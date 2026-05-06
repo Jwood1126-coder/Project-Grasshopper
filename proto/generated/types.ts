@@ -29,8 +29,20 @@ export interface Thermal {
   fps: number;
   gain: string;
   agc: boolean;
+  frames: number;
+  totalPackets: number;
+  validPackets: number;
+  discardPackets: number;
+  syncEntries: number;
+  lineMismatch: number;
+  segNot1: number;
+  segMismatch: number;
+  segZero: number;
+  frameTimeout: number;
   spliceDetected: number;
+  hwResets: number;
   lastFFCMs: number;
+  state: string;
 }
 
 /** Sent once over the relay WS by a device on connect. Identifies + auths the device. */

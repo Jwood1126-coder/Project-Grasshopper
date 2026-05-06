@@ -42,8 +42,20 @@ typedef struct {
     uint32_t fps;
     const char * gain;
     bool agc;
+    uint32_t frames;
+    uint32_t totalPackets;
+    uint32_t validPackets;
+    uint32_t discardPackets;
+    uint32_t syncEntries;
+    uint32_t lineMismatch;
+    uint32_t segNot1;
+    uint32_t segMismatch;
+    uint32_t segZero;
+    uint32_t frameTimeout;
     uint32_t spliceDetected;
+    uint32_t hwResets;
     uint32_t lastFFCMs;
+    const char * state;
 } Thermal_t;
 
 typedef struct {

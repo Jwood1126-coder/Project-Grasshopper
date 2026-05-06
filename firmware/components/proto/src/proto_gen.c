@@ -30,7 +30,7 @@ size_t Hello_to_json(char *buf, size_t bufsz, const Hello_t *m) {
 
 size_t Init_to_json(char *buf, size_t bufsz, const Init_t *m) {
     return snprintf(buf, bufsz,
-        "{\"type\":\"%s\",\"fwVersion\":\"%s\",\"gitSha\":\"%s\",\"deviceId\":\"%s\",\"state\":\"%s\",\"uptimeMs\":%llu,\"freeHeap\":%lu,\"freePsram\":%lu,\"wifi\":{\"mode\":\"%s\",\"ssid\":\"%s\",\"rssi\":%ld,\"ip\":\"%s\"},\"ntpSynced\":%s,\"epoch\":%llu,\"visible\":{\"fps\":%lu,\"w\":%lu,\"h\":%lu,\"quality\":%lu},\"thermal\":{\"fps\":%lu,\"gain\":\"%s\",\"agc\":%s,\"spliceDetected\":%lu,\"lastFFCMs\":%lu}}",
+        "{\"type\":\"%s\",\"fwVersion\":\"%s\",\"gitSha\":\"%s\",\"deviceId\":\"%s\",\"state\":\"%s\",\"uptimeMs\":%llu,\"freeHeap\":%lu,\"freePsram\":%lu,\"wifi\":{\"mode\":\"%s\",\"ssid\":\"%s\",\"rssi\":%ld,\"ip\":\"%s\"},\"ntpSynced\":%s,\"epoch\":%llu,\"visible\":{\"fps\":%lu,\"w\":%lu,\"h\":%lu,\"quality\":%lu},\"thermal\":{\"fps\":%lu,\"gain\":\"%s\",\"agc\":%s,\"frames\":%lu,\"totalPackets\":%lu,\"validPackets\":%lu,\"discardPackets\":%lu,\"syncEntries\":%lu,\"lineMismatch\":%lu,\"segNot1\":%lu,\"segMismatch\":%lu,\"segZero\":%lu,\"frameTimeout\":%lu,\"spliceDetected\":%lu,\"hwResets\":%lu,\"lastFFCMs\":%lu,\"state\":\"%s\"}}",
         m->type,
         m->fwVersion,
         m->gitSha,
@@ -52,13 +52,25 @@ size_t Init_to_json(char *buf, size_t bufsz, const Init_t *m) {
         (unsigned long)m->thermal.fps,
         m->thermal.gain,
         (m->thermal.agc ? "true" : "false"),
+        (unsigned long)m->thermal.frames,
+        (unsigned long)m->thermal.totalPackets,
+        (unsigned long)m->thermal.validPackets,
+        (unsigned long)m->thermal.discardPackets,
+        (unsigned long)m->thermal.syncEntries,
+        (unsigned long)m->thermal.lineMismatch,
+        (unsigned long)m->thermal.segNot1,
+        (unsigned long)m->thermal.segMismatch,
+        (unsigned long)m->thermal.segZero,
+        (unsigned long)m->thermal.frameTimeout,
         (unsigned long)m->thermal.spliceDetected,
-        (unsigned long)m->thermal.lastFFCMs);
+        (unsigned long)m->thermal.hwResets,
+        (unsigned long)m->thermal.lastFFCMs,
+        m->thermal.state);
 }
 
 size_t Tick_to_json(char *buf, size_t bufsz, const Tick_t *m) {
     return snprintf(buf, bufsz,
-        "{\"type\":\"%s\",\"uptimeMs\":%llu,\"freeHeap\":%lu,\"freePsram\":%lu,\"epoch\":%llu,\"state\":\"%s\",\"thermal\":{\"fps\":%lu,\"gain\":\"%s\",\"agc\":%s,\"spliceDetected\":%lu,\"lastFFCMs\":%lu}}",
+        "{\"type\":\"%s\",\"uptimeMs\":%llu,\"freeHeap\":%lu,\"freePsram\":%lu,\"epoch\":%llu,\"state\":\"%s\",\"thermal\":{\"fps\":%lu,\"gain\":\"%s\",\"agc\":%s,\"frames\":%lu,\"totalPackets\":%lu,\"validPackets\":%lu,\"discardPackets\":%lu,\"syncEntries\":%lu,\"lineMismatch\":%lu,\"segNot1\":%lu,\"segMismatch\":%lu,\"segZero\":%lu,\"frameTimeout\":%lu,\"spliceDetected\":%lu,\"hwResets\":%lu,\"lastFFCMs\":%lu,\"state\":\"%s\"}}",
         m->type,
         (unsigned long long)m->uptimeMs,
         (unsigned long)m->freeHeap,
@@ -68,8 +80,20 @@ size_t Tick_to_json(char *buf, size_t bufsz, const Tick_t *m) {
         (unsigned long)m->thermal.fps,
         m->thermal.gain,
         (m->thermal.agc ? "true" : "false"),
+        (unsigned long)m->thermal.frames,
+        (unsigned long)m->thermal.totalPackets,
+        (unsigned long)m->thermal.validPackets,
+        (unsigned long)m->thermal.discardPackets,
+        (unsigned long)m->thermal.syncEntries,
+        (unsigned long)m->thermal.lineMismatch,
+        (unsigned long)m->thermal.segNot1,
+        (unsigned long)m->thermal.segMismatch,
+        (unsigned long)m->thermal.segZero,
+        (unsigned long)m->thermal.frameTimeout,
         (unsigned long)m->thermal.spliceDetected,
-        (unsigned long)m->thermal.lastFFCMs);
+        (unsigned long)m->thermal.hwResets,
+        (unsigned long)m->thermal.lastFFCMs,
+        m->thermal.state);
 }
 
 size_t Event_to_json(char *buf, size_t bufsz, const Event_t *m) {

@@ -35,8 +35,20 @@
         "fps": "u32",
         "gain": "string",
         "agc": "bool",
+        "frames": "u32",
+        "totalPackets": "u32",
+        "validPackets": "u32",
+        "discardPackets": "u32",
+        "syncEntries": "u32",
+        "lineMismatch": "u32",
+        "segNot1": "u32",
+        "segMismatch": "u32",
+        "segZero": "u32",
+        "frameTimeout": "u32",
         "spliceDetected": "u32",
-        "lastFFCMs": "u32"
+        "hwResets": "u32",
+        "lastFFCMs": "u32",
+        "state": "string"
       }
     }
   },

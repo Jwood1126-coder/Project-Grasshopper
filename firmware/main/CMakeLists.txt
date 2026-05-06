@@ -1,7 +1,7 @@
 idf_component_register(
     SRCS "app_main.c"
-    INCLUDE_DIRS "."
-    REQUIRES nvs_flash esp_event esp_timer net_wifi net_relay proto
+    INCLUDE_DIRS "." "include"
+    REQUIRES nvs_flash esp_event esp_timer net_wifi net_relay proto hal_lepton
 )
 
 # Compile-time version string. Override at build time:
