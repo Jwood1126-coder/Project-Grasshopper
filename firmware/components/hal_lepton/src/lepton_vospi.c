@@ -95,12 +95,12 @@ static esp_err_t spi_init(void) {
     spi_device_interface_config_t dev_cfg = {
         .clock_speed_hz = LEP_SPI_FREQ_HZ,
         .mode = 3,                  // CPOL=1, CPHA=1
-        .spics_io_num = -1,         // manual CS via GPIO (driver CS gave all-zero)
+        .spics_io_num = -1,         // manual CS via GPIO
         .queue_size = 1,
         .command_bits = 0,
         .address_bits = 0,
         .dummy_bits = 0,
-        .flags = SPI_DEVICE_HALFDUPLEX | SPI_DEVICE_NO_DUMMY,
+        .flags = 0,                 // full-duplex (chunked polling)
     };
     err = spi_bus_add_device(SPI3_HOST, &dev_cfg, &s_spi);
     if (err != ESP_OK) {
@@ -163,27 +163,30 @@ static bool vospi_read_packet(uint8_t *out_line, uint8_t *out_seg) {
     *out_seg = 0;
     *out_line = 0;
 
-    spi_transaction_t t = {
-        .length   = 0,                  // half-duplex: no TX bits
-        .rxlength = LEP_PKT_LEN * 8,
-        .rx_buffer = s_pkt,
-    };
-
-    // KNOWN ISSUE — phase 3 WIP. With the IDF v5.3 spi_master driver on
-    // GPIO matrix (non-IOMUX) pins SCK=41/MISO=42, the receive only
-    // captures the first 4 bytes of real MISO data; bytes 4..163 read
-    // back as zero even though the SPI clock runs the full 164-byte
-    // duration (~80 μs at 16 MHz, measured). Tried full/half-duplex,
-    // DMA on/off, SPI2_HOST vs SPI3_HOST, manual vs driver CS, MISO
-    // pull-up, MOSFET power-cycle, with/without CCI bring-up — all give
-    // the same 4-byte truncation. Path forward is either Arduino-as-
-    // component (which Fox uses successfully on identical wiring) or
-    // direct spi_ll_* register reads bypassing the driver. Tracking in
+    // Read 164 bytes as 3 polling chunks (64+64+36) with CS held low
+    // across all of them. Lepton stalls when SCK pauses between chunks
+    // and resumes from the next bit, so we don't lose bytes. The
+    // single-transaction DMA path (spi_device_transmit) on these
+    // GPIO-matrix pins truncates at byte 4 — see
     // docs/phase3-spi-issue.md.
     gpio_set_level(LEP_SPI_CS, 0);
-    esp_err_t err = spi_device_transmit(s_spi, &t);
+    int offset = 0, remaining = LEP_PKT_LEN;
+    while (remaining > 0) {
+        int chunk = remaining > 64 ? 64 : remaining;
+        spi_transaction_t t = {
+            .length    = chunk * 8,
+            .rxlength  = chunk * 8,
+            .tx_buffer = s_tx_zeros,
+            .rx_buffer = s_pkt + offset,
+        };
+        if (spi_device_polling_transmit(s_spi, &t) != ESP_OK) {
+            gpio_set_level(LEP_SPI_CS, 1);
+            return false;
+        }
+        offset += chunk;
+        remaining -= chunk;
+    }
     gpio_set_level(LEP_SPI_CS, 1);
-    if (err != ESP_OK) return false;
 
     // Discard packet?  byte0 low nibble == 0x0F.
     if ((s_pkt[0] & 0x0F) == 0x0F) return false;
@@ -357,6 +360,7 @@ static void vospi_task(void *arg) {
         bool valid = vospi_read_packet(&line, &seg);
         s_total_packets++;
         if (valid) s_valid_packets++; else s_discard_packets++;
+
 
 
         // Periodic stat dump (every ~30 s).

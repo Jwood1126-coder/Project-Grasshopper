@@ -1,92 +1,88 @@
-# Phase 3 — VoSPI receive truncated to 4 bytes
+# Phase 3 — VoSPI receive on IDF v5.3 spi_master
 
 ## Symptom
 
-Reader reads packets at 100 pps (SYNC mode bound by `vTaskDelay(1)` at
-the 100 Hz tick rate, as designed). Each packet is supposed to be 164
-bytes; the SPI clock runs for the full duration (measured 132 μs total,
-~80 μs of clocking which matches 1312 bits at 16 MHz), but only the
-first 4 bytes read back as real Lepton data. Bytes 4..163 come back as
-`0x00`.
+VoSPI reader runs, packets clock in, but frames never assemble. With
+the chunked-polling workaround in place, the device reaches
+`validPackets ≈ 74 / 4366` over ~30 s and `lineMismatch ≈ 26`. It does
+sometimes pull complete-looking packets (raw byte dump showed real
+pixel data at byte 160 of a `line=30` packet), but most reads land
+during Lepton's idle/discard state and the reader's per-packet read
+time (~246 μs) is too slow to keep up with Lepton's ~9000 pps stream
+once in READING mode.
 
-Result: `validPackets / totalPackets` ≈ 0.8 % (we mostly catch real
-discard packets), and every "valid" packet decodes as `line == 0`
-because byte 1 of the rx buffer is always zero, so `packet_number =
-((byte0 & 0x0F) << 8) | byte1 = 0`. State machine advances
-SYNC → READING, then aborts on the very next packet because expected
-line 1 is also read as line 0 → `line_mismatch`. Frames never commit.
+## What we ruled out (with raw byte dumps)
 
-## What's been ruled out
+Single 164-byte transactions via `spi_device_transmit` with DMA
+(`SPI_DMA_CH_AUTO`) on these GPIO-matrix pins (SCK=41, MISO=42)
+deliver only the first 4 bytes of MISO data; bytes 4..163 read as
+zero. Verified with 0xAA pre-fill — the SPI driver IS writing zeros
+to those bytes (not just leaving them untouched). SPI clock measured
+running for 132 μs total / ~80 μs of actual SCK, which matches 1312
+bits at 16 MHz — so SCK runs the full duration but data isn't
+captured into rx_buffer past byte 4.
 
-Same 4-byte read regardless of:
+Same 4-byte truncation regardless of:
 
 - `spi_device_transmit` (DMA queued) vs `spi_device_polling_transmit`
 - `SPI_DMA_CH_AUTO` vs `SPI_DMA_DISABLED`
-  (with `SPI_DMA_DISABLED`, polling errors out at ">host max" as
-  expected — confirms DMA is engaged in the working path)
-- Full-duplex (`length = 1312`, dummy zero TX buffer) vs half-duplex
-  (`length = 0`, `rxlength = 1312`, `SPI_DEVICE_HALFDUPLEX |
-  SPI_DEVICE_NO_DUMMY`)
+- Full-duplex (length=1312, dummy zero TX) vs half-duplex (length=0,
+  rxlength=1312, `SPI_DEVICE_HALFDUPLEX | SPI_DEVICE_NO_DUMMY`)
 - `SPI2_HOST` (FSPI) vs `SPI3_HOST` (HSPI)
-- Manual CS (`spics_io_num = -1` + `gpio_set_level`) vs driver-managed
-  CS (`spics_io_num = LEP_SPI_CS`). Driver-managed CS gave all-zero rx
-  reliably — Lepton never sees CS asserted. So manual CS works in
-  principle.
-- MISO `gpio_set_pull_mode(GPIO_PULLUP_ONLY)` — tail bytes still 0x00,
-  which means the line is actively driven low, not floating.
-- MOSFET power-cycle (1 s OFF, then ON, 2 s settle) before init.
-- CCI fully configured vs CCI skipped — same data either way, so the
-  truncation is independent of Lepton state.
-- `0xAA` prefill on the rx buffer survives bytes 4..163 are
-  overwritten — proves the SPI driver IS writing to those bytes,
-  writing zeros.
-- Buffers are DMA-capable internal SRAM (`MALLOC_CAP_DMA |
+- Manual CS (`spics_io_num=-1`) vs driver-managed CS (driver-managed
+  gave reliably all-zero — driver wasn't asserting CS the way we
+  expected).
+- MISO pull-up — tail bytes still 0x00, so the line is actively
+  driven low somewhere, not floating.
+- MOSFET power-cycle (1 s OFF, then ON, 2 s settle).
+- CCI fully configured vs CCI skipped.
+- Buffers in DMA-capable internal SRAM (`MALLOC_CAP_DMA |
   MALLOC_CAP_INTERNAL`).
 
-## Hypotheses
+## Workaround in place: chunked polling
 
-1. **IDF v5.3 spi_master quirk on non-IOMUX pins** routed via GPIO
-   matrix. SCK=41 and MISO=42 are not the FSPI native IOMUX pins
-   (those are 12, 13, 11, 10). Routing through GPIO matrix is allowed
-   but has different timing. Fox uses identical pins via
-   Arduino-ESP32's `SPIClass(FSPI)` and works — but Arduino-ESP32 may
-   call lower-level APIs differently than `spi_master`.
+Three back-to-back `spi_device_polling_transmit` calls of 64 + 64 + 36
+bytes with manual CS held low across all three. Lepton stalls when
+SCK pauses between chunks and resumes from the next bit, so we don't
+lose bytes between chunks.
 
-2. **DMA descriptor truncation**: the descriptor may be limited to 4
-   bytes by some misinterpretation of `length` / `rxlength` in
-   half-duplex mode. The fact that timing is correct (full clock
-   duration) but data is missing past byte 4 hints at an internal
-   state-machine that stops latching MISO into the descriptor after
-   the first word.
+Effects:
 
-3. **Some driver path expects an explicit cmd / addr phase** (4 bytes)
-   that's eating the first 32 bits in our buffer, and then either
-   never starts the data phase or starts it but doesn't write to our
-   rx_buffer. We've explicitly set `command_bits = 0`,
-   `address_bits = 0`, `dummy_bits = 0`, but maybe an internal
-   default in v5.3 overrides.
+- `validPackets` roughly doubled (42 → 74 over ~30 s windows).
+- One captured packet (`line=30`, bytes [160..163] = `05 00 80 19`)
+  shows real pixel data extending past byte 4, confirming chunked
+  polling does deliver full packets sometimes.
+- Single-DMA tests after several reflashes started showing all-zero
+  headers (Lepton may have entered a degraded state from repeated
+  CCI command sequences + power cycles during debug). Chunked
+  polling pulled occasional real packets even in that state.
 
-## Path forward (next session)
+Cost: per-packet read time is ~246 μs (3 × ~82 μs per chunk, polling
+overhead included). Lepton's master-clocked rate is ~9000 pps, so
+~4000 effective pps from us means we miss roughly 55 % of packets
+during a Lepton broadcast. Frames never fully assemble — every
+`line_mismatch` aborts the in-flight frame.
 
-In rough preference order:
+## Likely fixes (next session)
 
-1. **Arduino-as-component for hal_lepton's SPI only.** Add
-   `espressif/arduino-esp32` to the firmware's
-   `idf_component.yml`, then have `lepton_vospi.c` call into Arduino's
-   `SPIClass` to do the transfer. Keep CCI on the IDF
-   `i2c_master_*` API. Known to work on this exact wiring (Fox is the
-   reference).
-2. **Direct `spi_ll_*` register-level read.** Bypass the driver,
-   manually program SPI registers, poll FIFO. Mirrors what
-   Arduino-ESP32's `spiTransferBytesNL` does on ESP32-original.
-3. **Move SCK/MISO to FSPI IOMUX pins** (re-wire the breakout to
-   GPIO 12 / 13 / 11). Costs hardware change; only worth it if the
-   driver path gets unblocked by IOMUX.
+1. **Arduino-as-component for the SPI HAL only.** Add
+   `espressif/arduino-esp32` to `firmware/idf_component.yml`, have
+   `lepton_vospi.c` use Arduino's `SPIClass(FSPI).transferBytes`
+   (which Fox uses successfully on identical wiring). Arduino's path
+   chunks at 64 bytes too, so it has the same theoretical speed
+   limit, but the fact that Fox works on this exact hardware strongly
+   suggests the per-call overhead is materially lower.
+2. **Direct register-level read** via `spi_ll_*` or raw register
+   writes. Mirrors `spiTransferBytesNL` from Arduino-ESP32 but in an
+   IDF-only project. ~2-3 hours.
+3. **Re-flash Fox** to the device once to confirm the wiring/Lepton
+   are still healthy after this debug session. If Fox doesn't pull
+   frames either, the Lepton is stuck and a hard power cycle (unplug
+   USB) is needed before further VoSPI debug.
 
 ## Code state
 
-`firmware/components/hal_lepton/src/lepton_vospi.c` left in a working
-build state but not producing frames. The component compiles, boots,
-and reports stats to the relay — `frames` stays at 0, `lineMismatch`
-counter increments. Boot completes the rest of the sketch normally
-(Wi-Fi, relay, periodic Tick).
+`firmware/components/hal_lepton/src/lepton_vospi.c` — chunked polling
+(64+64+36) with manual CS, full-duplex, DMA disabled (chunks fit in
+the 64-byte FIFO so DMA isn't needed). Builds and runs; `frames`
+stays at 0; relay shows live diagnostic counters via `Tick.thermal`.
