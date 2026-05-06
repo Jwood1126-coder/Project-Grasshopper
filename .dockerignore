@@ -1,0 +1,16 @@
+# Only relay/ is needed for the image
+firmware/
+app/
+proto/
+docs/
+.git/
+.gitignore
+.gitattributes
+README.md
+
+# Anywhere
+**/node_modules
+**/bun.lockb
+**/.env
+**/.env.local
+**/*.log

@@ -2,10 +2,10 @@ FROM oven/bun:1.1-alpine
 
 WORKDIR /app
 
-COPY package.json ./
+COPY relay/package.json ./
 RUN bun install
 
-COPY . .
+COPY relay/ ./
 
 ENV NODE_ENV=production
 EXPOSE 3000
