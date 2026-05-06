@@ -1,0 +1,43 @@
+menu "Grasshopper"
+
+config GRASSHOPPER_DEVICE_ID
+    string "Device identifier"
+    default "grasshopper-dev-001"
+    help
+        Per-unit identifier. Reported to the relay and used for
+        relay-side device routing. Final firmware sets this from NVS.
+
+menu "Wi-Fi (STA, phase 2 only — replaced by captive portal in phase 4)"
+config GRASSHOPPER_WIFI_SSID
+    string "Wi-Fi SSID"
+    default ""
+    help
+        STA-mode Wi-Fi SSID. Phase 2 uses Kconfig; phase 4 reads from
+        NVS set via captive portal. Leave blank to skip Wi-Fi (offline
+        boot).
+
+config GRASSHOPPER_WIFI_PASS
+    string "Wi-Fi password"
+    default ""
+endmenu
+
+menu "Debug relay (telescope)"
+config GRASSHOPPER_RELAY_ENABLED
+    bool "Connect outbound to debug relay"
+    default y
+    help
+        Off-by-default in shipping firmware. Set y in dev builds to
+        stream Hello/Init/Tick/Log/Event to the Railway-hosted relay.
+
+config GRASSHOPPER_RELAY_URL
+    string "Relay WSS URL"
+    default "wss://project-grasshopper-production.up.railway.app/relay"
+    depends on GRASSHOPPER_RELAY_ENABLED
+
+config GRASSHOPPER_RELAY_TOKEN
+    string "Relay bearer token"
+    default "dev-token"
+    depends on GRASSHOPPER_RELAY_ENABLED
+endmenu
+
+endmenu

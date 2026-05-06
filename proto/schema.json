@@ -1,0 +1,105 @@
+{
+  "version": 1,
+  "doc": "Source of truth for Grasshopper wire messages. Edit this file, then run `python3 proto/codegen.py` from the repo root to regenerate proto/generated/types.ts and firmware/components/proto/.",
+  "enums": {
+    "DeviceState": [
+      "BOOT",
+      "SAFE_MODE",
+      "IDLE",
+      "STREAMING",
+      "CAPTURING",
+      "TIMELAPSE_ACTIVE",
+      "DEEP_SLEEP_PREP",
+      "SHUTDOWN"
+    ]
+  },
+  "structs": {
+    "Wifi": {
+      "fields": {
+        "mode": "string",
+        "ssid": "string",
+        "rssi": "i32",
+        "ip": "string"
+      }
+    },
+    "Visible": {
+      "fields": {
+        "fps": "u32",
+        "w": "u32",
+        "h": "u32",
+        "quality": "u32"
+      }
+    },
+    "Thermal": {
+      "fields": {
+        "fps": "u32",
+        "gain": "string",
+        "agc": "bool",
+        "spliceDetected": "u32",
+        "lastFFCMs": "u32"
+      }
+    }
+  },
+  "messages": {
+    "Hello": {
+      "doc": "Sent once over the relay WS by a device on connect. Identifies + auths the device.",
+      "fields": {
+        "type": "string",
+        "deviceId": "string",
+        "token": "string",
+        "fwVersion": "string",
+        "gitSha": "string",
+        "bootReason": "string"
+      }
+    },
+    "Init": {
+      "doc": "Full device snapshot. Sent on LAN WS connect, and over relay after Hello.",
+      "fields": {
+        "type": "string",
+        "fwVersion": "string",
+        "gitSha": "string",
+        "deviceId": "string",
+        "state": "DeviceState",
+        "uptimeMs": "u64",
+        "freeHeap": "u32",
+        "freePsram": "u32",
+        "wifi": "Wifi",
+        "ntpSynced": "bool",
+        "epoch": "u64",
+        "visible": "Visible",
+        "thermal": "Thermal"
+      }
+    },
+    "Tick": {
+      "doc": "Subset of Init. Pushed every ~1500ms to update changed fields.",
+      "fields": {
+        "type": "string",
+        "uptimeMs": "u64",
+        "freeHeap": "u32",
+        "freePsram": "u32",
+        "epoch": "u64",
+        "state": "DeviceState",
+        "thermal": "Thermal"
+      }
+    },
+    "Event": {
+      "doc": "One-shot event (capture saved, FFC done, error, state change).",
+      "fields": {
+        "type": "string",
+        "kind": "string",
+        "msg": "string",
+        "ts": "u64"
+      }
+    },
+    "LogLine": {
+      "doc": "Structured log entry forwarded to the relay.",
+      "fields": {
+        "type": "string",
+        "ts": "u64",
+        "level": "string",
+        "tag": "string",
+        "msg": "string"
+      }
+    }
+  }
+}

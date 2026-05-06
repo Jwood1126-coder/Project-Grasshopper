@@ -1,11 +1,12 @@
 {
   "name": "grasshopper-relay",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "bun run src/server.ts",
-    "dev": "bun run --hot src/server.ts"
+    "dev": "bun run --hot src/server.ts",
+    "fake": "bun run dev/fakedevice.ts"
   },
   "dependencies": {
     "hono": "^4.6.0"
