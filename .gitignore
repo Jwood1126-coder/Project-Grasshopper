@@ -1,0 +1,24 @@
+# Node / Bun
+node_modules/
+bun.lockb
+*.log
+.env
+.env.local
+
+# ESP-IDF / firmware
+firmware/build/
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/managed_components/
+firmware/dependencies.lock
+
+# Vite / frontend build
+app/dist/
+app/.vite/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
