@@ -21,19 +21,18 @@ CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
 
-# Console: native USB CDC. If the GOOUUU board doesn't enumerate, fall
-# back to UART by setting CONFIG_ESP_CONSOLE_UART_DEFAULT=y in a build
-# override.
-CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
-CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG_ENABLED=y
+# Console: UART0 → CH340 bridge → /dev/ttyUSB0 on the host. Same as Fox,
+# because the GOOUUU board's native USB-C port is silent on these clones
+# (Espressif 303a:1001 enumerates but emits no characters). Phase 3+ may
+# revisit if a clean ESP-IDF native CDC works on a fresh board.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 
 # Main task: needs room for setup + JSON serializers
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
-# Wi-Fi: small static buffers, mostly dynamic so PSRAM does the work
-CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
-CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
-CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+# Wi-Fi: stock defaults for phase 2; revisit when heap budget gets tight.
+# (Manual override — STATIC=4 — broke the IDF v5.3 build because the
+# default RX_BA_WIN of 6 must be ≤ 2 × static buffers.)
 
 # TLS: use the bundled cert chain so wss:// works without provisioning
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y

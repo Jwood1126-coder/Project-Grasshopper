@@ -35,6 +35,8 @@ static int64_t g_boot_ms = 0;
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 static uint64_t uptime_ms(void) { return (uint64_t)(now_ms() - g_boot_ms); }
 
+static char s_json_buf[1024];
+
 static void send_init(void) {
     Init_t init = {
         .type = "init",
@@ -58,10 +60,9 @@ static void send_init(void) {
                      .spliceDetected = 0, .lastFFCMs = 0 },
     };
 
-    char buf[1024];
-    size_t n = Init_to_json(buf, sizeof(buf), &init);
-    if (n > 0 && n < sizeof(buf)) {
-        net_relay_send(buf, n);
+    size_t n = Init_to_json(s_json_buf, sizeof(s_json_buf), &init);
+    if (n > 0 && n < sizeof(s_json_buf)) {
+        net_relay_send(s_json_buf, n);
         ESP_LOGI(TAG, "init sent (%u B)", (unsigned)n);
     } else {
         ESP_LOGE(TAG, "init buffer too small (n=%u)", (unsigned)n);
@@ -69,7 +70,6 @@ static void send_init(void) {
 }
 
 static void tick_task(void *arg) {
-    char buf[1024];
     Tick_t tick = {
         .type = "tick",
         .thermal = { .fps = 9, .gain = "auto", .agc = false,
@@ -95,9 +95,9 @@ static void tick_task(void *arg) {
         tick.freePsram = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
         tick.epoch = (uint64_t)time(NULL);
         tick.state = DEVICESTATE_IDLE;
-        size_t n = Tick_to_json(buf, sizeof(buf), &tick);
-        if (n > 0 && n < sizeof(buf)) {
-            net_relay_send(buf, n);
+        size_t n = Tick_to_json(s_json_buf, sizeof(s_json_buf), &tick);
+        if (n > 0 && n < sizeof(s_json_buf)) {
+            net_relay_send(s_json_buf, n);
         }
     }
 }
@@ -129,7 +129,9 @@ void app_main(void) {
     ESP_LOGI(TAG, "relay disabled (CONFIG_GRASSHOPPER_RELAY_ENABLED=n)");
 #endif
 
-    xTaskCreate(tick_task, "tick", 4096, NULL, 5, NULL);
+    // 4 KB was too small — esp_websocket_client_send_text drags mbedtls
+    // into the call stack and TLS_write alone needs ~3 KB of locals.
+    xTaskCreate(tick_task, "tick", 8192, NULL, 5, NULL);
 
     ESP_LOGI(TAG, "boot complete; free heap=%u psram=%u",
              (unsigned)esp_get_free_heap_size(),

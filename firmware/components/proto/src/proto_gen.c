@@ -30,46 +30,46 @@ size_t Hello_to_json(char *buf, size_t bufsz, const Hello_t *m) {
 
 size_t Init_to_json(char *buf, size_t bufsz, const Init_t *m) {
     return snprintf(buf, bufsz,
-        "{\"type\":\"%s\",\"fwVersion\":\"%s\",\"gitSha\":\"%s\",\"deviceId\":\"%s\",\"state\":\"%s\",\"uptimeMs\":%llu,\"freeHeap\":%u,\"freePsram\":%u,\"wifi\":{\"mode\":\"%s\",\"ssid\":\"%s\",\"rssi\":%d,\"ip\":\"%s\"},\"ntpSynced\":%s,\"epoch\":%llu,\"visible\":{\"fps\":%u,\"w\":%u,\"h\":%u,\"quality\":%u},\"thermal\":{\"fps\":%u,\"gain\":\"%s\",\"agc\":%s,\"spliceDetected\":%u,\"lastFFCMs\":%u}}",
+        "{\"type\":\"%s\",\"fwVersion\":\"%s\",\"gitSha\":\"%s\",\"deviceId\":\"%s\",\"state\":\"%s\",\"uptimeMs\":%llu,\"freeHeap\":%lu,\"freePsram\":%lu,\"wifi\":{\"mode\":\"%s\",\"ssid\":\"%s\",\"rssi\":%ld,\"ip\":\"%s\"},\"ntpSynced\":%s,\"epoch\":%llu,\"visible\":{\"fps\":%lu,\"w\":%lu,\"h\":%lu,\"quality\":%lu},\"thermal\":{\"fps\":%lu,\"gain\":\"%s\",\"agc\":%s,\"spliceDetected\":%lu,\"lastFFCMs\":%lu}}",
         m->type,
         m->fwVersion,
         m->gitSha,
         m->deviceId,
         DeviceState_str(m->state),
         (unsigned long long)m->uptimeMs,
-        m->freeHeap,
-        m->freePsram,
+        (unsigned long)m->freeHeap,
+        (unsigned long)m->freePsram,
         m->wifi.mode,
         m->wifi.ssid,
-        m->wifi.rssi,
+        (long)m->wifi.rssi,
         m->wifi.ip,
         (m->ntpSynced ? "true" : "false"),
         (unsigned long long)m->epoch,
-        m->visible.fps,
-        m->visible.w,
-        m->visible.h,
-        m->visible.quality,
-        m->thermal.fps,
+        (unsigned long)m->visible.fps,
+        (unsigned long)m->visible.w,
+        (unsigned long)m->visible.h,
+        (unsigned long)m->visible.quality,
+        (unsigned long)m->thermal.fps,
         m->thermal.gain,
         (m->thermal.agc ? "true" : "false"),
-        m->thermal.spliceDetected,
-        m->thermal.lastFFCMs);
+        (unsigned long)m->thermal.spliceDetected,
+        (unsigned long)m->thermal.lastFFCMs);
 }
 
 size_t Tick_to_json(char *buf, size_t bufsz, const Tick_t *m) {
     return snprintf(buf, bufsz,
-        "{\"type\":\"%s\",\"uptimeMs\":%llu,\"freeHeap\":%u,\"freePsram\":%u,\"epoch\":%llu,\"state\":\"%s\",\"thermal\":{\"fps\":%u,\"gain\":\"%s\",\"agc\":%s,\"spliceDetected\":%u,\"lastFFCMs\":%u}}",
+        "{\"type\":\"%s\",\"uptimeMs\":%llu,\"freeHeap\":%lu,\"freePsram\":%lu,\"epoch\":%llu,\"state\":\"%s\",\"thermal\":{\"fps\":%lu,\"gain\":\"%s\",\"agc\":%s,\"spliceDetected\":%lu,\"lastFFCMs\":%lu}}",
         m->type,
         (unsigned long long)m->uptimeMs,
-        m->freeHeap,
-        m->freePsram,
+        (unsigned long)m->freeHeap,
+        (unsigned long)m->freePsram,
         (unsigned long long)m->epoch,
         DeviceState_str(m->state),
-        m->thermal.fps,
+        (unsigned long)m->thermal.fps,
         m->thermal.gain,
         (m->thermal.agc ? "true" : "false"),
-        m->thermal.spliceDetected,
-        m->thermal.lastFFCMs);
+        (unsigned long)m->thermal.spliceDetected,
+        (unsigned long)m->thermal.lastFFCMs);
 }
 
 size_t Event_to_json(char *buf, size_t bufsz, const Event_t *m) {

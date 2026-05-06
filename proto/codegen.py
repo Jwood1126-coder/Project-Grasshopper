@@ -21,15 +21,18 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
-# (ts_type, c_type, printf_fmt)  — printf_fmt is None for bool (handled specially)
+# (ts_type, c_type, printf_fmt, cast_expr)
+# printf_fmt is None for bool (handled specially), cast None means no cast.
+# Casts make the printf format width match the target's integer widths
+# (xtensa-esp32-elf treats uint32_t as long unsigned int, so %u warns).
 PRIMITIVES = {
-    "u8":  ("number", "uint8_t",  "%u"),
-    "u16": ("number", "uint16_t", "%u"),
-    "u32": ("number", "uint32_t", "%u"),
-    "u64": ("number", "uint64_t", "%llu"),
-    "i32": ("number", "int32_t",  "%d"),
-    "bool":   ("boolean", "bool",        None),
-    "string": ("string",  "const char *", '\\"%s\\"'),
+    "u8":  ("number", "uint8_t",      "%u",    "(unsigned)"),
+    "u16": ("number", "uint16_t",     "%u",    "(unsigned)"),
+    "u32": ("number", "uint32_t",     "%lu",   "(unsigned long)"),
+    "u64": ("number", "uint64_t",     "%llu",  "(unsigned long long)"),
+    "i32": ("number", "int32_t",      "%ld",   "(long)"),
+    "bool":   ("boolean", "bool",          None,    None),
+    "string": ("string",  "const char *", '\\"%s\\"', None),
 }
 
 
@@ -158,11 +161,9 @@ def emit_field(out_fmt, out_args, struct_path, fname, ftype, schema, is_first):
         out_args.append(f"{struct_path}{fname}")
     elif base in PRIMITIVES:
         fmt = PRIMITIVES[base][2]
+        cast = PRIMITIVES[base][3]
         out_fmt.append(f'{sep}\\"{fname}\\":{fmt}')
-        if base == "u64":
-            out_args.append(f"(unsigned long long){struct_path}{fname}")
-        else:
-            out_args.append(f"{struct_path}{fname}")
+        out_args.append(f"{cast}{struct_path}{fname}" if cast else f"{struct_path}{fname}")
     elif base in schema.get("enums", {}):
         out_fmt.append(f'{sep}\\"{fname}\\":\\"%s\\"')
         out_args.append(f"{base}_str({struct_path}{fname})")
