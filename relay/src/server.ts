@@ -281,7 +281,7 @@ const DASHBOARD_HTML = `<!doctype html>
   header h1 { font-size: 18px; margin: 0; font-weight: 600; }
   header .live { color: var(--accent); font-weight: 500; font-size: 13px; }
   main { max-width: 1200px; margin: 0 auto; padding: 20px 24px; }
-  .empty { color: var(--muted); font-style: italic; }
+  .no-devices { color: var(--muted); font-style: italic; }
   .device { border: 1px solid var(--line); border-radius: 8px; padding: 14px 18px; margin-bottom: 18px; background: #fff1; }
   .preview { display: flex; gap: 12px; flex-wrap: wrap; margin: 10px 0 6px; }
   .preview .frame { border: 1px solid var(--line); border-radius: 6px; overflow: hidden; background: #0006; min-width: 240px; max-width: 480px; }
@@ -318,7 +318,7 @@ const DASHBOARD_HTML = `<!doctype html>
   <h1>Grasshopper relay</h1>
   <span class="live" id="status">connecting…</span>
 </header>
-<main id="devices"><div class="empty">No devices connected yet.</div></main>
+<main id="devices"><div class="no-devices">No devices connected yet.</div></main>
 <div class="footer">
   Agent-readable: <code>/api/devices</code> · <code>/api/devices/:id/state</code> ·
   <code>/api/devices/:id/logs?since=</code> · <code>/api/devices/:id/events</code>
@@ -414,10 +414,6 @@ const DASHBOARD_HTML = `<!doctype html>
     f.imgTherm    = f.frameTherm.querySelector('img');
     f.phVis       = f.frameVis.querySelector('.ph');
     f.phTherm     = f.frameTherm.querySelector('.ph');
-    console.log('[dbg] buildCard ' + deviceId +
-                ' previewWrap.children=' + previewWrap.children.length +
-                ' frameVis=' + !!f.frameVis +
-                ' frameTherm=' + !!f.frameTherm);
 
     // Panels
     const wifi = makePanel('WiFi', [
@@ -596,8 +592,8 @@ const DASHBOARD_HTML = `<!doctype html>
             if (card.rootEl.parentNode) card.rootEl.parentNode.removeChild(card.rootEl);
           }
           cards.clear();
-          if (!root.querySelector('.empty')) {
-            root.innerHTML = '<div class="empty">No devices connected yet. Start a device with relay enabled to see it here.</div>';
+          if (!root.querySelector('.no-devices')) {
+            root.innerHTML = '<div class="no-devices">No devices connected yet. Start a device with relay enabled to see it here.</div>';
           }
         }
         return;
@@ -605,9 +601,11 @@ const DASHBOARD_HTML = `<!doctype html>
       emptyStreak = 0;
       status.textContent = devs.length + ' device' + (devs.length === 1 ? '' : 's');
 
-      // Remove the .empty placeholder if present, but DON'T blow away
-      // any existing cards in root.
-      const empty = root.querySelector('.empty');
+      // Remove the no-devices placeholder if present, but DON'T blow
+      // away any existing cards in root. (Earlier the selector here
+      // was '.empty' — which matched .frame.empty preview tiles too,
+      // and silently tore them out one per tick.)
+      const empty = root.querySelector('.no-devices');
       if (empty) empty.remove();
 
       const seen = new Set();
