@@ -225,6 +225,88 @@ static void tick_task(void *arg) {
     }
 }
 
+// ---------- Preview frame upload ----------
+//
+// Every PREVIEW_INTERVAL_MS, grab the latest visible JPEG and ship it
+// over the relay WS as a binary frame with a 24 B header.
+//
+// Wire format (all little-endian):
+//   offset 0:  4 B magic   = "GHFR"
+//   offset 4:  1 B modality (1 = visible, 2 = thermal)
+//   offset 5:  1 B version  (1)
+//   offset 6:  2 B reserved
+//   offset 8:  4 B width
+//   offset 12: 4 B height
+//   offset 16: 4 B jpeg length
+//   offset 20: 4 B epoch seconds
+//   offset 24: <jpeg bytes>
+
+#define PREVIEW_INTERVAL_MS 2000
+#define PREVIEW_HDR_LEN     24
+#define PREVIEW_MAGIC       "GHFR"
+#define PREVIEW_MOD_VIS     1
+#define PREVIEW_MOD_THERM   2
+#define PREVIEW_MAX_BYTES   65536
+
+// PSRAM-backed staging buffer. 64 KB is plenty for VGA q=12 (typical
+// 30-50 KB) plus the header. Allocated lazily on first upload.
+static uint8_t *s_preview_buf = NULL;
+
+static void put_u32_le(uint8_t *p, uint32_t v) {
+    p[0] = v & 0xFF; p[1] = (v >> 8) & 0xFF;
+    p[2] = (v >> 16) & 0xFF; p[3] = (v >> 24) & 0xFF;
+}
+
+void preview_task(void *arg) {
+    (void)arg;
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(PREVIEW_INTERVAL_MS));
+        if (!net_relay_is_connected())  continue;
+        if (!hal_camera_ready())        continue;
+
+        if (!s_preview_buf) {
+            s_preview_buf = heap_caps_malloc(PREVIEW_MAX_BYTES, MALLOC_CAP_SPIRAM);
+            if (!s_preview_buf) {
+                ESP_LOGE(TAG, "preview: no PSRAM for staging buf");
+                vTaskDelay(pdMS_TO_TICKS(10000));
+                continue;
+            }
+        }
+
+        const uint8_t *jpg = NULL;
+        size_t   jpg_len = 0;
+        uint32_t w = 0, h = 0;
+        if (hal_camera_grab_jpeg(&jpg, &jpg_len, &w, &h) != ESP_OK) continue;
+
+        if (jpg_len + PREVIEW_HDR_LEN > PREVIEW_MAX_BYTES) {
+            ESP_LOGW(TAG, "preview: jpg %u too big — skip", (unsigned)jpg_len);
+            hal_camera_release();
+            continue;
+        }
+
+        memcpy(s_preview_buf, PREVIEW_MAGIC, 4);
+        s_preview_buf[4] = PREVIEW_MOD_VIS;
+        s_preview_buf[5] = 1;        // version
+        s_preview_buf[6] = 0;
+        s_preview_buf[7] = 0;
+        put_u32_le(s_preview_buf + 8,  w);
+        put_u32_le(s_preview_buf + 12, h);
+        put_u32_le(s_preview_buf + 16, (uint32_t)jpg_len);
+        put_u32_le(s_preview_buf + 20, (uint32_t)time(NULL));
+        memcpy(s_preview_buf + PREVIEW_HDR_LEN, jpg, jpg_len);
+
+        hal_camera_release();   // releases the camera FB lock immediately
+
+        size_t total = PREVIEW_HDR_LEN + jpg_len;
+        if (net_relay_send_binary(s_preview_buf, total) != ESP_OK) {
+            ESP_LOGW(TAG, "preview: send failed (%u B)", (unsigned)total);
+        } else {
+            ESP_LOGD(TAG, "preview: sent %ux%u %u B", (unsigned)w, (unsigned)h,
+                     (unsigned)jpg_len);
+        }
+    }
+}
+
 void app_main(void) {
     g_boot_ms = now_ms();
 
@@ -284,6 +366,11 @@ void app_main(void) {
     // Tick task — TLS write through mbedtls needs ≥6 KB of locals on
     // top of our 1.5 KB JSON buf, hence 8 KB.
     xTaskCreate(tick_task, "tick", 8192, NULL, 5, NULL);
+
+    // Preview task — ships a JPEG to the relay every PREVIEW_INTERVAL_MS.
+    // 8 KB stack: TLS write needs ≥6 KB, the rest is locals + header.
+    extern void preview_task(void *);
+    xTaskCreate(preview_task, "preview", 8192, NULL, 4, NULL);
 
     ESP_LOGI(TAG, "boot complete; free heap=%u psram=%u",
              (unsigned)esp_get_free_heap_size(),

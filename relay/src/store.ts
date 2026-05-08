@@ -3,6 +3,14 @@
 
 import type { ServerWebSocket } from 'bun'
 
+export interface PreviewFrame {
+  modality: 'vis' | 'thermal'
+  width: number
+  height: number
+  ts: number          // ms when received by relay
+  jpeg: Uint8Array
+}
+
 export interface DeviceRecord {
   deviceId: string
   socket: ServerWebSocket<unknown> | null
@@ -15,6 +23,8 @@ export interface DeviceRecord {
   tick: unknown // last Tick (or merged snapshot)
   logs: LogEntry[]
   events: EventEntry[]
+  previewVis?: PreviewFrame
+  previewTherm?: PreviewFrame
 }
 
 export interface LogEntry {
@@ -92,6 +102,13 @@ class Store {
     const d = this.devices.get(deviceId)
     if (!d) return []
     return d.logs.filter((e) => e.ts > since)
+  }
+
+  setPreview(deviceId: string, frame: PreviewFrame) {
+    const d = this.devices.get(deviceId)
+    if (!d) return
+    if (frame.modality === 'vis') d.previewVis = frame
+    else d.previewTherm = frame
   }
 }
 

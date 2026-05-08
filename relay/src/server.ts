@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
 import type { ServerWebSocket } from 'bun'
-import { store } from './store'
+import { store, type PreviewFrame } from './store'
 
 const app = new Hono()
 
@@ -61,6 +61,20 @@ app.get('/api/devices/:id/events', (c) => {
   return c.json({ events: d.events })
 })
 
+app.get('/api/devices/:id/last-frame.jpg', (c) => {
+  const d = store.get(c.req.param('id'))
+  if (!d) return c.text('unknown device', 404)
+  const modality = c.req.query('modality') === 'thermal' ? 'thermal' : 'vis'
+  const frame = modality === 'thermal' ? d.previewTherm : d.previewVis
+  if (!frame) return c.text('no frame yet', 404)
+  c.header('Content-Type', 'image/jpeg')
+  c.header('Cache-Control', 'no-store')
+  c.header('X-Frame-Width', String(frame.width))
+  c.header('X-Frame-Height', String(frame.height))
+  c.header('X-Frame-Age-Ms', String(Date.now() - frame.ts))
+  return c.body(frame.jpeg)
+})
+
 app.post('/api/devices/:id/cmd', async (c) => {
   const d = store.get(c.req.param('id'))
   if (!d) return c.json({ error: 'unknown device' }, 404)
@@ -88,6 +102,28 @@ interface WsCtx {
 
 const RELAY_TOKEN = process.env.RELAY_TOKEN ?? 'dev-token'
 
+function handlePreview(ws: ServerWebSocket<WsCtx>, buf: Buffer) {
+  if (!ws.data.authed || !ws.data.deviceId) return
+  const modalityByte = buf[4]
+  const w = buf.readUInt32LE(8)
+  const h = buf.readUInt32LE(12)
+  const jpegLen = buf.readUInt32LE(16)
+  if (jpegLen + 24 !== buf.length) {
+    console.warn(`[ws] preview length mismatch: hdr says ${jpegLen}, got ${buf.length - 24}`)
+    return
+  }
+  const jpeg = new Uint8Array(buf.buffer, buf.byteOffset + 24, jpegLen)
+  const frame: PreviewFrame = {
+    modality: modalityByte === 2 ? 'thermal' : 'vis',
+    width: w,
+    height: h,
+    ts: Date.now(),
+    jpeg: new Uint8Array(jpeg), // copy out of the WS buffer
+  }
+  store.setPreview(ws.data.deviceId, frame)
+  store.upsert(ws.data.deviceId, { lastSeenMs: Date.now() })
+}
+
 const port = Number(process.env.PORT ?? 3000)
 
 const server = Bun.serve<WsCtx>({
@@ -114,6 +150,16 @@ const server = Bun.serve<WsCtx>({
       console.log(`[ws] open from ${ws.data.remoteIp}`)
     },
     message(ws, raw) {
+      // Binary frames carry preview JPEGs with a 24-byte "GHFR" header;
+      // anything else is JSON text.
+      if (typeof raw !== 'string') {
+        const buf = raw instanceof Buffer ? raw : Buffer.from(raw as ArrayBuffer)
+        if (buf.length >= 24 && buf[0] === 0x47 && buf[1] === 0x48 &&
+            buf[2] === 0x46 && buf[3] === 0x52) {
+          handlePreview(ws, buf)
+          return
+        }
+      }
       const text = typeof raw === 'string' ? raw : new TextDecoder().decode(raw)
       let msg: any
       try {
@@ -237,6 +283,12 @@ const DASHBOARD_HTML = `<!doctype html>
   main { max-width: 1200px; margin: 0 auto; padding: 20px 24px; }
   .empty { color: var(--muted); font-style: italic; }
   .device { border: 1px solid var(--line); border-radius: 8px; padding: 14px 18px; margin-bottom: 18px; background: #fff1; }
+  .preview { display: flex; gap: 12px; flex-wrap: wrap; margin: 10px 0 6px; }
+  .preview .frame { border: 1px solid var(--line); border-radius: 6px; overflow: hidden; background: #0006; min-width: 240px; max-width: 480px; }
+  .preview .frame .label { font: 600 11px ui-sans-serif; padding: 4px 8px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; background: #0008; }
+  .preview .frame .label .age { float: right; font-weight: 400; color: var(--muted); }
+  .preview .frame img { display: block; width: 100%; height: auto; }
+  .preview .frame.empty { padding: 20px; color: var(--muted); font-size: 12px; font-style: italic; min-width: 200px; }
   .device h3 { margin: 0 0 2px; font-size: 16px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .device .id { font-family: ui-monospace, monospace; font-size: 13px; }
   .pill { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px; background: #8884; line-height: 1.5; }
@@ -367,17 +419,29 @@ const DASHBOARD_HTML = `<!doctype html>
         root.innerHTML = '<div class="empty">No devices connected yet. Start a device with relay enabled to see it here.</div>';
         return;
       }
+      const cacheBust = Date.now();
       const blocks = await Promise.all(devs.map(async d => {
         const sr = await fetch('/api/devices/' + encodeURIComponent(d.deviceId) + '/state', { cache: 'no-store' });
         const sd = await sr.json();
         const s = sd.tick || sd.init || {};
         const events = await fetchEvents(d.deviceId);
         const ageS = Math.floor((Date.now() - d.lastSeenMs) / 1000);
+        const idEnc = encodeURIComponent(d.deviceId);
+        const visUrl = '/api/devices/' + idEnc + '/last-frame.jpg?modality=vis&t=' + cacheBust;
+        const thermUrl = '/api/devices/' + idEnc + '/last-frame.jpg?modality=thermal&t=' + cacheBust;
         return \`<div class="device">
           <h3><span class="id">\${d.deviceId}</span>
               <span class="pill \${d.online ? 'online' : 'offline'}">\${d.online ? 'online' : 'offline'}</span>
               <span class="pill state">\${d.state || '—'}</span></h3>
           <div class="meta">fw \${d.fwVersion || '?'} · sha \${d.gitSha || '?'} · ip \${d.ip || '?'} · last seen \${ageS}s ago</div>
+          <div class="preview">
+            <div class="frame" data-modality="vis"><div class="label">visible <span class="age" id="age-vis-\${idEnc}">—</span></div>
+              <img loading="lazy" src="\${visUrl}" onerror="this.parentElement.classList.add('empty');this.style.display='none';this.parentElement.querySelector('.label').nextSibling?.remove();this.parentElement.append(' no frame yet');" />
+            </div>
+            <div class="frame" data-modality="thermal"><div class="label">thermal <span class="age" id="age-therm-\${idEnc}">—</span></div>
+              <img loading="lazy" src="\${thermUrl}" onerror="this.parentElement.classList.add('empty');this.style.display='none';this.parentElement.append(' no frame yet');" />
+            </div>
+          </div>
           <div class="grid">
             \${panelWifi(s)}
             \${panelThermal(s)}

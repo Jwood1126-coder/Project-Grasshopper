@@ -17,6 +17,11 @@ esp_err_t net_relay_start(void);
 // Send a JSON envelope to the relay. Drops if not connected. Thread-safe.
 esp_err_t net_relay_send(const char *json, size_t len);
 
+// Send a binary frame (preview image, etc) over the same WS connection.
+// Caller frames its own header in the payload — the relay routes binary
+// frames separately from JSON. Drops if not connected. Thread-safe.
+esp_err_t net_relay_send_binary(const void *buf, size_t len);
+
 bool net_relay_is_connected(void);
 
 #ifdef __cplusplus

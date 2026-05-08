@@ -71,7 +71,10 @@ esp_err_t net_relay_start(void) {
         .network_timeout_ms = 10000,
         .crt_bundle_attach = esp_crt_bundle_attach,
         .task_stack = 6144,
-        .buffer_size = 2048,
+        // Sized for VGA JPEG previews (~30-50 KB at q=12) plus our 24 B
+        // header. esp_websocket_client_send_bin() chunks larger payloads
+        // automatically, but a single big buffer is simpler.
+        .buffer_size = 65536,
     };
     s_client = esp_websocket_client_init(&cfg);
     if (!s_client) return ESP_FAIL;
@@ -85,6 +88,13 @@ esp_err_t net_relay_send(const char *json, size_t len) {
     if (!s_connected || !s_client) return ESP_ERR_INVALID_STATE;
     int sent = esp_websocket_client_send_text(s_client, json, (int)len,
                                               pdMS_TO_TICKS(1000));
+    return sent > 0 ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t net_relay_send_binary(const void *buf, size_t len) {
+    if (!s_connected || !s_client) return ESP_ERR_INVALID_STATE;
+    int sent = esp_websocket_client_send_bin(s_client, (const char *)buf,
+                                              (int)len, pdMS_TO_TICKS(2000));
     return sent > 0 ? ESP_OK : ESP_FAIL;
 }
 
