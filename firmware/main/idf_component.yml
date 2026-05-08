@@ -1,0 +1,13 @@
+## Project-level component dependencies. Most components declare their
+## own deps; this is only for ones that the main app needs as a whole.
+
+dependencies:
+  ## Pinned to 3.1.0 specifically — 3.1.3 uses uart_config_t.flags which
+  ## was added in IDF v5.3.1; we have plain v5.3.0.
+  espressif/arduino-esp32: "3.1.1"
+  ## arduino-esp32 is pulled in for the Arduino SPIClass used by
+  ## hal_lepton. The IDF spi_master driver truncates the 164-byte
+  ## VoSPI receive at 4 bytes on these GPIO-matrix pins (see
+  ## docs/phase3-spi-issue.md); Arduino's SPIClass uses lower-level
+  ## register access in 64-byte chunks and is known to work on this
+  ## exact wiring (Fox uses it).

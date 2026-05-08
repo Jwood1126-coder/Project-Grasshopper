@@ -5,20 +5,21 @@
 // memset on every reset path) preserved verbatim.
 //
 // Platform changes:
-//   SPIClass(FSPI)         →  spi_master (full-duplex, mosi=-1)
-//   digitalWrite           →  gpio_set_level
+//   SPIClass(FSPI)         →  lepton_spi.cpp (Arduino SPIClass — IDF
+//                              spi_master truncates at byte 4 here)
+//   digitalWrite           →  gpio_set_level (CS handled inside lepton_spi)
 //   ps_malloc              →  heap_caps_malloc(MALLOC_CAP_SPIRAM)
 //   millis()               →  esp_timer_get_time()/1000
 //   Serial.printf          →  ESP_LOG*
 //   xTaskCreatePinnedToCore + Semaphore — unchanged (FreeRTOS).
 
 #include "lepton_internal.h"
+#include "lepton_spi.h"
 #include "board_pins.h"
 
 #include <string.h>
 
 #include "driver/gpio.h"
-#include "driver/spi_master.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -37,11 +38,9 @@ static const char *TAG = "lep_vospi";
 // Buffers
 static uint16_t *s_pending = NULL;          // PSRAM, 20 lines × 80 px × 2B = 3200B
 static uint16_t *s_frame[2] = {NULL, NULL}; // PSRAM, 38400B each
-static uint8_t  *s_pkt = NULL;              // DMA-capable internal SRAM, 164B
-static uint8_t  *s_tx_zeros = NULL;         // DMA-capable, 164B of 0 — full-duplex needs a real TX
+static uint8_t  *s_pkt = NULL;              // 164B packet buffer (no special caps needed —
+                                            // Arduino's SPIClass copies byte-by-byte from FIFO)
 static volatile int s_write_idx = 0;
-
-static spi_device_handle_t s_spi = NULL;
 
 // Mutex protecting frame counter + write index
 static SemaphoreHandle_t s_mutex = NULL;
@@ -74,55 +73,7 @@ static inline uint32_t now_ms(void) {
     return (uint32_t)(esp_timer_get_time() / 1000);
 }
 
-// ---- SPI bus + device init ----
-
-static esp_err_t spi_init(void) {
-    spi_bus_config_t bus_cfg = {
-        .mosi_io_num = -1,
-        .miso_io_num = LEP_SPI_MISO,
-        .sclk_io_num = LEP_SPI_SCK,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = 4096,   // generous; default 4092 is also fine
-    };
-    esp_err_t err = spi_bus_initialize(SPI3_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "spi_bus_initialize: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    spi_device_interface_config_t dev_cfg = {
-        .clock_speed_hz = LEP_SPI_FREQ_HZ,
-        .mode = 3,                  // CPOL=1, CPHA=1
-        .spics_io_num = -1,         // manual CS via GPIO
-        .queue_size = 1,
-        .command_bits = 0,
-        .address_bits = 0,
-        .dummy_bits = 0,
-        .flags = 0,                 // full-duplex (chunked polling)
-    };
-    err = spi_bus_add_device(SPI3_HOST, &dev_cfg, &s_spi);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "spi_bus_add_device: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    // Manual CS line high.
-    gpio_config_t cs_cfg = {
-        .pin_bit_mask = 1ULL << LEP_SPI_CS,
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&cs_cfg);
-    gpio_set_level(LEP_SPI_CS, 1);
-
-
-    ESP_LOGI(TAG, "SPI ready (sck=%d miso=%d cs=%d, %d Hz, mode 3)",
-             LEP_SPI_SCK, LEP_SPI_MISO, LEP_SPI_CS, LEP_SPI_FREQ_HZ);
-    return ESP_OK;
-}
+// SPI is owned by lepton_spi.cpp — see lepton_spi_init() below.
 
 // ---- Power-cycle the Lepton via MOSFET (fox approach) ----
 
@@ -162,32 +113,7 @@ static bool vospi_read_packet(uint8_t *out_line, uint8_t *out_seg) {
     *out_seg = 0;
     *out_line = 0;
 
-    // Read 164 bytes as 3 polling chunks (64+64+36) with CS held low
-    // across all of them. Lepton stalls when SCK pauses between chunks
-    // and resumes from the next bit, so we don't lose bytes.
-    // Workaround for the IDF spi_master truncation issue described in
-    // docs/phase3-spi-issue.md. Per-packet read time ~250 μs — too
-    // slow to keep up with Lepton's 9 kpps stream during READING, so
-    // frames don't currently assemble. Next session will try
-    // Arduino-as-component or properly bypass spi_master via spi_ll.
-    gpio_set_level(LEP_SPI_CS, 0);
-    int offset = 0, remaining = LEP_PKT_LEN;
-    while (remaining > 0) {
-        int chunk = remaining > 64 ? 64 : remaining;
-        spi_transaction_t t = {
-            .length    = chunk * 8,
-            .rxlength  = chunk * 8,
-            .tx_buffer = s_tx_zeros,
-            .rx_buffer = s_pkt + offset,
-        };
-        if (spi_device_polling_transmit(s_spi, &t) != ESP_OK) {
-            gpio_set_level(LEP_SPI_CS, 1);
-            return false;
-        }
-        offset += chunk;
-        remaining -= chunk;
-    }
-    gpio_set_level(LEP_SPI_CS, 1);
+    if (!lepton_spi_read_packet(s_pkt, LEP_PKT_LEN)) return false;
 
     // Discard packet?  byte0 low nibble == 0x0F.
     if ((s_pkt[0] & 0x0F) == 0x0F) return false;
@@ -594,21 +520,14 @@ esp_err_t lepton_vospi_init(void) {
     memset(s_pending, 0, VOSPI_PENDING_LINES * VOSPI_PIXELS_PER_PKT * sizeof(uint16_t));
 
     if (!s_pkt) {
-        s_pkt = heap_caps_malloc(LEP_PKT_LEN, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        s_pkt = heap_caps_malloc(LEP_PKT_LEN, MALLOC_CAP_INTERNAL);
     }
     if (!s_pkt) {
-        ESP_LOGE(TAG, "DMA packet buffer alloc failed");
-        return ESP_ERR_NO_MEM;
-    }
-    if (!s_tx_zeros) {
-        s_tx_zeros = heap_caps_calloc(1, LEP_PKT_LEN, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    }
-    if (!s_tx_zeros) {
-        ESP_LOGE(TAG, "DMA tx-zeros buffer alloc failed");
+        ESP_LOGE(TAG, "packet buffer alloc failed");
         return ESP_ERR_NO_MEM;
     }
 
-    esp_err_t err = spi_init();
+    esp_err_t err = lepton_spi_init();
     if (err != ESP_OK) return err;
 
     if (!s_task) {

@@ -30,6 +30,12 @@ CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 # Main task: needs room for setup + JSON serializers
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
+# Arduino-as-component (used only for the Lepton SPI HAL — see
+# components/hal_lepton). We provide our own app_main, so don't auto-
+# start Arduino's setup() / loop().
+CONFIG_AUTOSTART_ARDUINO=n
+CONFIG_FREERTOS_HZ=1000
+
 # Wi-Fi: stock defaults for phase 2; revisit when heap budget gets tight.
 # (Manual override — STATIC=4 — broke the IDF v5.3 build because the
 # default RX_BA_WIN of 6 must be ≤ 2 × static buffers.)
