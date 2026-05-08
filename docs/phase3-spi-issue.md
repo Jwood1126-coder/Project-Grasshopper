@@ -1,5 +1,20 @@
 # Phase 3 — VoSPI receive on IDF v5.3 spi_master
 
+## Hardware verified healthy (sanity check)
+
+After exhausting `spi_master` configurations, flashed Fox to the
+device and saw:
+
+```
+[vospi] First frame! seg IDs: 1 2 3 4
+Lepton: READY (frames: 1)
+Lepton: initial FFC triggered
+```
+
+So Lepton chip, breakout, wiring (SCK=41, MISO=42, CS=14, MOSFET=46),
+and the ESP32-S3 SPI peripheral are all good. The 4-byte truncation
+is purely a software issue in our `spi_master` integration.
+
 ## Symptom
 
 VoSPI reader runs, packets clock in, but frames never assemble. With
