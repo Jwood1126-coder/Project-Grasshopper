@@ -21,8 +21,14 @@
 static const char *TAG = "lep_cci";
 
 // ---- Globals (declared extern in lepton_internal.h) ----
-i2c_master_bus_handle_t lep_i2c_bus = NULL;
-i2c_master_dev_handle_t lep_i2c_dev = NULL;
+//
+// Why legacy driver/i2c.h instead of driver/i2c_master.h: the
+// esp32-camera component on IDF v5.3 uses the legacy SCCB driver
+// (driver/sccb.c), and the IDF refuses to link both APIs in the same
+// binary (i2c.c:check_i2c_driver_conflict aborts at boot). Since the
+// camera's choice is forced (its sccb-ng.c is gated to IDF v5.4+), the
+// CCI must match. Cosmetic difference; functionally equivalent.
+i2c_port_t lep_i2c_port = I2C_NUM_0;
 SemaphoreHandle_t lep_wire_mutex = NULL;
 
 // ---- CCI register addresses ----
@@ -60,7 +66,9 @@ static esp_err_t cci_write_reg(uint16_t reg, uint16_t value) {
         (uint8_t)(value >> 8), (uint8_t)(value & 0xFF),
     };
     xSemaphoreTake(lep_wire_mutex, portMAX_DELAY);
-    esp_err_t err = i2c_master_transmit(lep_i2c_dev, buf, 4, CCI_I2C_TIMEOUT_MS);
+    esp_err_t err = i2c_master_write_to_device(
+        lep_i2c_port, LEP_I2C_ADDR, buf, 4,
+        pdMS_TO_TICKS(CCI_I2C_TIMEOUT_MS));
     xSemaphoreGive(lep_wire_mutex);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "write_reg 0x%04x: %s", reg, esp_err_to_name(err));
@@ -72,10 +80,9 @@ static esp_err_t cci_read_reg(uint16_t reg, uint16_t *value) {
     uint8_t reg_buf[2] = { (uint8_t)(reg >> 8), (uint8_t)(reg & 0xFF) };
     uint8_t out[2] = {0, 0};
     xSemaphoreTake(lep_wire_mutex, portMAX_DELAY);
-    // Lepton needs a small intra-transfer gap; transmit_receive issues a
-    // RESTART between phases which the device tolerates.
-    esp_err_t err = i2c_master_transmit_receive(
-        lep_i2c_dev, reg_buf, 2, out, 2, CCI_I2C_TIMEOUT_MS);
+    esp_err_t err = i2c_master_write_read_device(
+        lep_i2c_port, LEP_I2C_ADDR, reg_buf, 2, out, 2,
+        pdMS_TO_TICKS(CCI_I2C_TIMEOUT_MS));
     xSemaphoreGive(lep_wire_mutex);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "read_reg 0x%04x: %s", reg, esp_err_to_name(err));
@@ -129,33 +136,27 @@ esp_err_t lepton_cci_init(void) {
     lep_wire_mutex = xSemaphoreCreateMutex();
     if (!lep_wire_mutex) return ESP_ERR_NO_MEM;
 
-    i2c_master_bus_config_t bus_cfg = {
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .i2c_port = I2C_NUM_0,
-        .scl_io_num = LEP_I2C_SCL,
-        .sda_io_num = LEP_I2C_SDA,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
+    i2c_config_t conf = {
+        .mode             = I2C_MODE_MASTER,
+        .sda_io_num       = LEP_I2C_SDA,
+        .scl_io_num       = LEP_I2C_SCL,
+        .sda_pullup_en    = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en    = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = 100000, // Lepton's safe range
     };
-    esp_err_t err = i2c_new_master_bus(&bus_cfg, &lep_i2c_bus);
+    esp_err_t err = i2c_param_config(lep_i2c_port, &conf);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "i2c_new_master_bus: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "i2c_param_config: %s", esp_err_to_name(err));
+        return err;
+    }
+    err = i2c_driver_install(lep_i2c_port, conf.mode, 0, 0, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "i2c_driver_install: %s", esp_err_to_name(err));
         return err;
     }
 
-    i2c_device_config_t dev_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = LEP_I2C_ADDR,
-        .scl_speed_hz = 100000,   // 100 kHz — Lepton's safe range
-    };
-    err = i2c_master_bus_add_device(lep_i2c_bus, &dev_cfg, &lep_i2c_dev);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "i2c_master_bus_add_device: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    ESP_LOGI(TAG, "CCI initialized (I2C0 sda=%d scl=%d, 0x%02x @100kHz)",
-             LEP_I2C_SDA, LEP_I2C_SCL, LEP_I2C_ADDR);
+    ESP_LOGI(TAG, "CCI initialized (I2C%d sda=%d scl=%d, 0x%02x @100kHz)",
+             lep_i2c_port, LEP_I2C_SDA, LEP_I2C_SCL, LEP_I2C_ADDR);
     return ESP_OK;
 }
 

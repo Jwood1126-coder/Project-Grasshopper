@@ -7,11 +7,12 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
-#include "driver/i2c_master.h"
+#include "driver/i2c.h"
 
-// Shared I2C bus + Lepton device handle (created in lepton_cci_init).
-extern i2c_master_bus_handle_t lep_i2c_bus;
-extern i2c_master_dev_handle_t lep_i2c_dev;
+// I2C port the CCI bus runs on. Other components on the same physical
+// bus (e.g. hal_oled) install themselves on this same port via the
+// legacy `driver/i2c.h` API.
+extern i2c_port_t lep_i2c_port;
 
 // Shared mutex for I2C bus. Same role as Fox's wire_mutex — once OLED
 // lands in phase 4 it must take this same mutex to coexist on the bus.

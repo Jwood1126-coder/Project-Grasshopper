@@ -79,18 +79,22 @@ const char *hal_lepton_state_name(uint8_t state);
 
 // ---------- Shared I2C bus access ----------
 //
-// hal_lepton owns the I2C master bus + a wire-mutex (so CCI ops don't
-// race a future OLED driver on the same bus). Other components on the
+// hal_lepton owns the I2C port + a wire-mutex (so CCI ops don't race
+// other devices on the same physical bus). Other components on the
 // same bus (e.g. hal_oled) borrow these via the accessors below.
 //
-// Returns NULL if hal_lepton_boot() hasn't run or I2C init failed.
+// Uses the legacy driver/i2c.h API for IDF v5.3 compatibility — the
+// esp32-camera SCCB on v5.3 forces the legacy driver, and the IDF
+// won't link the new and old drivers in the same binary.
+//
+// Returns -1 / NULL if hal_lepton_boot() hasn't run.
 
-#include "driver/i2c_master.h"
+#include "driver/i2c.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
-i2c_master_bus_handle_t hal_lepton_i2c_bus(void);
-SemaphoreHandle_t       hal_lepton_wire_mutex(void);
+int               hal_lepton_i2c_port(void);
+SemaphoreHandle_t hal_lepton_wire_mutex(void);
 
 #ifdef __cplusplus
 }

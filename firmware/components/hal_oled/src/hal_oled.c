@@ -12,7 +12,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "driver/i2c_master.h"
+#include "driver/i2c.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -21,11 +21,13 @@
 
 static const char *TAG = "hal_oled";
 
-#define FB_BYTES (OLED_W * OLED_H / 8)
+#define FB_BYTES   (OLED_W * OLED_H / 8)
+#define I2C_TIMEOUT_MS 200
 
-static i2c_master_dev_handle_t s_dev = NULL;
-static SemaphoreHandle_t       s_wire = NULL;
-static uint8_t                 s_fb[FB_BYTES];
+static int               s_port = -1;
+static SemaphoreHandle_t s_wire = NULL;
+static uint8_t           s_fb[FB_BYTES];
+static bool              s_panel_ok = false;
 
 typedef enum {
     SCR_BOOT = 0,
@@ -67,47 +69,38 @@ static const uint8_t ssd1306_init[] = {
     0xAF,                       // display on
 };
 
-static esp_err_t oled_send_cmd(const uint8_t *cmd_buf, size_t len) {
-    if (xSemaphoreTake(s_wire, pdMS_TO_TICKS(200)) != pdTRUE) {
+static esp_err_t oled_send(const uint8_t *buf, size_t len) {
+    if (xSemaphoreTake(s_wire, pdMS_TO_TICKS(500)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
-    esp_err_t err = i2c_master_transmit(s_dev, cmd_buf, len,
-                                         pdMS_TO_TICKS(200));
+    esp_err_t err = i2c_master_write_to_device(
+        s_port, OLED_I2C_ADDR, buf, len, pdMS_TO_TICKS(I2C_TIMEOUT_MS));
     xSemaphoreGive(s_wire);
     return err;
 }
 
 // Flush the framebuffer in 8 page writes. Each page = 1 control byte
-// (0x40 = data) + 128 data bytes. We'd love one giant write, but the
-// SSD1306 expects the 0x40 control byte at the start of each I2C
-// transmission, so 8 small writes is the canonical approach.
+// (0x40 = data) + 128 data bytes. The SSD1306 expects the 0x40 control
+// byte at the start of each I2C transmission, so 8 small writes is the
+// canonical approach.
 static esp_err_t oled_flush(void) {
-    if (!s_dev) return ESP_FAIL;
-    if (xSemaphoreTake(s_wire, pdMS_TO_TICKS(500)) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
-    }
+    if (!s_panel_ok) return ESP_FAIL;
 
-    // Set column range 0..127, page range 0..7.
     static const uint8_t addr_setup[] = {
         0x00,
-        0x21, 0x00, 0x7F,        // column 0..127
-        0x22, 0x00, 0x07,        // page 0..7
+        0x21, 0x00, 0x7F,
+        0x22, 0x00, 0x07,
     };
-    esp_err_t err = i2c_master_transmit(s_dev, addr_setup, sizeof(addr_setup),
-                                         pdMS_TO_TICKS(200));
-    if (err != ESP_OK) goto out;
+    esp_err_t err = oled_send(addr_setup, sizeof(addr_setup));
+    if (err != ESP_OK) return err;
 
     uint8_t chunk[1 + 128];
     chunk[0] = 0x40;
     for (int p = 0; p < 8; p++) {
         memcpy(&chunk[1], &s_fb[p * 128], 128);
-        err = i2c_master_transmit(s_dev, chunk, sizeof(chunk),
-                                   pdMS_TO_TICKS(200));
+        err = oled_send(chunk, sizeof(chunk));
         if (err != ESP_OK) break;
     }
-
-out:
-    xSemaphoreGive(s_wire);
     return err;
 }
 
@@ -227,38 +220,25 @@ static void scheduler_task(void *arg) {
 }
 
 esp_err_t hal_oled_start(void) {
-    if (s_dev) return ESP_OK;
+    if (s_panel_ok) return ESP_OK;
 
-    i2c_master_bus_handle_t bus = hal_lepton_i2c_bus();
+    int port = hal_lepton_i2c_port();
     s_wire = hal_lepton_wire_mutex();
-    if (!bus || !s_wire) {
-        ESP_LOGE(TAG, "I2C bus not ready (call hal_lepton_boot first)");
+    if (port < 0 || !s_wire) {
+        ESP_LOGE(TAG, "I2C port not ready (call hal_lepton_boot first)");
         return ESP_FAIL;
     }
-
-    i2c_device_config_t dev_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address  = OLED_I2C_ADDR,
-        .scl_speed_hz    = 400000,
-    };
-    esp_err_t err = i2c_master_bus_add_device(bus, &dev_cfg, &s_dev);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "i2c_master_bus_add_device: %s", esp_err_to_name(err));
-        return err;
-    }
-
+    s_port = port;
     s_status_mutex = xSemaphoreCreateMutex();
 
-    err = oled_send_cmd(ssd1306_init, sizeof(ssd1306_init));
+    esp_err_t err = oled_send(ssd1306_init, sizeof(ssd1306_init));
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "ssd1306 init: %s — display absent?", esp_err_to_name(err));
-        // Keep s_dev around so future writes are no-ops via the same path.
         return err;
     }
+    s_panel_ok = true;
     ESP_LOGI(TAG, "ssd1306 ready @ 0x%02x, %dx%d", OLED_I2C_ADDR, OLED_W, OLED_H);
 
-    // Render boot screen synchronously so the user sees something
-    // before the scheduler kicks in.
     render_boot();
     oled_flush();
 
