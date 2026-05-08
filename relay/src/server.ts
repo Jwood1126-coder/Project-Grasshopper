@@ -64,15 +64,23 @@ app.get('/api/devices/:id/events', (c) => {
 app.get('/api/devices/:id/last-frame.jpg', (c) => {
   const d = store.get(c.req.param('id'))
   if (!d) return c.text('unknown device', 404)
-  const modality = c.req.query('modality') === 'thermal' ? 'thermal' : 'vis'
-  const frame = modality === 'thermal' ? d.previewTherm : d.previewVis
+  const m = c.req.query('modality')
+  if (m !== 'vis' && m !== 'thermal') {
+    return c.text('modality must be "vis" or "thermal"', 400)
+  }
+  const frame = m === 'thermal' ? d.previewTherm : d.previewVis
   if (!frame) return c.text('no frame yet', 404)
-  c.header('Content-Type', 'image/jpeg')
-  c.header('Cache-Control', 'no-store')
-  c.header('X-Frame-Width', String(frame.width))
-  c.header('X-Frame-Height', String(frame.height))
-  c.header('X-Frame-Age-Ms', String(Date.now() - frame.ts))
-  return c.body(frame.jpeg)
+  // Return a raw Response so the typed body accepts Uint8Array directly
+  // (Hono's c.body only accepts string | ArrayBuffer | ReadableStream).
+  return new Response(frame.jpeg, {
+    headers: {
+      'Content-Type':    'image/jpeg',
+      'Cache-Control':   'no-store',
+      'X-Frame-Width':   String(frame.width),
+      'X-Frame-Height':  String(frame.height),
+      'X-Frame-Age-Ms':  String(Date.now() - frame.ts),
+    },
+  })
 })
 
 app.post('/api/devices/:id/cmd', async (c) => {
@@ -159,16 +167,16 @@ const server = Bun.serve<WsCtx>({
     },
     message(ws, raw) {
       // Binary frames carry preview JPEGs with a 24-byte "GHFR" header;
-      // anything else is JSON text.
+      // anything else is JSON text. Bun delivers binary as Buffer.
       if (typeof raw !== 'string') {
-        const buf = raw instanceof Buffer ? raw : Buffer.from(raw as ArrayBuffer)
+        const buf: Buffer = raw
         if (buf.length >= 24 && buf[0] === 0x47 && buf[1] === 0x48 &&
             buf[2] === 0x46 && buf[3] === 0x52) {
           handlePreview(ws, buf)
           return
         }
       }
-      const text = typeof raw === 'string' ? raw : new TextDecoder().decode(raw)
+      const text = typeof raw === 'string' ? raw : raw.toString('utf-8')
       let msg: any
       try {
         msg = JSON.parse(text)

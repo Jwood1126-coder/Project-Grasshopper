@@ -75,6 +75,24 @@ esp_err_t net_relay_start(void) {
         // header. esp_websocket_client_send_bin() chunks larger payloads
         // automatically, but a single big buffer is simpler.
         .buffer_size = 65536,
+        // ---- Connection liveness ----
+        // iPhone hotspot NAT silently drops idle TCP connections after
+        // ~60-180 s. Without these, the WS appears alive until the next
+        // send, then closes with code 1006. Three layers:
+        //
+        //   1. ping_interval_sec=15  — application-level WS PING every
+        //      15 s; provokes a PONG so the NAT keeps the mapping warm.
+        //   2. pingpong_timeout_sec=30 — if the device doesn't get a
+        //      PONG within 30 s, drop and reconnect (don't sit there
+        //      thinking we're connected).
+        //   3. keep_alive_*            — TCP-layer keepalives so the
+        //      kernel notices a dead peer even between WS frames.
+        .ping_interval_sec       = 15,
+        .pingpong_timeout_sec    = 30,
+        .keep_alive_enable       = true,
+        .keep_alive_idle         = 30,
+        .keep_alive_interval     = 10,
+        .keep_alive_count        = 3,
     };
     s_client = esp_websocket_client_init(&cfg);
     if (!s_client) return ESP_FAIL;
