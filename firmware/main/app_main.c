@@ -41,12 +41,20 @@ static int64_t g_boot_ms = 0;
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 static uint64_t uptime_ms(void) { return (uint64_t)(now_ms() - g_boot_ms); }
 
-static char s_json_buf[1536];
+static char s_json_buf[2048];
 
 // Local rolling fps tracker — frame counter is monotonic from hal_lepton,
 // fps is delta over the tick interval.
 static uint32_t s_last_frame_count = 0;
 static uint32_t s_last_fps = 0;
+
+// Camera sensor name — populated once at init, then read-only.
+static char s_sensor_name[32] = "";
+
+// Live wifi link — refreshed each tick by fill_wifi().
+static char s_wifi_ip[16]   = "";
+static char s_wifi_ssid[33] = "";
+static int  s_wifi_rssi     = 0;
 
 static const char *gain_str(int mode) {
     switch (mode) {
@@ -64,6 +72,33 @@ static void fill_visible(Visible_t *out) {
     out->w       = st.width;
     out->h       = st.height;
     out->quality = st.jpeg_quality;
+    out->ready   = st.ready;
+    out->sensor  = s_sensor_name;
+}
+
+static void fill_wifi(Wifi_t *out) {
+    net_wifi_get_link(s_wifi_ip, sizeof(s_wifi_ip),
+                      s_wifi_ssid, sizeof(s_wifi_ssid),
+                      &s_wifi_rssi);
+    out->mode = "STA";
+    out->ssid = s_wifi_ssid[0] ? s_wifi_ssid : CONFIG_GRASSHOPPER_WIFI_SSID;
+    out->rssi = s_wifi_rssi;
+    out->ip   = s_wifi_ip;
+}
+
+static void fill_storage(Storage_t *out) {
+    hal_storage_sd_stats_t  ss = {0};
+    hal_storage_lfs_stats_t ls = {0};
+    hal_storage_sd_stats(&ss);
+    hal_storage_lfs_stats(&ls);
+
+    out->sdMounted   = ss.mounted;
+    out->sdTotalKB   = ss.total_bytes / 1024;
+    out->sdUsedKB    = ss.used_bytes  / 1024;
+    out->sdFreeKB    = ss.free_bytes  / 1024;
+    out->lfsMounted  = ls.mounted;
+    out->lfsTotalKB  = (uint32_t)(ls.total_bytes / 1024);
+    out->lfsUsedKB   = (uint32_t)(ls.used_bytes  / 1024);
 }
 
 static void fill_thermal(Thermal_t *out) {
@@ -99,17 +134,13 @@ static void send_init(void) {
         .uptimeMs = uptime_ms(),
         .freeHeap = (uint32_t)esp_get_free_heap_size(),
         .freePsram = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-        .wifi = {
-            .mode = "STA",
-            .ssid = CONFIG_GRASSHOPPER_WIFI_SSID,
-            .rssi = -50,
-            .ip = "",
-        },
         .ntpSynced = false,
         .epoch = 0,
     };
+    fill_wifi(&init.wifi);
     fill_visible(&init.visible);
     fill_thermal(&init.thermal);
+    fill_storage(&init.storage);
 
     size_t n = Init_to_json(s_json_buf, sizeof(s_json_buf), &init);
     if (n > 0 && n < sizeof(s_json_buf)) {
@@ -141,12 +172,11 @@ static void tick_task(void *arg) {
         last_fps_ms = t;
         hal_camera_tick_fps();
 
-        // Push status to OLED — also when the relay is offline, so the
-        // user always sees fresh fps/heap/wifi numbers.
+        // Refresh wifi link strings (also feeds the OLED status below).
+        net_wifi_get_link(s_wifi_ip, sizeof(s_wifi_ip),
+                          s_wifi_ssid, sizeof(s_wifi_ssid),
+                          &s_wifi_rssi);
         {
-            char ip[16] = {0}, ssid[33] = {0};
-            int rssi = 0;
-            net_wifi_get_link(ip, sizeof(ip), ssid, sizeof(ssid), &rssi);
             hal_camera_stats_t cs = {0};
             hal_camera_get_stats(&cs);
             hal_storage_sd_stats_t ss = {0};
@@ -154,9 +184,9 @@ static void tick_task(void *arg) {
 
             hal_oled_status_t os = {
                 .fw_version      = GRASSHOPPER_FW_VERSION,
-                .wifi_ssid       = ssid,
-                .wifi_ip         = ip,
-                .wifi_rssi       = rssi,
+                .wifi_ssid       = s_wifi_ssid,
+                .wifi_ip         = s_wifi_ip,
+                .wifi_rssi       = s_wifi_rssi,
                 .relay_connected = net_relay_is_connected(),
                 .therm_fps       = s_last_fps,
                 .cam_fps         = cs.fps,
@@ -181,7 +211,10 @@ static void tick_task(void *arg) {
         tick.freePsram = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
         tick.epoch = (uint64_t)time(NULL);
         tick.state = DEVICESTATE_STREAMING;
+        fill_wifi(&tick.wifi);
+        fill_visible(&tick.visible);
         fill_thermal(&tick.thermal);
+        fill_storage(&tick.storage);
 
         size_t n = Tick_to_json(s_json_buf, sizeof(s_json_buf), &tick);
         if (n > 0 && n < sizeof(s_json_buf)) {
@@ -236,11 +269,11 @@ void app_main(void) {
         .jpeg_quality = 12,
         .fb_count     = 2,
     };
-    char sensor_name[32] = {0};
-    if (hal_camera_init(&cam_cfg, sensor_name) != ESP_OK) {
+    if (hal_camera_init(&cam_cfg, s_sensor_name) != ESP_OK) {
         ESP_LOGW(TAG, "camera init failed — vis-stream unavailable");
+        strncpy(s_sensor_name, "absent", sizeof(s_sensor_name) - 1);
     } else {
-        ESP_LOGI(TAG, "camera ready (sensor=%s)", sensor_name);
+        ESP_LOGI(TAG, "camera ready (sensor=%s)", s_sensor_name);
     }
 
     // OLED — needs hal_lepton's I2C bus, so it goes after hal_lepton_boot.

@@ -227,75 +227,174 @@ const DASHBOARD_HTML = `<!doctype html>
 <title>Grasshopper relay</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-  :root { color-scheme: light dark; --fg:#222; --bg:#fafafa; --muted:#777; --accent:#0a7; --warn:#c33; }
-  @media (prefers-color-scheme: dark) { :root { --fg:#eee; --bg:#1a1a1a; --muted:#888; --accent:#4f8; } }
+  :root { color-scheme: light dark; --fg:#222; --bg:#fafafa; --muted:#777; --accent:#0a7; --warn:#c33; --ok:#2a8; --line:#8883; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#eee; --bg:#161616; --muted:#888; --accent:#4f8; --ok:#3c9; --line:#fff2; } }
   * { box-sizing: border-box }
   body { font: 14px/1.5 -apple-system, system-ui, Segoe UI, sans-serif; margin: 0; color: var(--fg); background: var(--bg); }
-  header { padding: 16px 24px; border-bottom: 1px solid #8881; display: flex; align-items: center; gap: 12px; }
+  header { padding: 14px 24px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 12px; }
   header h1 { font-size: 18px; margin: 0; font-weight: 600; }
-  header .live { color: var(--accent); font-weight: 500; }
-  main { max-width: 1100px; margin: 0 auto; padding: 24px; }
-  .card { border: 1px solid #8882; border-radius: 8px; padding: 16px 20px; margin-bottom: 16px; background: #fff1; }
-  .card h2 { font-size: 14px; font-weight: 600; margin: 0 0 8px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+  header .live { color: var(--accent); font-weight: 500; font-size: 13px; }
+  main { max-width: 1200px; margin: 0 auto; padding: 20px 24px; }
   .empty { color: var(--muted); font-style: italic; }
-  .device { border: 1px solid #8883; border-radius: 6px; padding: 12px 16px; margin-bottom: 12px; }
-  .device h3 { margin: 0 0 4px; font-size: 16px; display: flex; gap: 8px; align-items: center; }
+  .device { border: 1px solid var(--line); border-radius: 8px; padding: 14px 18px; margin-bottom: 18px; background: #fff1; }
+  .device h3 { margin: 0 0 2px; font-size: 16px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .device .id { font-family: ui-monospace, monospace; font-size: 13px; }
-  .device .pill { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px; background: #8884; }
-  .pill.online { background: var(--accent); color: #000; }
+  .pill { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px; background: #8884; line-height: 1.5; }
+  .pill.online { background: var(--ok); color: #000; }
   .pill.offline { background: var(--warn); color: #fff; }
-  .device .meta { color: var(--muted); font-size: 12px; }
-  .device pre { font: 11px/1.4 ui-monospace, monospace; background: #0001; padding: 8px; border-radius: 4px; max-height: 200px; overflow: auto; margin: 8px 0 0; }
-  .footer { color: var(--muted); font-size: 11px; padding: 24px; text-align: center; }
+  .pill.state { background: #5af3; color: var(--fg); font-family: ui-monospace, monospace; }
+  .meta { color: var(--muted); font-size: 12px; margin-bottom: 10px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+  .panel { border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; background: #fff1; }
+  .panel h4 { font: 600 11px ui-sans-serif; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 6px; }
+  .row { display: flex; justify-content: space-between; gap: 8px; padding: 1px 0; font-size: 13px; }
+  .row .k { color: var(--muted); }
+  .row .v { font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+  .row .v.warn { color: var(--warn); }
+  .row .v.ok { color: var(--ok); }
+  details { margin-top: 12px; }
+  details summary { font-size: 12px; color: var(--muted); cursor: pointer; user-select: none; }
+  details pre { font: 11px/1.4 ui-monospace, monospace; background: #0001; padding: 8px; border-radius: 4px; max-height: 280px; overflow: auto; margin: 6px 0 0; }
+  .events { margin-top: 12px; }
+  .events .ev { font: 12px/1.5 ui-monospace, monospace; padding: 2px 0; border-bottom: 1px dotted var(--line); }
+  .events .ev .t { color: var(--muted); }
+  .footer { color: var(--muted); font-size: 11px; padding: 18px 24px; text-align: center; }
 </style>
 </head>
 <body>
 <header>
-  <h1>🦗 Grasshopper relay</h1>
+  <h1>Grasshopper relay</h1>
   <span class="live" id="status">connecting…</span>
 </header>
-<main>
-  <div class="card">
-    <h2>Devices</h2>
-    <div id="devices" class="empty">No devices connected yet.</div>
-  </div>
-</main>
+<main id="devices"><div class="empty">No devices connected yet.</div></main>
 <div class="footer">
-  Agent-readable endpoints: <code>/api/devices</code>, <code>/api/devices/:id/state</code>,
-  <code>/api/devices/:id/logs?since=&lt;ts&gt;</code>, <code>/api/devices/:id/events</code>
+  Agent-readable: <code>/api/devices</code> · <code>/api/devices/:id/state</code> ·
+  <code>/api/devices/:id/logs?since=</code> · <code>/api/devices/:id/events</code>
 </div>
 <script>
+  const fmtKB = (n) => n == null ? '—' : n < 1024 ? n + ' KB' : (n / 1024).toFixed(1) + ' MB';
+  const fmtPct = (used, total) => (total > 0) ? Math.round((used / total) * 100) + '%' : '—';
+  const fmtAge = (ms) => {
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return s + 's';
+    if (s < 3600) return Math.floor(s/60) + 'm ' + (s%60) + 's';
+    return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+  };
+  const rssiClass = (r) => r === 0 ? 'warn' : r > -65 ? 'ok' : '';
+
+  function row(k, v, cls) {
+    const c = cls ? \` class="v \${cls}"\` : ' class="v"';
+    return \`<div class="row"><span class="k">\${k}</span><span\${c}>\${v ?? '—'}</span></div>\`;
+  }
+
+  function panelWifi(s) {
+    const w = s?.wifi || {};
+    return \`<div class="panel"><h4>WiFi</h4>
+      \${row('SSID', w.ssid || '—')}
+      \${row('IP', w.ip || '—')}
+      \${row('RSSI', w.rssi != null && w.rssi !== 0 ? w.rssi + ' dBm' : 'no link', rssiClass(w.rssi))}
+      \${row('Mode', w.mode || '—')}
+    </div>\`;
+  }
+
+  function panelThermal(s) {
+    const t = s?.thermal || {};
+    const valid = t.totalPackets ? Math.round(100 * t.validPackets / t.totalPackets) + '%' : '—';
+    return \`<div class="panel"><h4>Lepton</h4>
+      \${row('State', t.state || '—')}
+      \${row('FPS', t.fps ?? '—')}
+      \${row('Frames', t.frames ?? '—')}
+      \${row('Valid', valid)}
+      \${row('Splices', t.spliceDetected ?? 0)}
+      \${row('HW resets', t.hwResets ?? 0, t.hwResets > 0 ? 'warn' : '')}
+      \${row('Gain · AGC', (t.gain || '?') + ' · ' + (t.agc ? 'on' : 'off'))}
+    </div>\`;
+  }
+
+  function panelCamera(s) {
+    const v = s?.visible || {};
+    return \`<div class="panel"><h4>Camera</h4>
+      \${row('Sensor', v.sensor || '—')}
+      \${row('Ready', v.ready ? 'yes' : 'no', v.ready ? 'ok' : 'warn')}
+      \${row('Frame', v.w && v.h ? v.w + '×' + v.h : '—')}
+      \${row('FPS', v.fps ?? '—')}
+      \${row('JPEG q', v.quality ?? '—')}
+    </div>\`;
+  }
+
+  function panelStorage(s) {
+    const st = s?.storage || {};
+    return \`<div class="panel"><h4>Storage</h4>
+      \${row('SD', st.sdMounted ? 'mounted' : 'absent', st.sdMounted ? 'ok' : 'warn')}
+      \${row('SD used', st.sdMounted ? (fmtKB(st.sdUsedKB) + ' / ' + fmtKB(st.sdTotalKB) + ' (' + fmtPct(st.sdUsedKB, st.sdTotalKB) + ')') : '—')}
+      \${row('LittleFS', st.lfsMounted ? fmtKB(st.lfsUsedKB) + ' / ' + fmtKB(st.lfsTotalKB) : 'absent', st.lfsMounted ? '' : 'warn')}
+    </div>\`;
+  }
+
+  function panelSystem(s) {
+    return \`<div class="panel"><h4>System</h4>
+      \${row('Uptime', s?.uptimeMs != null ? fmtAge(s.uptimeMs) : '—')}
+      \${row('Free heap', s?.freeHeap != null ? fmtKB(s.freeHeap / 1024) : '—')}
+      \${row('Free PSRAM', s?.freePsram != null ? fmtKB(s.freePsram / 1024) : '—')}
+      \${row('NTP', s?.ntpSynced ? 'synced' : (s?.epoch ? 'set' : 'no'))}
+    </div>\`;
+  }
+
+  async function fetchEvents(id) {
+    try {
+      const r = await fetch('/api/devices/' + encodeURIComponent(id) + '/events', { cache: 'no-store' });
+      const j = await r.json();
+      return (j.events || []).slice(-5).reverse();
+    } catch { return []; }
+  }
+
+  function eventBlock(events) {
+    if (!events.length) return '';
+    return '<div class="events"><h4 style="margin:14px 0 4px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;">Recent events</h4>' +
+      events.map(e => \`<div class="ev"><span class="t">\${new Date(e.ts).toLocaleTimeString()}</span> [\${e.kind}] \${e.msg || ''}</div>\`).join('') +
+      '</div>';
+  }
+
   async function tick() {
     try {
-      const r = await fetch('/api/devices', { cache: 'no-store' })
-      const data = await r.json()
-      const devs = data.devices || []
-      const root = document.getElementById('devices')
-      const status = document.getElementById('status')
-      status.textContent = devs.length + ' device' + (devs.length === 1 ? '' : 's')
+      const r = await fetch('/api/devices', { cache: 'no-store' });
+      const data = await r.json();
+      const devs = data.devices || [];
+      const status = document.getElementById('status');
+      status.textContent = devs.length + ' device' + (devs.length === 1 ? '' : 's');
+      const root = document.getElementById('devices');
       if (!devs.length) {
-        root.className = 'empty'
-        root.innerHTML = 'No devices connected yet. Start a device with relay enabled to see it here.'
-        return
+        root.innerHTML = '<div class="empty">No devices connected yet. Start a device with relay enabled to see it here.</div>';
+        return;
       }
-      root.className = ''
       const blocks = await Promise.all(devs.map(async d => {
-        const stateRes = await fetch('/api/devices/' + encodeURIComponent(d.deviceId) + '/state', { cache: 'no-store' })
-        const stateData = await stateRes.json()
-        const ageS = Math.floor((Date.now() - d.lastSeenMs) / 1000)
+        const sr = await fetch('/api/devices/' + encodeURIComponent(d.deviceId) + '/state', { cache: 'no-store' });
+        const sd = await sr.json();
+        const s = sd.tick || sd.init || {};
+        const events = await fetchEvents(d.deviceId);
+        const ageS = Math.floor((Date.now() - d.lastSeenMs) / 1000);
         return \`<div class="device">
           <h3><span class="id">\${d.deviceId}</span>
-              <span class="pill \${d.online ? 'online' : 'offline'}">\${d.online ? 'online' : 'offline'}</span></h3>
-          <div class="meta">fw \${d.fwVersion || '?'} · \${d.gitSha || '?'} · ip \${d.ip || '?'} · last seen \${ageS}s ago</div>
-          <pre>\${JSON.stringify(stateData.tick || stateData.init || {}, null, 2)}</pre>
-        </div>\`
-      }))
-      root.innerHTML = blocks.join('')
+              <span class="pill \${d.online ? 'online' : 'offline'}">\${d.online ? 'online' : 'offline'}</span>
+              <span class="pill state">\${d.state || '—'}</span></h3>
+          <div class="meta">fw \${d.fwVersion || '?'} · sha \${d.gitSha || '?'} · ip \${d.ip || '?'} · last seen \${ageS}s ago</div>
+          <div class="grid">
+            \${panelWifi(s)}
+            \${panelThermal(s)}
+            \${panelCamera(s)}
+            \${panelStorage(s)}
+            \${panelSystem(s)}
+          </div>
+          \${eventBlock(events)}
+          <details><summary>raw tick JSON</summary><pre>\${JSON.stringify(s, null, 2)}</pre></details>
+        </div>\`;
+      }));
+      root.innerHTML = blocks.join('');
     } catch (e) {
-      document.getElementById('status').textContent = 'error: ' + e.message
+      document.getElementById('status').textContent = 'error: ' + e.message;
     }
   }
-  tick(); setInterval(tick, 2000)
+  tick(); setInterval(tick, 2000);
 </script>
 </body>
 </html>

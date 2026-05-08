@@ -30,7 +30,7 @@ size_t Hello_to_json(char *buf, size_t bufsz, const Hello_t *m) {
 
 size_t Init_to_json(char *buf, size_t bufsz, const Init_t *m) {
     return snprintf(buf, bufsz,
-        "{\"type\":\"%s\",\"fwVersion\":\"%s\",\"gitSha\":\"%s\",\"deviceId\":\"%s\",\"state\":\"%s\",\"uptimeMs\":%llu,\"freeHeap\":%lu,\"freePsram\":%lu,\"wifi\":{\"mode\":\"%s\",\"ssid\":\"%s\",\"rssi\":%ld,\"ip\":\"%s\"},\"ntpSynced\":%s,\"epoch\":%llu,\"visible\":{\"fps\":%lu,\"w\":%lu,\"h\":%lu,\"quality\":%lu},\"thermal\":{\"fps\":%lu,\"gain\":\"%s\",\"agc\":%s,\"frames\":%lu,\"totalPackets\":%lu,\"validPackets\":%lu,\"discardPackets\":%lu,\"syncEntries\":%lu,\"lineMismatch\":%lu,\"segNot1\":%lu,\"segMismatch\":%lu,\"segZero\":%lu,\"frameTimeout\":%lu,\"spliceDetected\":%lu,\"hwResets\":%lu,\"lastFFCMs\":%lu,\"state\":\"%s\"}}",
+        "{\"type\":\"%s\",\"fwVersion\":\"%s\",\"gitSha\":\"%s\",\"deviceId\":\"%s\",\"state\":\"%s\",\"uptimeMs\":%llu,\"freeHeap\":%lu,\"freePsram\":%lu,\"wifi\":{\"mode\":\"%s\",\"ssid\":\"%s\",\"rssi\":%ld,\"ip\":\"%s\"},\"ntpSynced\":%s,\"epoch\":%llu,\"visible\":{\"fps\":%lu,\"w\":%lu,\"h\":%lu,\"quality\":%lu,\"ready\":%s,\"sensor\":\"%s\"},\"thermal\":{\"fps\":%lu,\"gain\":\"%s\",\"agc\":%s,\"frames\":%lu,\"totalPackets\":%lu,\"validPackets\":%lu,\"discardPackets\":%lu,\"syncEntries\":%lu,\"lineMismatch\":%lu,\"segNot1\":%lu,\"segMismatch\":%lu,\"segZero\":%lu,\"frameTimeout\":%lu,\"spliceDetected\":%lu,\"hwResets\":%lu,\"lastFFCMs\":%lu,\"state\":\"%s\"},\"storage\":{\"sdMounted\":%s,\"sdTotalKB\":%llu,\"sdUsedKB\":%llu,\"sdFreeKB\":%llu,\"lfsMounted\":%s,\"lfsTotalKB\":%lu,\"lfsUsedKB\":%lu}}",
         m->type,
         m->fwVersion,
         m->gitSha,
@@ -49,6 +49,8 @@ size_t Init_to_json(char *buf, size_t bufsz, const Init_t *m) {
         (unsigned long)m->visible.w,
         (unsigned long)m->visible.h,
         (unsigned long)m->visible.quality,
+        (m->visible.ready ? "true" : "false"),
+        m->visible.sensor,
         (unsigned long)m->thermal.fps,
         m->thermal.gain,
         (m->thermal.agc ? "true" : "false"),
@@ -65,18 +67,35 @@ size_t Init_to_json(char *buf, size_t bufsz, const Init_t *m) {
         (unsigned long)m->thermal.spliceDetected,
         (unsigned long)m->thermal.hwResets,
         (unsigned long)m->thermal.lastFFCMs,
-        m->thermal.state);
+        m->thermal.state,
+        (m->storage.sdMounted ? "true" : "false"),
+        (unsigned long long)m->storage.sdTotalKB,
+        (unsigned long long)m->storage.sdUsedKB,
+        (unsigned long long)m->storage.sdFreeKB,
+        (m->storage.lfsMounted ? "true" : "false"),
+        (unsigned long)m->storage.lfsTotalKB,
+        (unsigned long)m->storage.lfsUsedKB);
 }
 
 size_t Tick_to_json(char *buf, size_t bufsz, const Tick_t *m) {
     return snprintf(buf, bufsz,
-        "{\"type\":\"%s\",\"uptimeMs\":%llu,\"freeHeap\":%lu,\"freePsram\":%lu,\"epoch\":%llu,\"state\":\"%s\",\"thermal\":{\"fps\":%lu,\"gain\":\"%s\",\"agc\":%s,\"frames\":%lu,\"totalPackets\":%lu,\"validPackets\":%lu,\"discardPackets\":%lu,\"syncEntries\":%lu,\"lineMismatch\":%lu,\"segNot1\":%lu,\"segMismatch\":%lu,\"segZero\":%lu,\"frameTimeout\":%lu,\"spliceDetected\":%lu,\"hwResets\":%lu,\"lastFFCMs\":%lu,\"state\":\"%s\"}}",
+        "{\"type\":\"%s\",\"uptimeMs\":%llu,\"freeHeap\":%lu,\"freePsram\":%lu,\"epoch\":%llu,\"state\":\"%s\",\"wifi\":{\"mode\":\"%s\",\"ssid\":\"%s\",\"rssi\":%ld,\"ip\":\"%s\"},\"visible\":{\"fps\":%lu,\"w\":%lu,\"h\":%lu,\"quality\":%lu,\"ready\":%s,\"sensor\":\"%s\"},\"thermal\":{\"fps\":%lu,\"gain\":\"%s\",\"agc\":%s,\"frames\":%lu,\"totalPackets\":%lu,\"validPackets\":%lu,\"discardPackets\":%lu,\"syncEntries\":%lu,\"lineMismatch\":%lu,\"segNot1\":%lu,\"segMismatch\":%lu,\"segZero\":%lu,\"frameTimeout\":%lu,\"spliceDetected\":%lu,\"hwResets\":%lu,\"lastFFCMs\":%lu,\"state\":\"%s\"},\"storage\":{\"sdMounted\":%s,\"sdTotalKB\":%llu,\"sdUsedKB\":%llu,\"sdFreeKB\":%llu,\"lfsMounted\":%s,\"lfsTotalKB\":%lu,\"lfsUsedKB\":%lu}}",
         m->type,
         (unsigned long long)m->uptimeMs,
         (unsigned long)m->freeHeap,
         (unsigned long)m->freePsram,
         (unsigned long long)m->epoch,
         DeviceState_str(m->state),
+        m->wifi.mode,
+        m->wifi.ssid,
+        (long)m->wifi.rssi,
+        m->wifi.ip,
+        (unsigned long)m->visible.fps,
+        (unsigned long)m->visible.w,
+        (unsigned long)m->visible.h,
+        (unsigned long)m->visible.quality,
+        (m->visible.ready ? "true" : "false"),
+        m->visible.sensor,
         (unsigned long)m->thermal.fps,
         m->thermal.gain,
         (m->thermal.agc ? "true" : "false"),
@@ -93,7 +112,14 @@ size_t Tick_to_json(char *buf, size_t bufsz, const Tick_t *m) {
         (unsigned long)m->thermal.spliceDetected,
         (unsigned long)m->thermal.hwResets,
         (unsigned long)m->thermal.lastFFCMs,
-        m->thermal.state);
+        m->thermal.state,
+        (m->storage.sdMounted ? "true" : "false"),
+        (unsigned long long)m->storage.sdTotalKB,
+        (unsigned long long)m->storage.sdUsedKB,
+        (unsigned long long)m->storage.sdFreeKB,
+        (m->storage.lfsMounted ? "true" : "false"),
+        (unsigned long)m->storage.lfsTotalKB,
+        (unsigned long)m->storage.lfsUsedKB);
 }
 
 size_t Event_to_json(char *buf, size_t bufsz, const Event_t *m) {

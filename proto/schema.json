@@ -27,7 +27,20 @@
         "fps": "u32",
         "w": "u32",
         "h": "u32",
-        "quality": "u32"
+        "quality": "u32",
+        "ready": "bool",
+        "sensor": "string"
+      }
+    },
+    "Storage": {
+      "fields": {
+        "sdMounted": "bool",
+        "sdTotalKB": "u64",
+        "sdUsedKB": "u64",
+        "sdFreeKB": "u64",
+        "lfsMounted": "bool",
+        "lfsTotalKB": "u32",
+        "lfsUsedKB": "u32"
       }
     },
     "Thermal": {
@@ -79,7 +92,8 @@
         "ntpSynced": "bool",
         "epoch": "u64",
         "visible": "Visible",
-        "thermal": "Thermal"
+        "thermal": "Thermal",
+        "storage": "Storage"
       }
     },
     "Tick": {
@@ -91,7 +105,10 @@
         "freePsram": "u32",
         "epoch": "u64",
         "state": "DeviceState",
-        "thermal": "Thermal"
+        "wifi": "Wifi",
+        "visible": "Visible",
+        "thermal": "Thermal",
+        "storage": "Storage"
       }
     },
     "Event": {

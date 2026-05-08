@@ -36,7 +36,19 @@ typedef struct {
     uint32_t w;
     uint32_t h;
     uint32_t quality;
+    bool ready;
+    const char * sensor;
 } Visible_t;
+
+typedef struct {
+    bool sdMounted;
+    uint64_t sdTotalKB;
+    uint64_t sdUsedKB;
+    uint64_t sdFreeKB;
+    bool lfsMounted;
+    uint32_t lfsTotalKB;
+    uint32_t lfsUsedKB;
+} Storage_t;
 
 typedef struct {
     uint32_t fps;
@@ -83,6 +95,7 @@ typedef struct {
     uint64_t epoch;
     Visible_t visible;
     Thermal_t thermal;
+    Storage_t storage;
 } Init_t;
 
 size_t Init_to_json(char *buf, size_t bufsz, const Init_t *m);
@@ -94,7 +107,10 @@ typedef struct {
     uint32_t freePsram;
     uint64_t epoch;
     DeviceState_t state;
+    Wifi_t wifi;
+    Visible_t visible;
     Thermal_t thermal;
+    Storage_t storage;
 } Tick_t;
 
 size_t Tick_to_json(char *buf, size_t bufsz, const Tick_t *m);

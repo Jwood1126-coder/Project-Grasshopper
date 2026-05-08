@@ -23,6 +23,18 @@ export interface Visible {
   w: number;
   h: number;
   quality: number;
+  ready: boolean;
+  sensor: string;
+}
+
+export interface Storage {
+  sdMounted: boolean;
+  sdTotalKB: number;
+  sdUsedKB: number;
+  sdFreeKB: number;
+  lfsMounted: boolean;
+  lfsTotalKB: number;
+  lfsUsedKB: number;
 }
 
 export interface Thermal {
@@ -70,6 +82,7 @@ export interface Init {
   epoch: number;
   visible: Visible;
   thermal: Thermal;
+  storage: Storage;
 }
 
 /** Subset of Init. Pushed every ~1500ms to update changed fields. */
@@ -80,7 +93,10 @@ export interface Tick {
   freePsram: number;
   epoch: number;
   state: DeviceState;
+  wifi: Wifi;
+  visible: Visible;
   thermal: Thermal;
+  storage: Storage;
 }
 
 /** One-shot event (capture saved, FFC done, error, state change). */
