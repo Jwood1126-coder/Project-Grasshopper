@@ -414,6 +414,10 @@ const DASHBOARD_HTML = `<!doctype html>
     f.imgTherm    = f.frameTherm.querySelector('img');
     f.phVis       = f.frameVis.querySelector('.ph');
     f.phTherm     = f.frameTherm.querySelector('.ph');
+    console.log('[dbg] buildCard ' + deviceId +
+                ' previewWrap.children=' + previewWrap.children.length +
+                ' frameVis=' + !!f.frameVis +
+                ' frameTherm=' + !!f.frameTherm);
 
     // Panels
     const wifi = makePanel('WiFi', [
