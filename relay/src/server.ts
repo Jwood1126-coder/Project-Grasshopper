@@ -515,7 +515,7 @@ const DASHBOARD_HTML = `<!doctype html>
 
   // --- image refresh ---
   // The browser keeps the previously decoded image visible until the
-  // new one finishes loading and decoding, so a plain `img.src = newUrl`
+  // new one finishes loading and decoding, so a plain img.src swap
   // doesn't flash. The original "blink" was caused by tearing down the
   // <img> element each tick — which we no longer do.
   function refreshImage(card, modality) {
