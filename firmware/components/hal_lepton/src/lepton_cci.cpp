@@ -57,6 +57,7 @@ SemaphoreHandle_t lep_wire_mutex = NULL;
 #define CCI_CMD_SYS_TELEMETRY_ENABLE 0x0218
 #define CCI_CMD_OEM_POWER_DOWN       0x4800
 #define CCI_CMD_OEM_GPIO_MODE        0x4854
+#define CCI_CMD_OEM_REBOOT           0x4842   // soft-reboot the Lepton
 #define CCI_CMD_RAD_ENABLE           0x4E10
 #define CCI_CMD_RAD_TLINEAR_ENABLE   0x4EC0
 
@@ -191,6 +192,19 @@ esp_err_t lepton_cci_init(void) {
 
     ESP_LOGI(TAG, "CCI initialized via Arduino Wire (sda=%d scl=%d, 0x%02x @100kHz)",
              LEP_I2C_SDA, LEP_I2C_SCL, LEP_I2C_ADDR);
+
+    return ESP_OK;
+}
+
+esp_err_t lepton_cci_oem_reboot(void) {
+    ESP_LOGW(TAG, "issuing Lepton OEM_REBOOT (soft reset via CCI)");
+    if (!cci_run_command(CCI_CMD_OEM_REBOOT)) {
+        ESP_LOGW(TAG, "OEM_REBOOT cmd failed");
+        return ESP_FAIL;
+    }
+    // Lepton needs ~5 s to come back from a soft reboot.
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    ESP_LOGI(TAG, "OEM_REBOOT done");
     return ESP_OK;
 }
 

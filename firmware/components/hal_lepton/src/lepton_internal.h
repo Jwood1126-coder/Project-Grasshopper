@@ -27,6 +27,7 @@ extern SemaphoreHandle_t lep_wire_mutex;
 
 // CCI subsystem.
 esp_err_t lepton_cci_init(void);
+esp_err_t lepton_cci_oem_reboot(void);
 esp_err_t lepton_cci_configure(void);
 esp_err_t lepton_cci_run_ffc(void);
 esp_err_t lepton_cci_set_agc(bool enable);

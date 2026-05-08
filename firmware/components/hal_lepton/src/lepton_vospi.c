@@ -109,11 +109,24 @@ static void vospi_power_cycle_hardware(uint32_t boot_wait_ms) {
 
 // ---- Read one VoSPI packet (164 B) ----
 
+// DEBUG: histogram of byte0 values seen, dumped every N packets.
+// Tells us what the SPI is actually reading — bus garbage looks like
+// FF/00 dominant; Lepton-in-discard-mode looks like 0xF? / 0x?F mix;
+// Lepton-streaming looks like a mix of 00..03 (line numbers), 14
+// (line 20 segment-1), 24, 34, 44 (line 20 of segments 2-4), and
+// 0xF? for inter-frame discards.
+static uint32_t s_dbg_byte0_hist[16] = {0};
+static uint32_t s_dbg_byte1_max = 0;
+
 static bool vospi_read_packet(uint8_t *out_line, uint8_t *out_seg) {
     *out_seg = 0;
     *out_line = 0;
 
     if (!lepton_spi_read_packet(s_pkt, LEP_PKT_LEN)) return false;
+
+    // DEBUG: tally low nibble of byte0.
+    s_dbg_byte0_hist[s_pkt[0] & 0x0F]++;
+    if (s_pkt[1] > s_dbg_byte1_max) s_dbg_byte1_max = s_pkt[1];
 
     // Discard packet?  byte0 low nibble == 0x0F.
     if ((s_pkt[0] & 0x0F) == 0x0F) return false;
@@ -124,6 +137,18 @@ static bool vospi_read_packet(uint8_t *out_line, uint8_t *out_seg) {
     *out_line = (uint8_t)pn;
     if (*out_line == 20) *out_seg = (s_pkt[0] >> 4) & 0x07;
     return true;
+}
+
+// Called from the periodic-stats path so we get a histogram dump.
+void lepton_vospi_dbg_dump(void) {
+    char buf[200] = {0};
+    int p = 0;
+    for (int i = 0; i < 16; i++) {
+        p += snprintf(buf + p, sizeof(buf) - p, "%lu ",
+                      (unsigned long)s_dbg_byte0_hist[i]);
+    }
+    ESP_LOGI("lep_dbg", "byte0 lo-nib hist: %s | byte1_max=%lu",
+             buf, (unsigned long)s_dbg_byte1_max);
 }
 
 // ---- Pixel storage ----
@@ -290,7 +315,11 @@ static void vospi_task(void *arg) {
 
 
 
-        // Periodic stat dump (every ~30 s).
+        // Periodic stat dump (every ~10 k packets so we get fast feedback).
+        if (s_total_packets % 10000 == 0) {
+            extern void lepton_vospi_dbg_dump(void);
+            lepton_vospi_dbg_dump();
+        }
         if (s_total_packets % 180000 == 0) {
             ESP_LOGI(TAG, "frames=%lu total=%lu valid=%lu discard=%lu",
                      (unsigned long)s_frame_counter,
@@ -323,20 +352,21 @@ static void vospi_task(void *arg) {
                     }
                     vospi_force_resync();
 
-                    // Auto-reset only as last resort. Two guards:
-                    //   (a) at least 200 sync attempts (was 20). The
-                    //       Lepton can take 5-7 min to converge after
-                    //       repeated power-cycles — Fox recorded this
-                    //       in field. Aggressive reset here used to
-                    //       start the whole countdown over and never
-                    //       let it stabilize.
-                    //   (b) bail out if we've never seen ANY valid
-                    //       packet — that's a "truly stuck" Lepton
-                    //       and a hardware reset is the only fix.
-                    //       But if we have ≥1 valid packet, the
-                    //       Lepton is alive; just slow. Don't reset.
-                    if (sync_fail_count >= 200 && s_valid_packets == 0) {
+                    // Codex-improved recovery rule: track frames committed
+                    // since the last reset, not cumulative valid packets.
+                    // The old guard `s_valid_packets == 0` made recovery
+                    // impossible once we'd seen ONE valid packet ever —
+                    // exactly the half-alive state we got stuck in.
+                    //
+                    // New rule: if we've gone ≥600 sync attempts (~10 min
+                    // at ~1 s each) without committing a single frame
+                    // since the last reset attempt, the Lepton is
+                    // genuinely stuck and a reset is worth trying.
+                    static uint32_t s_frames_at_last_reset = 0;
+                    bool no_progress = (s_frame_counter == s_frames_at_last_reset);
+                    if (sync_fail_count >= 600 && no_progress) {
                         ESP_LOGW(TAG, "persistent failure — resetting Lepton hardware");
+                        s_frames_at_last_reset = s_frame_counter;
                         vospi_power_cycle_hardware(5000);
                         vospi_force_resync();
                         vospi_abort_frame(frame, &expect_seg, &expect_line,

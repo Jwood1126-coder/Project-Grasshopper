@@ -25,7 +25,11 @@
 #define LEP_SPI_SCK     41
 #define LEP_SPI_MISO    42
 #define LEP_SPI_CS      14
-#define LEP_SPI_FREQ_HZ 16000000
+// 8 MHz instead of 16 MHz — Codex's signal-integrity separator test.
+// If thermal frames immediately stabilize at 8 MHz, the breakout has
+// a margin issue at 16 MHz (loose wires, long jumpers, no termination).
+// If 8 MHz fails the same way, the bug is in the VoSPI state machine.
+#define LEP_SPI_FREQ_HZ 8000000
 
 // ===== FLIR Lepton 3.1R CCI (I2C) =====
 #define LEP_I2C_SDA      1

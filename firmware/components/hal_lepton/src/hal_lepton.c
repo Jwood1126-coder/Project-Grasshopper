@@ -42,7 +42,6 @@ esp_err_t hal_lepton_boot(void) {
 
     esp_err_t err = lepton_cci_init();
     if (err != ESP_OK) return err;
-
     err = lepton_cci_configure();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "CCI configure failed");
