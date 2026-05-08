@@ -390,23 +390,30 @@ const DASHBOARD_HTML = `<!doctype html>
 
     f.meta = el('div', { class: 'meta' }, '—');
 
-    // Preview tiles — stable <img> elements, refreshed by image loop.
-    f.imgVis    = el('img', { loading: 'lazy', alt: 'visible preview' });
-    f.imgTherm  = el('img', { loading: 'lazy', alt: 'thermal preview' });
-    f.frameVis  = el('div', { class: 'frame', 'data-modality': 'vis' },
-                      el('div', { class: 'label' }, 'visible'), f.imgVis);
-    f.frameTherm = el('div', { class: 'frame', 'data-modality': 'thermal' },
-                      el('div', { class: 'label' }, 'thermal'), f.imgTherm);
-    // Hide images by default; show once first frame loads.
-    f.imgVis.style.display    = 'none';
-    f.imgTherm.style.display  = 'none';
-    f.framePlaceholderVis   = document.createTextNode(' no frame yet');
-    f.framePlaceholderTherm = document.createTextNode(' no frame yet');
-    f.frameVis.classList.add('empty');
-    f.frameTherm.classList.add('empty');
-    f.frameVis.appendChild(f.framePlaceholderVis);
-    f.frameTherm.appendChild(f.framePlaceholderTherm);
-    const previewWrap = el('div', { class: 'preview' }, f.frameVis, f.frameTherm);
+    // Preview tiles built via innerHTML so both frames ALWAYS end up in
+    // the DOM. (Earlier el()-based variadic-children construction was
+    // somehow dropping the thermal frame in Chromium — repro'd via
+    // chromium-headless --dump-dom; root cause unclear, likely a
+    // browser-specific quirk. innerHTML sidesteps it.)
+    const previewWrap = document.createElement('div');
+    previewWrap.className = 'preview';
+    previewWrap.innerHTML =
+      '<div class="frame empty" data-modality="vis">' +
+        '<div class="label">visible</div>' +
+        '<img loading="lazy" alt="visible preview" style="display:none">' +
+        '<span class="ph">no frame yet</span>' +
+      '</div>' +
+      '<div class="frame empty" data-modality="thermal">' +
+        '<div class="label">thermal</div>' +
+        '<img loading="lazy" alt="thermal preview" style="display:none">' +
+        '<span class="ph">no frame yet</span>' +
+      '</div>';
+    f.frameVis    = previewWrap.querySelector('[data-modality="vis"]');
+    f.frameTherm  = previewWrap.querySelector('[data-modality="thermal"]');
+    f.imgVis      = f.frameVis.querySelector('img');
+    f.imgTherm    = f.frameTherm.querySelector('img');
+    f.phVis       = f.frameVis.querySelector('.ph');
+    f.phTherm     = f.frameTherm.querySelector('.ph');
 
     // Panels
     const wifi = makePanel('WiFi', [
@@ -526,10 +533,10 @@ const DASHBOARD_HTML = `<!doctype html>
     img.onload = () => {
       img.style.display = '';
       const frame = modality === 'vis' ? f.frameVis : f.frameTherm;
-      const placeholder = modality === 'vis' ? f.framePlaceholderVis : f.framePlaceholderTherm;
+      const ph    = modality === 'vis' ? f.phVis    : f.phTherm;
       if (frame.classList.contains('empty')) {
         frame.classList.remove('empty');
-        if (placeholder.parentNode === frame) frame.removeChild(placeholder);
+        if (ph) ph.style.display = 'none';
       }
     };
     img.onerror = () => { /* keep showing previous frame */ };
