@@ -11,3 +11,6 @@ dependencies:
   ## docs/phase3-spi-issue.md); Arduino's SPIClass uses lower-level
   ## register access in 64-byte chunks and is known to work on this
   ## exact wiring (Fox uses it).
+
+  ## OV2640 / OV5640 driver. Auto-detects sensor on init.
+  espressif/esp32-camera: "~2.0"

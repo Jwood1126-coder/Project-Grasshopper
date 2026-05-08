@@ -3,6 +3,6 @@ idf_component_register(
          "src/lepton_spi.cpp"
     INCLUDE_DIRS "include"
     PRIV_INCLUDE_DIRS "src" "../../main/include"
-    REQUIRES driver esp_timer freertos
-    PRIV_REQUIRES nvs_flash esp_driver_i2c esp_driver_spi esp_driver_gpio espressif__arduino-esp32
+    REQUIRES driver esp_timer freertos esp_driver_i2c
+    PRIV_REQUIRES nvs_flash esp_driver_spi esp_driver_gpio espressif__arduino-esp32
 )

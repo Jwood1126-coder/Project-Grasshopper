@@ -42,6 +42,11 @@
 #define SD_MMC_CMD      38
 #define SD_MMC_D0       40
 
+// ===== SSD1306 OLED (shares Lepton I2C bus) =====
+#define OLED_I2C_ADDR  0x3C
+#define OLED_W         128
+#define OLED_H          64
+
 // ===== Lepton frame geometry =====
 #define LEP_W            160
 #define LEP_H            120

@@ -21,7 +21,10 @@
 #include "freertos/task.h"
 #include "nvs_flash.h"
 
+#include "hal_camera.h"
 #include "hal_lepton.h"
+#include "hal_oled.h"
+#include "hal_storage.h"
 #include "net_relay.h"
 #include "net_wifi.h"
 #include "proto_gen.h"
@@ -52,6 +55,15 @@ static const char *gain_str(int mode) {
     case LEP_GAIN_AUTO: return "auto";
     default: return "?";
     }
+}
+
+static void fill_visible(Visible_t *out) {
+    hal_camera_stats_t st = {0};
+    hal_camera_get_stats(&st);
+    out->fps     = st.fps;
+    out->w       = st.width;
+    out->h       = st.height;
+    out->quality = st.jpeg_quality;
 }
 
 static void fill_thermal(Thermal_t *out) {
@@ -95,8 +107,8 @@ static void send_init(void) {
         },
         .ntpSynced = false,
         .epoch = 0,
-        .visible = { .fps = 0, .w = 0, .h = 0, .quality = 0 },
     };
+    fill_visible(&init.visible);
     fill_thermal(&init.thermal);
 
     size_t n = Init_to_json(s_json_buf, sizeof(s_json_buf), &init);
@@ -127,6 +139,32 @@ static void tick_task(void *arg) {
         }
         s_last_frame_count = frames;
         last_fps_ms = t;
+        hal_camera_tick_fps();
+
+        // Push status to OLED — also when the relay is offline, so the
+        // user always sees fresh fps/heap/wifi numbers.
+        {
+            char ip[16] = {0}, ssid[33] = {0};
+            int rssi = 0;
+            net_wifi_get_link(ip, sizeof(ip), ssid, sizeof(ssid), &rssi);
+            hal_camera_stats_t cs = {0};
+            hal_camera_get_stats(&cs);
+            hal_storage_sd_stats_t ss = {0};
+            hal_storage_sd_stats(&ss);
+
+            hal_oled_status_t os = {
+                .fw_version      = GRASSHOPPER_FW_VERSION,
+                .wifi_ssid       = ssid,
+                .wifi_ip         = ip,
+                .wifi_rssi       = rssi,
+                .relay_connected = net_relay_is_connected(),
+                .therm_fps       = s_last_fps,
+                .cam_fps         = cs.fps,
+                .free_heap_kb    = (uint32_t)(esp_get_free_heap_size() / 1024),
+                .sd_present      = ss.mounted,
+            };
+            hal_oled_set_status(&os);
+        }
 
         if (!net_relay_is_connected()) {
             sent_init = false;
@@ -166,6 +204,10 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
+    // Storage — non-fatal if a partition is missing or the SD slot is empty.
+    hal_storage_littlefs_mount();
+    hal_storage_sd_mount();
+
     if (strlen(CONFIG_GRASSHOPPER_WIFI_SSID) > 0) {
         ESP_ERROR_CHECK(net_wifi_init());
         net_wifi_connect_blocking(CONFIG_GRASSHOPPER_WIFI_SSID,
@@ -185,6 +227,25 @@ void app_main(void) {
     // frame; relay client reconnect-loops in the background until then.
     if (hal_lepton_boot() != ESP_OK) {
         ESP_LOGE(TAG, "Lepton boot failed — continuing in degraded mode");
+    }
+
+    // Bring up the visible camera. Failure is non-fatal — thermal-only
+    // mode still works.
+    hal_camera_cfg_t cam_cfg = {
+        .framesize    = HAL_CAM_FRAMESIZE_VGA,
+        .jpeg_quality = 12,
+        .fb_count     = 2,
+    };
+    char sensor_name[32] = {0};
+    if (hal_camera_init(&cam_cfg, sensor_name) != ESP_OK) {
+        ESP_LOGW(TAG, "camera init failed — vis-stream unavailable");
+    } else {
+        ESP_LOGI(TAG, "camera ready (sensor=%s)", sensor_name);
+    }
+
+    // OLED — needs hal_lepton's I2C bus, so it goes after hal_lepton_boot.
+    if (hal_oled_start() != ESP_OK) {
+        ESP_LOGW(TAG, "oled start failed — running headless");
     }
 
     // Tick task — TLS write through mbedtls needs ≥6 KB of locals on

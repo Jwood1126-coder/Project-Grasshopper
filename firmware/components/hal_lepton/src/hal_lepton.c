@@ -104,3 +104,6 @@ void hal_lepton_get_stats(hal_lepton_stats_t *out) {
 const char *hal_lepton_state_name(uint8_t state) {
     return lepton_vospi_state_name(state);
 }
+
+i2c_master_bus_handle_t hal_lepton_i2c_bus(void) { return lep_i2c_bus; }
+SemaphoreHandle_t       hal_lepton_wire_mutex(void) { return lep_wire_mutex; }

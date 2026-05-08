@@ -1,5 +1,6 @@
 #include "net_wifi.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "esp_event.h"
@@ -81,3 +82,28 @@ esp_err_t net_wifi_connect_blocking(const char *ssid, const char *password) {
 }
 
 bool net_wifi_is_connected(void) { return s_connected; }
+
+void net_wifi_get_link(char *ip_buf, size_t ip_len,
+                       char *ssid_buf, size_t ssid_len,
+                       int *rssi) {
+    if (ip_buf && ip_len)     ip_buf[0] = 0;
+    if (ssid_buf && ssid_len) ssid_buf[0] = 0;
+    if (rssi) *rssi = 0;
+    if (!s_connected) return;
+
+    esp_netif_t *nif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (nif && ip_buf && ip_len) {
+        esp_netif_ip_info_t info;
+        if (esp_netif_get_ip_info(nif, &info) == ESP_OK) {
+            snprintf(ip_buf, ip_len, IPSTR, IP2STR(&info.ip));
+        }
+    }
+
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        if (ssid_buf && ssid_len) {
+            strlcpy(ssid_buf, (const char *)ap.ssid, ssid_len);
+        }
+        if (rssi) *rssi = ap.rssi;
+    }
+}

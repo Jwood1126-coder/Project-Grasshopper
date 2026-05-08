@@ -77,6 +77,21 @@ typedef struct {
 void hal_lepton_get_stats(hal_lepton_stats_t *out);
 const char *hal_lepton_state_name(uint8_t state);
 
+// ---------- Shared I2C bus access ----------
+//
+// hal_lepton owns the I2C master bus + a wire-mutex (so CCI ops don't
+// race a future OLED driver on the same bus). Other components on the
+// same bus (e.g. hal_oled) borrow these via the accessors below.
+//
+// Returns NULL if hal_lepton_boot() hasn't run or I2C init failed.
+
+#include "driver/i2c_master.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
+i2c_master_bus_handle_t hal_lepton_i2c_bus(void);
+SemaphoreHandle_t       hal_lepton_wire_mutex(void);
+
 #ifdef __cplusplus
 }
 #endif
