@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "src/lepton_cci.c" "src/lepton_vospi.c" "src/hal_lepton.c"
+    SRCS "src/lepton_cci.cpp" "src/lepton_vospi.c" "src/hal_lepton.c"
          "src/lepton_spi.cpp"
     INCLUDE_DIRS "include"
     PRIV_INCLUDE_DIRS "src" "../../main/include"
