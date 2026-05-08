@@ -6,12 +6,14 @@
   "scripts": {
     "start": "bun run src/server.ts",
     "dev": "bun run --hot src/server.ts",
-    "fake": "bun run dev/fakedevice.ts"
+    "fake": "bun run dev/fakedevice.ts",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "hono": "^4.6.0"
   },
   "devDependencies": {
-    "@types/bun": "^1.1.0"
+    "@types/bun": "^1.1.0",
+    "typescript": "^5.5.0"
   }
 }

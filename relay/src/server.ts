@@ -76,6 +76,14 @@ app.get('/api/devices/:id/last-frame.jpg', (c) => {
 })
 
 app.post('/api/devices/:id/cmd', async (c) => {
+  // Require the same shared secret the device uses to register, sent
+  // as a Bearer header. Prevents anonymous internet traffic from
+  // forwarding commands to a connected device.
+  const auth = c.req.header('Authorization') || ''
+  const presented = auth.startsWith('Bearer ') ? auth.slice(7) : ''
+  if (!presented || presented !== RELAY_TOKEN) {
+    return c.json({ error: 'unauthorized' }, 401)
+  }
   const d = store.get(c.req.param('id'))
   if (!d) return c.json({ error: 'unknown device' }, 404)
   if (!d.socket || d.socket.readyState !== 1)
@@ -263,6 +271,18 @@ console.log(`grasshopper-relay listening on :${port}`)
 console.log(`  HTTP/dashboard  → http://localhost:${port}/`)
 console.log(`  device WS       → ws://localhost:${port}/relay`)
 console.log(`  RELAY_TOKEN=${RELAY_TOKEN === 'dev-token' ? '(dev default)' : 'set'}`)
+
+// If we're running behind a Railway public domain (i.e. on the open
+// internet) and still using the dev-token fallback, scream loudly.
+// Anyone could connect a device or hit /cmd without it.
+if (RELAY_TOKEN === 'dev-token' && process.env.RAILWAY_PUBLIC_DOMAIN) {
+  console.error('=========================================================')
+  console.error('  WARNING: RELAY_TOKEN is "dev-token" on a public deploy.')
+  console.error('  Set RELAY_TOKEN to a unique secret in Railway env vars.')
+  console.error('  Until you do, anyone with this URL can register a fake')
+  console.error('  device or POST commands to a connected one.')
+  console.error('=========================================================')
+}
 
 // ---- Embedded dashboard HTML (no framework) ----------------------------
 
@@ -513,11 +533,24 @@ const DASHBOARD_HTML = `<!doctype html>
       return;
     }
     f.events.style.display = '';
-    f.events.innerHTML = '<h4 style="margin:14px 0 4px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;">Recent events</h4>' +
-      events.map(e => '<div class="ev"><span class="t">' +
-        new Date(e.ts).toLocaleTimeString() + '</span> [' +
-        (e.kind || '?') + '] ' + (e.msg || '')
-        + '</div>').join('');
+    // Build via DOM, not innerHTML — event kind/msg come from the
+    // device, so we treat them as untrusted text.
+    f.events.replaceChildren();
+    const h = document.createElement('h4');
+    h.setAttribute('style', 'margin:14px 0 4px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;');
+    h.textContent = 'Recent events';
+    f.events.appendChild(h);
+    for (const e of events) {
+      const row = document.createElement('div');
+      row.className = 'ev';
+      const t = document.createElement('span');
+      t.className = 't';
+      t.textContent = new Date(e.ts).toLocaleTimeString();
+      row.appendChild(t);
+      // Plain text node for the message — no HTML interpretation.
+      row.appendChild(document.createTextNode(' [' + (e.kind || '?') + '] ' + (e.msg || '')));
+      f.events.appendChild(row);
+    }
   }
 
   // --- image refresh ---

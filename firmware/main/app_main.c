@@ -241,7 +241,10 @@ static void tick_task(void *arg) {
 //   offset 20: 4 B epoch seconds
 //   offset 24: <jpeg bytes>
 
-#define PREVIEW_INTERVAL_MS 2000
+// 1 s instead of 2 s so the integer-rounded FPS metric isn't always 0.
+// At ~30-50 KB per VGA q12 JPEG that's ~30-50 KB/s upload — fine on a
+// hotspot, well under the relay's WS buffer (64 KB).
+#define PREVIEW_INTERVAL_MS 1000
 #define PREVIEW_HDR_LEN     24
 #define PREVIEW_MAGIC       "GHFR"
 #define PREVIEW_MOD_VIS     1

@@ -146,33 +146,44 @@ def gen_h(schema):
 
 # ---- C serializer ----
 
-def emit_field(out_fmt, out_args, struct_path, fname, ftype, schema, is_first):
+def emit_field(out_fmt, out_args, struct_path, fname, ftype, schema, is_first, esc_map=None):
     """Append a JSON field's format chunk + args to out_fmt / out_args.
 
     struct_path: e.g. 'm->' or 'm->wifi.'
+    esc_map: maps a full source path (e.g. 'm->wifi.ssid') to the local
+             escape-buffer variable name to use instead of the raw
+             struct field. Required for string/enum fields that contain
+             arbitrary user data.
     """
+    if esc_map is None:
+        esc_map = {}
     sep = "" if is_first else ","
     base = ftype
+    full_path = f"{struct_path}{fname}"
     if base == "bool":
         out_fmt.append(f'{sep}\\"{fname}\\":%s')
-        out_args.append(f'({struct_path}{fname} ? "true" : "false")')
+        out_args.append(f'({full_path} ? "true" : "false")')
     elif base == "string":
         out_fmt.append(f'{sep}\\"{fname}\\":\\"%s\\"')
-        out_args.append(f"{struct_path}{fname}")
+        # Use the escape buffer if we pre-scanned this field; fall back
+        # to the raw pointer (codegen-internal sanity).
+        out_args.append(esc_map.get(full_path, full_path))
     elif base in PRIMITIVES:
         fmt = PRIMITIVES[base][2]
         cast = PRIMITIVES[base][3]
         out_fmt.append(f'{sep}\\"{fname}\\":{fmt}')
-        out_args.append(f"{cast}{struct_path}{fname}" if cast else f"{struct_path}{fname}")
+        out_args.append(f"{cast}{full_path}" if cast else full_path)
     elif base in schema.get("enums", {}):
+        # Enum string is a fixed identifier from the schema — safe to
+        # emit verbatim (no user input), so no escape needed.
         out_fmt.append(f'{sep}\\"{fname}\\":\\"%s\\"')
-        out_args.append(f"{base}_str({struct_path}{fname})")
+        out_args.append(f"{base}_str({full_path})")
     elif base in schema.get("structs", {}):
         out_fmt.append(f'{sep}\\"{fname}\\":{{')
         sdef = schema["structs"][base]
         first = True
         for sf, st in sdef["fields"].items():
-            emit_field(out_fmt, out_args, f"{struct_path}{fname}.", sf, st, schema, first)
+            emit_field(out_fmt, out_args, f"{full_path}.", sf, st, schema, first, esc_map)
             first = False
         out_fmt.append("}")
     else:
@@ -182,7 +193,43 @@ def emit_field(out_fmt, out_args, struct_path, fname, ftype, schema, is_first):
 def gen_c(schema):
     out = []
     out.append("// AUTO-GENERATED from proto/schema.json — do not edit by hand.\n\n")
-    out.append('#include "proto_gen.h"\n#include <stdio.h>\n\n')
+    out.append('#include "proto_gen.h"\n#include <stdio.h>\n#include <string.h>\n\n')
+
+    # JSON string escaper — copies `s` into `dst` (capacity `cap`) with
+    # backslash-escapes for ", \, control chars. Returns number of bytes
+    # written (excluding NUL). Caller is responsible for emitting the
+    # surrounding quotes. NULL input → empty output.
+    out.append('''\
+static size_t pg_esc(char *dst, size_t cap, const char *s) {
+    if (!dst || !cap) return 0;
+    if (!s) { dst[0] = 0; return 0; }
+    size_t n = 0;
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        const char *rep = NULL;
+        char ubuf[8];
+        if (c == '"')  rep = "\\\\\\"";
+        else if (c == '\\\\') rep = "\\\\\\\\";
+        else if (c == '\\n') rep = "\\\\n";
+        else if (c == '\\r') rep = "\\\\r";
+        else if (c == '\\t') rep = "\\\\t";
+        else if (c == '\\b') rep = "\\\\b";
+        else if (c == '\\f') rep = "\\\\f";
+        else if (c < 0x20)   { snprintf(ubuf, sizeof(ubuf), "\\\\u%04x", c); rep = ubuf; }
+        if (rep) {
+            size_t rl = strlen(rep);
+            if (n + rl + 1 > cap) break;
+            memcpy(dst + n, rep, rl); n += rl;
+        } else {
+            if (n + 2 > cap) break;
+            dst[n++] = (char)c;
+        }
+    }
+    dst[n < cap ? n : cap - 1] = 0;
+    return n;
+}
+
+''')
 
     for ename, evals in schema.get("enums", {}).items():
         out.append(f"const char *{ename}_str({ename}_t v) {{\n")
@@ -193,15 +240,38 @@ def gen_c(schema):
         out.append("    }\n")
         out.append("}\n\n")
 
+    # Walk every (string) field in messages + nested structs to figure
+    # out how many escape buffers we need to declare per serializer.
+    def collect_strings(prefix, path, ftype, schema, out):
+        if ftype == "string":
+            out.append((prefix, path))
+        elif ftype in schema.get("structs", {}):
+            for sf, st in schema["structs"][ftype]["fields"].items():
+                collect_strings(prefix + "_" + sf, path + "." + sf, st, schema, out)
+
     for mname, mdef in schema.get("messages", {}).items():
+        # Pre-scan string fields so we can stack-allocate escape buffers.
+        strings = []
+        for fname, ftype in mdef["fields"].items():
+            collect_strings("e_" + fname, "m->" + fname, ftype, schema, strings)
+
         out.append(
             f"size_t {mname}_to_json(char *buf, size_t bufsz, const {mname}_t *m) {{\n"
         )
+        # Per-string-field escape buffer. 256 B handles any sane SSID,
+        # log line, etc; longer strings are truncated, never overrun.
+        for var, _ in strings:
+            out.append(f"    char {var}[256];\n")
+        for var, srcpath in strings:
+            out.append(f"    pg_esc({var}, sizeof({var}), {srcpath});\n")
+
         fmt_parts = ['"{']
         args = []
         first = True
+        # Map srcpath → escape-buffer var for substitution during emit.
+        esc_map = {srcpath: var for var, srcpath in strings}
         for fname, ftype in mdef["fields"].items():
-            emit_field(fmt_parts, args, "m->", fname, ftype, schema, first)
+            emit_field(fmt_parts, args, "m->", fname, ftype, schema, first, esc_map)
             first = False
         fmt_parts.append('}"')
         fmt_str = "".join(fmt_parts)

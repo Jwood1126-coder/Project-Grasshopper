@@ -1,0 +1,92 @@
+# CI gates for Grasshopper. Runs on every push + PR.
+#
+# Three independent jobs:
+#   - relay-typecheck:   `tsc --noEmit` on relay/
+#   - app-typecheck:     `tsc --noEmit` on app/
+#   - firmware-build:    full ESP-IDF v5.3 build of firmware/
+#
+# A failure in any one fails the workflow. Codegen drift is also caught:
+# we re-run proto/codegen.py and fail if it produces a diff (= someone
+# edited proto_gen.{c,h} or types.ts directly without re-running it).
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  codegen-fresh:
+    name: proto codegen up-to-date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: regenerate
+        run: python3 proto/codegen.py
+      - name: diff
+        run: |
+          if ! git diff --exit-code; then
+            echo "::error::proto/codegen.py produced a diff — run it locally and commit."
+            exit 1
+          fi
+
+  relay-typecheck:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: relay
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+
+  app-typecheck:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+
+  firmware-build:
+    runs-on: ubuntu-latest
+    container:
+      # Pinned to v5.3 — bumping requires removing the arduino-esp32
+      # uart-hal patch (see docs/phase3-spi-issue.md §"How to keep this
+      # working in CI").
+      image: espressif/idf:v5.3
+    defaults:
+      run:
+        working-directory: firmware
+    steps:
+      - uses: actions/checkout@v4
+      - name: idf.py build
+        run: |
+          . $IDF_PATH/export.sh
+          # Resolve managed components first so the Arduino patch can
+          # apply (it lives inside managed_components/, which doesn't
+          # exist until idf-component-manager runs).
+          idf.py reconfigure || true
+          # Patch arduino-esp32 v3.1.1 so it builds against IDF v5.3.0.
+          # uart_config_t.flags.backup_before_sleep was added in
+          # v5.3.1; commenting it out is the documented workaround.
+          # See docs/phase3-spi-issue.md §"How to keep this working in CI".
+          PATCH_FILE=managed_components/espressif__arduino-esp32/cores/esp32/esp32-hal-uart.c
+          if grep -q 'uart_config.flags.backup_before_sleep' "$PATCH_FILE"; then
+            sed -i 's|uart_config.flags.backup_before_sleep = false;|/* uart_config.flags.backup_before_sleep = false; */|' "$PATCH_FILE"
+            echo "applied arduino-esp32 uart-hal patch"
+          fi
+          idf.py build
+      - name: report binary size
+        run: |
+          ls -la build/grasshopper.bin
+          echo "size: $(stat -c%s build/grasshopper.bin) bytes"
