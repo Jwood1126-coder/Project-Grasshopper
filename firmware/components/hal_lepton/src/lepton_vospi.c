@@ -323,7 +323,19 @@ static void vospi_task(void *arg) {
                     }
                     vospi_force_resync();
 
-                    if (sync_fail_count >= 20) {
+                    // Auto-reset only as last resort. Two guards:
+                    //   (a) at least 200 sync attempts (was 20). The
+                    //       Lepton can take 5-7 min to converge after
+                    //       repeated power-cycles — Fox recorded this
+                    //       in field. Aggressive reset here used to
+                    //       start the whole countdown over and never
+                    //       let it stabilize.
+                    //   (b) bail out if we've never seen ANY valid
+                    //       packet — that's a "truly stuck" Lepton
+                    //       and a hardware reset is the only fix.
+                    //       But if we have ≥1 valid packet, the
+                    //       Lepton is alive; just slow. Don't reset.
+                    if (sync_fail_count >= 200 && s_valid_packets == 0) {
                         ESP_LOGW(TAG, "persistent failure — resetting Lepton hardware");
                         vospi_power_cycle_hardware(5000);
                         vospi_force_resync();
