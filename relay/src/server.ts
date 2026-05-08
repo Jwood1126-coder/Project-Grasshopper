@@ -324,8 +324,14 @@ const DASHBOARD_HTML = `<!doctype html>
   <code>/api/devices/:id/logs?since=</code> · <code>/api/devices/:id/events</code>
 </div>
 <script>
-  const fmtKB = (n) => n == null ? '—' : n < 1024 ? n + ' KB' : (n / 1024).toFixed(1) + ' MB';
-  const fmtPct = (used, total) => (total > 0) ? Math.round((used / total) * 100) + '%' : '—';
+  // Dashboard refresh strategy: build per-device card DOM ONCE on first
+  // sight, then mutate text/class in place every status tick. Image
+  // refresh is on its own timer using a preload-then-swap pattern so
+  // the visible <img> never goes blank — eliminating the page-wide
+  // blink that came from rebuilding innerHTML each tick.
+
+  const fmtKB = (n) => n == null ? '—' : n < 1024 ? n.toFixed(0) + ' KB' : (n / 1024).toFixed(1) + ' MB';
+  const fmtPct = (u, t) => (t > 0) ? Math.round(100 * u / t) + '%' : '—';
   const fmtAge = (ms) => {
     const s = Math.floor(ms / 1000);
     if (s < 60) return s + 's';
@@ -334,62 +340,225 @@ const DASHBOARD_HTML = `<!doctype html>
   };
   const rssiClass = (r) => r === 0 ? 'warn' : r > -65 ? 'ok' : '';
 
-  function row(k, v, cls) {
-    const c = cls ? \` class="v \${cls}"\` : ' class="v"';
-    return \`<div class="row"><span class="k">\${k}</span><span\${c}>\${v ?? '—'}</span></div>\`;
+  // Per-device state we keep in JS so we can update incrementally.
+  const cards = new Map(); // deviceId → { rootEl, fields, lastVisTs, lastThermTs }
+
+  function el(tag, attrs = {}, ...children) {
+    const e = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs)) {
+      if (k === 'class') e.className = v;
+      else if (k === 'style') e.setAttribute('style', v);
+      else if (k.startsWith('data-')) e.setAttribute(k, v);
+      else e[k] = v;
+    }
+    for (const c of children) {
+      if (c == null) continue;
+      e.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+    }
+    return e;
   }
 
-  function panelWifi(s) {
+  function makeRow(label) {
+    const v = el('span', { class: 'v' }, '—');
+    return { row: el('div', { class: 'row' }, el('span', { class: 'k' }, label), v), v };
+  }
+  function setRow(rec, value, cls) {
+    rec.v.textContent = value ?? '—';
+    rec.v.className = 'v' + (cls ? ' ' + cls : '');
+  }
+
+  function makePanel(title, rows) {
+    const f = {};
+    const panel = el('div', { class: 'panel' }, el('h4', {}, title));
+    for (const [key, label] of rows) {
+      const r = makeRow(label);
+      f[key] = r;
+      panel.appendChild(r.row);
+    }
+    return { panel, f };
+  }
+
+  function buildCard(deviceId) {
+    const idEnc = encodeURIComponent(deviceId);
+    const f = {};
+
+    // Header
+    f.h_id    = el('span', { class: 'id' }, deviceId);
+    f.h_pill  = el('span', { class: 'pill offline' }, 'offline');
+    f.h_state = el('span', { class: 'pill state' }, '—');
+    const h3 = el('h3', {}, f.h_id, f.h_pill, f.h_state);
+
+    f.meta = el('div', { class: 'meta' }, '—');
+
+    // Preview tiles — stable <img> elements, refreshed by image loop.
+    f.imgVis    = el('img', { loading: 'lazy', alt: 'visible preview' });
+    f.imgTherm  = el('img', { loading: 'lazy', alt: 'thermal preview' });
+    f.ageVis    = el('span', { class: 'age' }, '—');
+    f.ageTherm  = el('span', { class: 'age' }, '—');
+    f.frameVis  = el('div', { class: 'frame', 'data-modality': 'vis' },
+                      el('div', { class: 'label' }, 'visible ', f.ageVis), f.imgVis);
+    f.frameTherm = el('div', { class: 'frame', 'data-modality': 'thermal' },
+                      el('div', { class: 'label' }, 'thermal ', f.ageTherm), f.imgTherm);
+    // Hide images by default; show once first frame loads.
+    f.imgVis.style.display    = 'none';
+    f.imgTherm.style.display  = 'none';
+    f.framePlaceholderVis   = document.createTextNode(' no frame yet');
+    f.framePlaceholderTherm = document.createTextNode(' no frame yet');
+    f.frameVis.classList.add('empty');
+    f.frameTherm.classList.add('empty');
+    f.frameVis.appendChild(f.framePlaceholderVis);
+    f.frameTherm.appendChild(f.framePlaceholderTherm);
+    const previewWrap = el('div', { class: 'preview' }, f.frameVis, f.frameTherm);
+
+    // Panels
+    const wifi = makePanel('WiFi', [
+      ['ssid', 'SSID'], ['ip', 'IP'], ['rssi', 'RSSI'], ['mode', 'Mode'],
+    ]);
+    const therm = makePanel('Lepton', [
+      ['state', 'State'], ['fps', 'FPS'], ['frames', 'Frames'],
+      ['valid', 'Valid'], ['splices', 'Splices'], ['hwr', 'HW resets'],
+      ['gain', 'Gain · AGC'],
+    ]);
+    const cam = makePanel('Camera', [
+      ['sensor', 'Sensor'], ['ready', 'Ready'], ['frame', 'Frame'],
+      ['fps', 'FPS'], ['q', 'JPEG q'],
+    ]);
+    const stor = makePanel('Storage', [
+      ['sd', 'SD'], ['sdUsed', 'SD used'], ['lfs', 'LittleFS'],
+    ]);
+    const sys = makePanel('System', [
+      ['uptime', 'Uptime'], ['heap', 'Free heap'], ['psram', 'Free PSRAM'], ['ntp', 'NTP'],
+    ]);
+    const grid = el('div', { class: 'grid' }, wifi.panel, therm.panel, cam.panel, stor.panel, sys.panel);
+
+    f.panels = { wifi: wifi.f, therm: therm.f, cam: cam.f, stor: stor.f, sys: sys.f };
+
+    f.events = el('div', { class: 'events', style: 'display:none' });
+    f.rawPre = el('pre', {}, '');
+    const det = el('details', {}, el('summary', {}, 'raw tick JSON'), f.rawPre);
+
+    const root = el('div', { class: 'device', 'data-device': idEnc },
+                    h3, f.meta, previewWrap, grid, f.events, det);
+
+    return { rootEl: root, fields: f, baseId: idEnc, lastVisTs: 0, lastThermTs: 0 };
+  }
+
+  function applyState(card, d, s) {
+    const f = card.fields;
+    f.h_pill.className = 'pill ' + (d.online ? 'online' : 'offline');
+    f.h_pill.textContent = d.online ? 'online' : 'offline';
+    f.h_state.textContent = d.state || '—';
+
+    const ageS = Math.max(0, Math.floor((Date.now() - d.lastSeenMs) / 1000));
+    f.meta.textContent = 'fw ' + (d.fwVersion || '?') + ' · sha ' + (d.gitSha || '?') +
+                         ' · ip ' + (d.ip || '?') + ' · last seen ' + ageS + 's ago';
+
+    // WiFi
     const w = s?.wifi || {};
-    return \`<div class="panel"><h4>WiFi</h4>
-      \${row('SSID', w.ssid || '—')}
-      \${row('IP', w.ip || '—')}
-      \${row('RSSI', w.rssi != null && w.rssi !== 0 ? w.rssi + ' dBm' : 'no link', rssiClass(w.rssi))}
-      \${row('Mode', w.mode || '—')}
-    </div>\`;
-  }
+    setRow(f.panels.wifi.ssid, w.ssid || '—');
+    setRow(f.panels.wifi.ip, w.ip || '—');
+    setRow(f.panels.wifi.rssi,
+      (w.rssi != null && w.rssi !== 0) ? w.rssi + ' dBm' : 'no link',
+      rssiClass(w.rssi));
+    setRow(f.panels.wifi.mode, w.mode || '—');
 
-  function panelThermal(s) {
+    // Thermal
     const t = s?.thermal || {};
     const valid = t.totalPackets ? Math.round(100 * t.validPackets / t.totalPackets) + '%' : '—';
-    return \`<div class="panel"><h4>Lepton</h4>
-      \${row('State', t.state || '—')}
-      \${row('FPS', t.fps ?? '—')}
-      \${row('Frames', t.frames ?? '—')}
-      \${row('Valid', valid)}
-      \${row('Splices', t.spliceDetected ?? 0)}
-      \${row('HW resets', t.hwResets ?? 0, t.hwResets > 0 ? 'warn' : '')}
-      \${row('Gain · AGC', (t.gain || '?') + ' · ' + (t.agc ? 'on' : 'off'))}
-    </div>\`;
-  }
+    setRow(f.panels.therm.state, t.state || '—');
+    setRow(f.panels.therm.fps, t.fps ?? '—');
+    setRow(f.panels.therm.frames, t.frames ?? '—');
+    setRow(f.panels.therm.valid, valid);
+    setRow(f.panels.therm.splices, t.spliceDetected ?? 0);
+    setRow(f.panels.therm.hwr, t.hwResets ?? 0, t.hwResets > 0 ? 'warn' : '');
+    setRow(f.panels.therm.gain, (t.gain || '?') + ' · ' + (t.agc ? 'on' : 'off'));
 
-  function panelCamera(s) {
+    // Camera
     const v = s?.visible || {};
-    return \`<div class="panel"><h4>Camera</h4>
-      \${row('Sensor', v.sensor || '—')}
-      \${row('Ready', v.ready ? 'yes' : 'no', v.ready ? 'ok' : 'warn')}
-      \${row('Frame', v.w && v.h ? v.w + '×' + v.h : '—')}
-      \${row('FPS', v.fps ?? '—')}
-      \${row('JPEG q', v.quality ?? '—')}
-    </div>\`;
-  }
+    setRow(f.panels.cam.sensor, v.sensor || '—');
+    setRow(f.panels.cam.ready, v.ready ? 'yes' : 'no', v.ready ? 'ok' : 'warn');
+    setRow(f.panels.cam.frame, (v.w && v.h) ? (v.w + '×' + v.h) : '—');
+    setRow(f.panels.cam.fps, v.fps ?? '—');
+    setRow(f.panels.cam.q, v.quality ?? '—');
 
-  function panelStorage(s) {
+    // Storage
     const st = s?.storage || {};
-    return \`<div class="panel"><h4>Storage</h4>
-      \${row('SD', st.sdMounted ? 'mounted' : 'absent', st.sdMounted ? 'ok' : 'warn')}
-      \${row('SD used', st.sdMounted ? (fmtKB(st.sdUsedKB) + ' / ' + fmtKB(st.sdTotalKB) + ' (' + fmtPct(st.sdUsedKB, st.sdTotalKB) + ')') : '—')}
-      \${row('LittleFS', st.lfsMounted ? fmtKB(st.lfsUsedKB) + ' / ' + fmtKB(st.lfsTotalKB) : 'absent', st.lfsMounted ? '' : 'warn')}
-    </div>\`;
+    setRow(f.panels.stor.sd, st.sdMounted ? 'mounted' : 'absent', st.sdMounted ? 'ok' : 'warn');
+    setRow(f.panels.stor.sdUsed,
+      st.sdMounted
+        ? (fmtKB(st.sdUsedKB) + ' / ' + fmtKB(st.sdTotalKB) + ' (' + fmtPct(st.sdUsedKB, st.sdTotalKB) + ')')
+        : '—');
+    setRow(f.panels.stor.lfs,
+      st.lfsMounted ? (fmtKB(st.lfsUsedKB) + ' / ' + fmtKB(st.lfsTotalKB)) : 'absent',
+      st.lfsMounted ? '' : 'warn');
+
+    // System
+    setRow(f.panels.sys.uptime, s?.uptimeMs != null ? fmtAge(s.uptimeMs) : '—');
+    setRow(f.panels.sys.heap, s?.freeHeap != null ? fmtKB(s.freeHeap / 1024) : '—');
+    setRow(f.panels.sys.psram, s?.freePsram != null ? fmtKB(s.freePsram / 1024) : '—');
+    setRow(f.panels.sys.ntp, s?.ntpSynced ? 'synced' : (s?.epoch ? 'set' : 'no'));
+
+    f.rawPre.textContent = JSON.stringify(s, null, 2);
   }
 
-  function panelSystem(s) {
-    return \`<div class="panel"><h4>System</h4>
-      \${row('Uptime', s?.uptimeMs != null ? fmtAge(s.uptimeMs) : '—')}
-      \${row('Free heap', s?.freeHeap != null ? fmtKB(s.freeHeap / 1024) : '—')}
-      \${row('Free PSRAM', s?.freePsram != null ? fmtKB(s.freePsram / 1024) : '—')}
-      \${row('NTP', s?.ntpSynced ? 'synced' : (s?.epoch ? 'set' : 'no'))}
-    </div>\`;
+  function applyEvents(card, events) {
+    const f = card.fields;
+    if (!events || !events.length) {
+      f.events.style.display = 'none';
+      return;
+    }
+    f.events.style.display = '';
+    f.events.innerHTML = '<h4 style="margin:14px 0 4px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;">Recent events</h4>' +
+      events.map(e => '<div class="ev"><span class="t">' +
+        new Date(e.ts).toLocaleTimeString() + '</span> [' +
+        (e.kind || '?') + '] ' + (e.msg || '')
+        + '</div>').join('');
+  }
+
+  // --- preload-then-swap image refresh ---
+  // Hits HEAD via /last-frame.jpg, reads X-Frame-Age-Ms; if newer than
+  // what we already have, preload the JPEG into a hidden Image and only
+  // swap the visible <img>'s src once load completes. No flash.
+  async function refreshImage(card, modality) {
+    const f = card.fields;
+    const url = '/api/devices/' + card.baseId + '/last-frame.jpg?modality=' + modality;
+    try {
+      const r = await fetch(url + '&_=' + Date.now(), { cache: 'no-store' });
+      if (!r.ok) return;
+      const w = parseInt(r.headers.get('X-Frame-Width') || '0', 10);
+      const h = parseInt(r.headers.get('X-Frame-Height') || '0', 10);
+      const ageMs = parseInt(r.headers.get('X-Frame-Age-Ms') || '0', 10);
+      const blob = await r.blob();
+      const objUrl = URL.createObjectURL(blob);
+
+      const img = modality === 'vis' ? f.imgVis : f.imgTherm;
+      const ageSpan = modality === 'vis' ? f.ageVis : f.ageTherm;
+      const frame = modality === 'vis' ? f.frameVis : f.frameTherm;
+      const placeholder = modality === 'vis' ? f.framePlaceholderVis : f.framePlaceholderTherm;
+
+      const tmp = new Image();
+      tmp.onload = () => {
+        const oldSrc = img.src;
+        img.src = objUrl;
+        img.style.display = '';
+        if (frame.classList.contains('empty')) {
+          frame.classList.remove('empty');
+          if (placeholder.parentNode === frame) frame.removeChild(placeholder);
+        }
+        ageSpan.textContent = (ageMs / 1000).toFixed(1) + 's · ' + w + '×' + h;
+        // Revoke previous object URL to free memory.
+        if (oldSrc && oldSrc.startsWith('blob:')) URL.revokeObjectURL(oldSrc);
+      };
+      tmp.onerror = () => URL.revokeObjectURL(objUrl);
+      tmp.src = objUrl;
+    } catch {}
+  }
+
+  async function refreshAllImages() {
+    for (const card of cards.values()) {
+      refreshImage(card, 'vis');
+      refreshImage(card, 'thermal');
+    }
   }
 
   async function fetchEvents(id) {
@@ -400,13 +569,6 @@ const DASHBOARD_HTML = `<!doctype html>
     } catch { return []; }
   }
 
-  function eventBlock(events) {
-    if (!events.length) return '';
-    return '<div class="events"><h4 style="margin:14px 0 4px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;">Recent events</h4>' +
-      events.map(e => \`<div class="ev"><span class="t">\${new Date(e.ts).toLocaleTimeString()}</span> [\${e.kind}] \${e.msg || ''}</div>\`).join('') +
-      '</div>';
-  }
-
   async function tick() {
     try {
       const r = await fetch('/api/devices', { cache: 'no-store' });
@@ -415,50 +577,58 @@ const DASHBOARD_HTML = `<!doctype html>
       const status = document.getElementById('status');
       status.textContent = devs.length + ' device' + (devs.length === 1 ? '' : 's');
       const root = document.getElementById('devices');
+
+      // Drop the empty placeholder once we have devices.
+      if (devs.length && root.querySelector('.empty')) {
+        root.innerHTML = '';
+      }
       if (!devs.length) {
-        root.innerHTML = '<div class="empty">No devices connected yet. Start a device with relay enabled to see it here.</div>';
+        if (!root.querySelector('.empty')) {
+          root.innerHTML = '<div class="empty">No devices connected yet. Start a device with relay enabled to see it here.</div>';
+        }
+        // Tear down any cached cards.
+        for (const [id, card] of cards) {
+          if (card.rootEl.parentNode) card.rootEl.parentNode.removeChild(card.rootEl);
+        }
+        cards.clear();
         return;
       }
-      const cacheBust = Date.now();
-      const blocks = await Promise.all(devs.map(async d => {
-        const sr = await fetch('/api/devices/' + encodeURIComponent(d.deviceId) + '/state', { cache: 'no-store' });
-        const sd = await sr.json();
-        const s = sd.tick || sd.init || {};
-        const events = await fetchEvents(d.deviceId);
-        const ageS = Math.floor((Date.now() - d.lastSeenMs) / 1000);
-        const idEnc = encodeURIComponent(d.deviceId);
-        const visUrl = '/api/devices/' + idEnc + '/last-frame.jpg?modality=vis&t=' + cacheBust;
-        const thermUrl = '/api/devices/' + idEnc + '/last-frame.jpg?modality=thermal&t=' + cacheBust;
-        return \`<div class="device">
-          <h3><span class="id">\${d.deviceId}</span>
-              <span class="pill \${d.online ? 'online' : 'offline'}">\${d.online ? 'online' : 'offline'}</span>
-              <span class="pill state">\${d.state || '—'}</span></h3>
-          <div class="meta">fw \${d.fwVersion || '?'} · sha \${d.gitSha || '?'} · ip \${d.ip || '?'} · last seen \${ageS}s ago</div>
-          <div class="preview">
-            <div class="frame" data-modality="vis"><div class="label">visible <span class="age" id="age-vis-\${idEnc}">—</span></div>
-              <img loading="lazy" src="\${visUrl}" onerror="this.parentElement.classList.add('empty');this.style.display='none';this.parentElement.querySelector('.label').nextSibling?.remove();this.parentElement.append(' no frame yet');" />
-            </div>
-            <div class="frame" data-modality="thermal"><div class="label">thermal <span class="age" id="age-therm-\${idEnc}">—</span></div>
-              <img loading="lazy" src="\${thermUrl}" onerror="this.parentElement.classList.add('empty');this.style.display='none';this.parentElement.append(' no frame yet');" />
-            </div>
-          </div>
-          <div class="grid">
-            \${panelWifi(s)}
-            \${panelThermal(s)}
-            \${panelCamera(s)}
-            \${panelStorage(s)}
-            \${panelSystem(s)}
-          </div>
-          \${eventBlock(events)}
-          <details><summary>raw tick JSON</summary><pre>\${JSON.stringify(s, null, 2)}</pre></details>
-        </div>\`;
-      }));
-      root.innerHTML = blocks.join('');
+
+      const seen = new Set();
+      for (const d of devs) {
+        seen.add(d.deviceId);
+        let card = cards.get(d.deviceId);
+        if (!card) {
+          card = buildCard(d.deviceId);
+          cards.set(d.deviceId, card);
+          root.appendChild(card.rootEl);
+        }
+        // Fetch state + events in parallel.
+        const [sr, events] = await Promise.all([
+          fetch('/api/devices/' + encodeURIComponent(d.deviceId) + '/state', { cache: 'no-store' }).then(r => r.json()),
+          fetchEvents(d.deviceId),
+        ]);
+        const s = sr.tick || sr.init || {};
+        applyState(card, d, s);
+        applyEvents(card, events);
+      }
+
+      // Remove any cards for devices that vanished.
+      for (const [id, card] of cards) {
+        if (!seen.has(id)) {
+          if (card.rootEl.parentNode) card.rootEl.parentNode.removeChild(card.rootEl);
+          cards.delete(id);
+        }
+      }
     } catch (e) {
       document.getElementById('status').textContent = 'error: ' + e.message;
     }
   }
-  tick(); setInterval(tick, 2000);
+
+  tick();
+  setInterval(tick, 2000);
+  refreshAllImages();
+  setInterval(refreshAllImages, 1500);
 </script>
 </body>
 </html>
