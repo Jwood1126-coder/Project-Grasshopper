@@ -393,12 +393,10 @@ const DASHBOARD_HTML = `<!doctype html>
     // Preview tiles — stable <img> elements, refreshed by image loop.
     f.imgVis    = el('img', { loading: 'lazy', alt: 'visible preview' });
     f.imgTherm  = el('img', { loading: 'lazy', alt: 'thermal preview' });
-    f.ageVis    = el('span', { class: 'age' }, '—');
-    f.ageTherm  = el('span', { class: 'age' }, '—');
     f.frameVis  = el('div', { class: 'frame', 'data-modality': 'vis' },
-                      el('div', { class: 'label' }, 'visible ', f.ageVis), f.imgVis);
+                      el('div', { class: 'label' }, 'visible'), f.imgVis);
     f.frameTherm = el('div', { class: 'frame', 'data-modality': 'thermal' },
-                      el('div', { class: 'label' }, 'thermal ', f.ageTherm), f.imgTherm);
+                      el('div', { class: 'label' }, 'thermal'), f.imgTherm);
     // Hide images by default; show once first frame loads.
     f.imgVis.style.display    = 'none';
     f.imgTherm.style.display  = 'none';
@@ -515,46 +513,30 @@ const DASHBOARD_HTML = `<!doctype html>
         + '</div>').join('');
   }
 
-  // --- preload-then-swap image refresh ---
-  // Hits HEAD via /last-frame.jpg, reads X-Frame-Age-Ms; if newer than
-  // what we already have, preload the JPEG into a hidden Image and only
-  // swap the visible <img>'s src once load completes. No flash.
-  async function refreshImage(card, modality) {
+  // --- image refresh ---
+  // The browser keeps the previously decoded image visible until the
+  // new one finishes loading and decoding, so a plain `img.src = newUrl`
+  // doesn't flash. The original "blink" was caused by tearing down the
+  // <img> element each tick — which we no longer do.
+  function refreshImage(card, modality) {
     const f = card.fields;
-    const url = '/api/devices/' + card.baseId + '/last-frame.jpg?modality=' + modality;
-    try {
-      const r = await fetch(url + '&_=' + Date.now(), { cache: 'no-store' });
-      if (!r.ok) return;
-      const w = parseInt(r.headers.get('X-Frame-Width') || '0', 10);
-      const h = parseInt(r.headers.get('X-Frame-Height') || '0', 10);
-      const ageMs = parseInt(r.headers.get('X-Frame-Age-Ms') || '0', 10);
-      const blob = await r.blob();
-      const objUrl = URL.createObjectURL(blob);
-
-      const img = modality === 'vis' ? f.imgVis : f.imgTherm;
-      const ageSpan = modality === 'vis' ? f.ageVis : f.ageTherm;
+    const img = modality === 'vis' ? f.imgVis : f.imgTherm;
+    const url = '/api/devices/' + card.baseId + '/last-frame.jpg?modality=' +
+                modality + '&t=' + Date.now();
+    img.onload = () => {
+      img.style.display = '';
       const frame = modality === 'vis' ? f.frameVis : f.frameTherm;
       const placeholder = modality === 'vis' ? f.framePlaceholderVis : f.framePlaceholderTherm;
-
-      const tmp = new Image();
-      tmp.onload = () => {
-        const oldSrc = img.src;
-        img.src = objUrl;
-        img.style.display = '';
-        if (frame.classList.contains('empty')) {
-          frame.classList.remove('empty');
-          if (placeholder.parentNode === frame) frame.removeChild(placeholder);
-        }
-        ageSpan.textContent = (ageMs / 1000).toFixed(1) + 's · ' + w + '×' + h;
-        // Revoke previous object URL to free memory.
-        if (oldSrc && oldSrc.startsWith('blob:')) URL.revokeObjectURL(oldSrc);
-      };
-      tmp.onerror = () => URL.revokeObjectURL(objUrl);
-      tmp.src = objUrl;
-    } catch {}
+      if (frame.classList.contains('empty')) {
+        frame.classList.remove('empty');
+        if (placeholder.parentNode === frame) frame.removeChild(placeholder);
+      }
+    };
+    img.onerror = () => { /* keep showing previous frame */ };
+    img.src = url;
   }
 
-  async function refreshAllImages() {
+  function refreshAllImages() {
     for (const card of cards.values()) {
       refreshImage(card, 'vis');
       refreshImage(card, 'thermal');
@@ -569,30 +551,53 @@ const DASHBOARD_HTML = `<!doctype html>
     } catch { return []; }
   }
 
+  // --- tick reentrancy ---
+  // setInterval keeps firing even if the previous tick is still
+  // awaiting. We've seen on hotspot networks that /state can take >2s,
+  // which let two ticks race and produce DOM where cards in the Map
+  // weren't in the DOM. Single-flight here is a hard guarantee.
+  let ticking = false;
+
+  // /api/devices briefly returns [] during Railway redeploys (the
+  // in-memory store is wiped). Don't immediately tear down cards on
+  // a single empty response; require N consecutive empties first.
+  let emptyStreak = 0;
+  const EMPTY_THRESHOLD = 3;
+
   async function tick() {
+    if (ticking) return;
+    ticking = true;
     try {
       const r = await fetch('/api/devices', { cache: 'no-store' });
       const data = await r.json();
       const devs = data.devices || [];
       const status = document.getElementById('status');
-      status.textContent = devs.length + ' device' + (devs.length === 1 ? '' : 's');
       const root = document.getElementById('devices');
 
-      // Drop the empty placeholder once we have devices.
-      if (devs.length && root.querySelector('.empty')) {
-        root.innerHTML = '';
-      }
       if (!devs.length) {
-        if (!root.querySelector('.empty')) {
-          root.innerHTML = '<div class="empty">No devices connected yet. Start a device with relay enabled to see it here.</div>';
+        emptyStreak++;
+        status.textContent = cards.size > 0
+          ? cards.size + ' device' + (cards.size === 1 ? '' : 's') + ' (relay quiet)'
+          : '0 devices';
+        if (emptyStreak >= EMPTY_THRESHOLD) {
+          // Real empty — tear down.
+          for (const [id, card] of cards) {
+            if (card.rootEl.parentNode) card.rootEl.parentNode.removeChild(card.rootEl);
+          }
+          cards.clear();
+          if (!root.querySelector('.empty')) {
+            root.innerHTML = '<div class="empty">No devices connected yet. Start a device with relay enabled to see it here.</div>';
+          }
         }
-        // Tear down any cached cards.
-        for (const [id, card] of cards) {
-          if (card.rootEl.parentNode) card.rootEl.parentNode.removeChild(card.rootEl);
-        }
-        cards.clear();
         return;
       }
+      emptyStreak = 0;
+      status.textContent = devs.length + ' device' + (devs.length === 1 ? '' : 's');
+
+      // Remove the .empty placeholder if present, but DON'T blow away
+      // any existing cards in root.
+      const empty = root.querySelector('.empty');
+      if (empty) empty.remove();
 
       const seen = new Set();
       for (const d of devs) {
@@ -601,9 +606,12 @@ const DASHBOARD_HTML = `<!doctype html>
         if (!card) {
           card = buildCard(d.deviceId);
           cards.set(d.deviceId, card);
-          root.appendChild(card.rootEl);
         }
-        // Fetch state + events in parallel.
+        // Defensive: if the DOM and Map got out of sync (e.g. earlier
+        // teardown left an orphan in Map), make sure the card is in
+        // root. appendChild on an existing child is a no-op move.
+        if (card.rootEl.parentNode !== root) root.appendChild(card.rootEl);
+
         const [sr, events] = await Promise.all([
           fetch('/api/devices/' + encodeURIComponent(d.deviceId) + '/state', { cache: 'no-store' }).then(r => r.json()),
           fetchEvents(d.deviceId),
@@ -613,7 +621,6 @@ const DASHBOARD_HTML = `<!doctype html>
         applyEvents(card, events);
       }
 
-      // Remove any cards for devices that vanished.
       for (const [id, card] of cards) {
         if (!seen.has(id)) {
           if (card.rootEl.parentNode) card.rootEl.parentNode.removeChild(card.rootEl);
@@ -622,12 +629,13 @@ const DASHBOARD_HTML = `<!doctype html>
       }
     } catch (e) {
       document.getElementById('status').textContent = 'error: ' + e.message;
+    } finally {
+      ticking = false;
     }
   }
 
   tick();
   setInterval(tick, 2000);
-  refreshAllImages();
   setInterval(refreshAllImages, 1500);
 </script>
 </body>
