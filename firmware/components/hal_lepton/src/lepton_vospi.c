@@ -41,7 +41,6 @@ static uint8_t  *s_pkt = NULL;              // DMA-capable internal SRAM, 164B
 static uint8_t  *s_tx_zeros = NULL;         // DMA-capable, 164B of 0 — full-duplex needs a real TX
 static volatile int s_write_idx = 0;
 
-// SPI handle
 static spi_device_handle_t s_spi = NULL;
 
 // Mutex protecting frame counter + write index
@@ -165,10 +164,12 @@ static bool vospi_read_packet(uint8_t *out_line, uint8_t *out_seg) {
 
     // Read 164 bytes as 3 polling chunks (64+64+36) with CS held low
     // across all of them. Lepton stalls when SCK pauses between chunks
-    // and resumes from the next bit, so we don't lose bytes. The
-    // single-transaction DMA path (spi_device_transmit) on these
-    // GPIO-matrix pins truncates at byte 4 — see
-    // docs/phase3-spi-issue.md.
+    // and resumes from the next bit, so we don't lose bytes.
+    // Workaround for the IDF spi_master truncation issue described in
+    // docs/phase3-spi-issue.md. Per-packet read time ~250 μs — too
+    // slow to keep up with Lepton's 9 kpps stream during READING, so
+    // frames don't currently assemble. Next session will try
+    // Arduino-as-component or properly bypass spi_master via spi_ll.
     gpio_set_level(LEP_SPI_CS, 0);
     int offset = 0, remaining = LEP_PKT_LEN;
     while (remaining > 0) {

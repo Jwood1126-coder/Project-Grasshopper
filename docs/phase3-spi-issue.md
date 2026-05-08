@@ -66,19 +66,24 @@ during a Lepton broadcast. Frames never fully assemble — every
 ## Likely fixes (next session)
 
 1. **Arduino-as-component for the SPI HAL only.** Add
-   `espressif/arduino-esp32` to `firmware/idf_component.yml`, have
-   `lepton_vospi.c` use Arduino's `SPIClass(FSPI).transferBytes`
+   `espressif/arduino-esp32` to `firmware/main/idf_component.yml`,
+   have `lepton_vospi.cpp` use Arduino's `SPIClass(FSPI).transferBytes`
    (which Fox uses successfully on identical wiring). Arduino's path
-   chunks at 64 bytes too, so it has the same theoretical speed
-   limit, but the fact that Fox works on this exact hardware strongly
-   suggests the per-call overhead is materially lower.
-2. **Direct register-level read** via `spi_ll_*` or raw register
-   writes. Mirrors `spiTransferBytesNL` from Arduino-ESP32 but in an
-   IDF-only project. ~2-3 hours.
-3. **Re-flash Fox** to the device once to confirm the wiring/Lepton
-   are still healthy after this debug session. If Fox doesn't pull
-   frames either, the Lepton is stuck and a hard power cycle (unplug
-   USB) is needed before further VoSPI debug.
+   chunks at 64 bytes too, but its per-call overhead is much lower
+   than `spi_device_polling_transmit`. Pragmatic, works.
+2. **Direct register-level read** via `spi_ll_*`. Tried this in-session
+   — added `spi_ll_set_miso_bitlen` + `spi_ll_user_start` + busy-wait
+   on `spi_ll_get_running_cmd`. Reader hung on the first chunk; spi_ll
+   alone doesn't fully replace what `spi_master` does in
+   `spi_format_hw_data` (cmd/addr/dummy bitlen, polarity, bit order,
+   `apply_config`, etc.), and the `spi_master`-initialized hardware
+   state isn't in the configuration this raw path expects. Either
+   bypass spi_master entirely (do hardware init via `spi_ll_master_*`
+   / direct registers) or call into IDF's lower-level `spi_hal_*`
+   helpers. ~3-4 hours of careful work.
+3. **Re-flash Fox** to confirm wiring + Lepton are still healthy. If
+   Fox doesn't pull frames either, the Lepton may be stuck — hard
+   power-cycle (unplug USB ≥ 15 s) before further VoSPI debug.
 
 ## Code state
 
