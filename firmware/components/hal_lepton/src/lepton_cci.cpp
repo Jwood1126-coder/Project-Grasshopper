@@ -154,6 +154,36 @@ static bool cci_set_attribute(uint16_t cmd, uint32_t value) {
     return cci_wait_idle(5000);
 }
 
+// Correct GET protocol per FLIR Lepton CCI spec:
+//   1. wait idle
+//   2. write COMMAND with bottom 2 bits = 00 (the GET form)
+//   3. wait idle (Lepton processes, sets DATA_LEN + DATA_*, clears BUSY)
+//   4. read DATA_LEN to learn response word count
+//   5. read DATA_0..DATA_(N-1) from 0x0008 onward
+//
+// `words_out` must have capacity for `max_words`. Returns the number
+// of words actually read, or 0 on failure.
+static int cci_get_attribute(uint16_t cmd, uint16_t *words_out, int max_words) {
+    if (!cci_wait_idle(1000)) return 0;
+    if (!cci_write_reg(CCI_REG_COMMAND, cmd & ~0x0003u)) return 0;  // force GET
+    if (!cci_wait_idle(5000)) return 0;
+
+    uint16_t len_words = 0;
+    if (!cci_read_reg(CCI_REG_DATA_LEN, &len_words)) return 0;
+    if (len_words == 0 || len_words > max_words) {
+        ESP_LOGW(TAG, "get 0x%04x: unexpected DATA_LEN=%u (cap=%d)",
+                 cmd, len_words, max_words);
+        return 0;
+    }
+    for (int i = 0; i < len_words; i++) {
+        uint16_t v = 0;
+        // DATA_0..DATA_15 = 0x0008..0x0026 in 16-bit address steps of 2.
+        if (!cci_read_reg(CCI_REG_DATA_0 + i * 2, &v)) return 0;
+        words_out[i] = v;
+    }
+    return len_words;
+}
+
 // ---- Single-attribute helpers (Fox's lep_enable_*) ----
 
 static bool lep_enable_radiometry(void) {
@@ -206,6 +236,71 @@ esp_err_t lepton_cci_oem_reboot(void) {
     vTaskDelay(pdMS_TO_TICKS(5000));
     ESP_LOGI(TAG, "OEM_REBOOT done");
     return ESP_OK;
+}
+
+// Read-only diagnostic dump: print every CCI value we care about so
+// we can compare "what the Lepton thinks its state is" against
+// "what we tried to set". If our SET commands aren't actually taking
+// effect, this surfaces the gap.
+void lepton_cci_dump_state(void) {
+    uint16_t buf[16];
+    int n;
+
+    ESP_LOGI(TAG, "=== Lepton CCI state dump ===");
+
+    // STATUS register (direct read, not a GET).
+    uint16_t status = 0;
+    if (cci_read_reg(CCI_REG_STATUS, &status)) {
+        ESP_LOGI(TAG, "  STATUS         = 0x%04x  (busy=%d boot_mode=%d boot_status=%d)",
+                 status, status & 1, (status >> 1) & 1, (status >> 2) & 1);
+    } else {
+        ESP_LOGW(TAG, "  STATUS         read failed");
+    }
+
+    // SYS module — camera status (0x0204 GET) returns 4 words.
+    n = cci_get_attribute(0x0204, buf, 16);
+    if (n > 0) {
+        ESP_LOGI(TAG, "  SYS_STATUS     n=%d  w0=0x%04x w1=0x%04x w2=0x%04x w3=0x%04x  (camStatus=%u)",
+                 n, buf[0], buf[1], n>2?buf[2]:0, n>3?buf[3]:0, buf[0]);
+    } else {
+        ESP_LOGW(TAG, "  SYS_STATUS     GET failed");
+    }
+
+    // SYS FW version — 8 bytes / 4 words. (0x480C is in OEM module.)
+    n = cci_get_attribute(0x480C, buf, 16);
+    if (n > 0) {
+        ESP_LOGI(TAG, "  OEM_FW_VER     n=%d  gpp=%u.%u.%u dsp=%u.%u.%u  (raw: %04x %04x %04x %04x)",
+                 n,
+                 buf[0] & 0xFF, (buf[0] >> 8) & 0xFF, buf[1] & 0xFF,
+                 buf[2] & 0xFF, (buf[2] >> 8) & 0xFF, buf[3] & 0xFF,
+                 buf[0], buf[1], buf[2], buf[3]);
+    } else {
+        ESP_LOGW(TAG, "  OEM_FW_VER     GET failed");
+    }
+
+    // AGC enable + AGC calc enable + RAD enable + RAD TLinear enable.
+    // Each returns 2 words (a uint32 enum: 0=disable, 1=enable).
+    struct { const char *name; uint16_t cmd; } gets[] = {
+        { "AGC_ENABLE     ", CCI_CMD_AGC_ENABLE },
+        { "AGC_CALC_EN    ", CCI_CMD_AGC_CALC_ENABLE },
+        { "RAD_ENABLE     ", CCI_CMD_RAD_ENABLE },
+        { "RAD_TLINEAR_EN ", CCI_CMD_RAD_TLINEAR_ENABLE },
+        { "SYS_GAIN_MODE  ", CCI_CMD_SYS_GAIN_MODE },
+        { "OEM_GPIO_MODE  ", CCI_CMD_OEM_GPIO_MODE },
+        { "SYS_TELEMETRY  ", CCI_CMD_SYS_TELEMETRY_ENABLE },
+    };
+    for (size_t i = 0; i < sizeof(gets)/sizeof(gets[0]); i++) {
+        n = cci_get_attribute(gets[i].cmd, buf, 16);
+        if (n > 0) {
+            uint32_t v = (uint32_t)buf[0] | ((uint32_t)buf[1] << 16);
+            ESP_LOGI(TAG, "  %s= %lu  (raw: %04x %04x)",
+                     gets[i].name, (unsigned long)v, buf[0], buf[1]);
+        } else {
+            ESP_LOGW(TAG, "  %s  GET failed", gets[i].name);
+        }
+    }
+
+    ESP_LOGI(TAG, "=== end Lepton state dump ===");
 }
 
 esp_err_t lepton_cci_configure(void) {

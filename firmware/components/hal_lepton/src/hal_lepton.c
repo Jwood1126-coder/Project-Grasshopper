@@ -37,15 +37,39 @@ static void power_cycle(void) {
 
 esp_err_t hal_lepton_boot(void) {
     power_cycle();
-    ESP_LOGI(TAG, "waiting 2s for Lepton boot...");
-    vTaskDelay(pdMS_TO_TICKS(2000));
+    // Fox uses 5s here. Phase 3 sometimes converged at 2s + many
+    // sync-fail retries, but post-cycle Leptons appear to need the
+    // full ~5s for the OEM module to fully initialize — observed via
+    // OEM_FW_VER GET returning DATA_LEN=0 (Lepton not ready to
+    // respond) at 2s but populated values at 5s+.
+    ESP_LOGI(TAG, "waiting 5s for Lepton boot (matches Fox)...");
+    vTaskDelay(pdMS_TO_TICKS(5000));
 
     esp_err_t err = lepton_cci_init();
     if (err != ESP_OK) return err;
+    // Diagnostic snapshot BEFORE configure — see what factory defaults
+    // the Lepton booted into.
+    lepton_cci_dump_state();
     err = lepton_cci_configure();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "CCI configure failed");
         return err;
+    }
+    // Diagnostic snapshot AFTER configure — confirm our SETs took.
+    lepton_cci_dump_state();
+
+    // EXPERIMENT: issue FFC before waiting for first frame. Fox runs
+    // FFC AFTER the first frame, but in our post-cycle-storm state the
+    // Lepton never emits a first frame to trigger FFC. FFC sometimes
+    // kicks a stuck pixel pipeline into life by forcing a calibration
+    // refresh — worth trying as a one-shot.
+    ESP_LOGW(TAG, "pre-emptive FFC (before first frame)...");
+    if (lepton_cci_run_ffc() == ESP_OK) {
+        ESP_LOGI(TAG, "pre-emptive FFC done");
+        // Give Lepton 1 s after FFC to settle.
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    } else {
+        ESP_LOGW(TAG, "pre-emptive FFC failed");
     }
 
     err = lepton_vospi_init();
