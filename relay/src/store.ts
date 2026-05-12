@@ -44,6 +44,12 @@ export interface EventEntry {
   id?: string
   cmd?: string
   ok?: boolean
+  // Structured payload attached to a cmd.result by the firmware (e.g.
+  // sessions.list returns {sessions:[...], total, listed, truncated};
+  // session.read_file returns {filename, offset, len, totalSize, eof, b64}).
+  // Type intentionally `unknown` — endpoints that consume it should
+  // narrow with a runtime check or a per-cmd schema.
+  data?: unknown
 }
 
 const LOGS_PER_DEVICE = 1000

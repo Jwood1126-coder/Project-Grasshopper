@@ -324,6 +324,142 @@ export const USER_UI_HTML = `<!doctype html>
     font-size: 12px;
   }
 
+  /* Tab bar */
+  .tabs { display: flex; gap: 4px; margin-left: auto; }
+  .tab {
+    padding: 8px 16px; border-radius: 8px; cursor: pointer;
+    font: 500 13px/1 system-ui; color: var(--muted);
+    background: transparent; border: 1px solid transparent;
+    transition: background 0.15s, color 0.15s;
+  }
+  .tab:hover { background: var(--surface-2); color: var(--text); }
+  .tab.active {
+    background: var(--surface-2); color: var(--text);
+    border-color: var(--border);
+  }
+
+  /* Library view */
+  .library-view { padding-top: 4px; }
+  .library-header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 16px;
+  }
+  .library-header h2 { margin: 0; font-size: 18px; font-weight: 600; }
+  .library-header .meta { color: var(--muted); font-size: 13px; }
+  .session-grid {
+    display: grid; gap: 14px;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  }
+  .session-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; overflow: hidden; cursor: pointer;
+    transition: transform 0.12s, border-color 0.12s;
+    display: flex; flex-direction: column;
+  }
+  .session-card:hover { transform: translateY(-2px); border-color: var(--accent); }
+  .session-card .thumb-wrap {
+    aspect-ratio: 4/3; background: #0a0a0a; overflow: hidden;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .session-card .thumb {
+    width: 100%; height: 100%; object-fit: cover;
+  }
+  .session-card .thumb-empty {
+    color: var(--muted); font-size: 12px;
+  }
+  .session-card .info { padding: 10px 12px; }
+  .session-card .title {
+    font: 600 13px/1.3 ui-monospace, monospace;
+    color: var(--text); margin-bottom: 4px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .session-card .row { font: 12px/1.5 system-ui; color: var(--muted); }
+  .session-card .badges { margin-top: 6px; display: flex; gap: 4px; flex-wrap: wrap; }
+  .session-card .badge {
+    font: 10px/1 system-ui; padding: 3px 6px; border-radius: 4px;
+    background: var(--surface-2); color: var(--muted); text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .session-card .badge.tl { background: #1f3a28; color: var(--ok); }
+  .session-card .badge.single { background: #2a2a3a; color: #88a; }
+  .session-card .badge.incomplete { background: #3a1f23; color: var(--err); }
+
+  .empty-library {
+    text-align: center; padding: 60px 20px; color: var(--muted);
+  }
+  .empty-library h3 { color: var(--text); margin-bottom: 8px; }
+
+  /* Session detail view */
+  .detail-header {
+    display: flex; align-items: center; gap: 12px; margin-bottom: 16px;
+    flex-wrap: wrap;
+  }
+  .detail-header .back {
+    background: var(--surface-2); border: 1px solid var(--border);
+    color: var(--text); padding: 6px 12px; border-radius: 6px;
+    cursor: pointer; font-size: 13px;
+  }
+  .detail-header .back:hover { border-color: var(--accent); }
+  .detail-header h2 {
+    margin: 0; font: 600 16px/1 ui-monospace, monospace;
+  }
+  .detail-meta {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px 16px; margin-bottom: 16px;
+    display: grid; gap: 8px 18px;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  }
+  .detail-meta .item { font-size: 13px; }
+  .detail-meta .item .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .detail-meta .item .v { color: var(--text); }
+  .capture-grid {
+    display: grid; gap: 8px;
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  }
+  .capture-tile {
+    aspect-ratio: 4/3; background: #0a0a0a; cursor: pointer;
+    border-radius: 6px; overflow: hidden; position: relative;
+    border: 1px solid var(--border);
+  }
+  .capture-tile img { width: 100%; height: 100%; object-fit: cover; }
+  .capture-tile .seq {
+    position: absolute; top: 4px; left: 4px;
+    background: rgba(0,0,0,0.7); color: white;
+    font: 11px/1 ui-monospace, monospace; padding: 2px 5px; border-radius: 3px;
+  }
+  .capture-tile:hover { border-color: var(--accent); }
+
+  /* Lightbox */
+  .lightbox {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.95);
+    z-index: 200; display: none; align-items: center; justify-content: center;
+    flex-direction: column;
+  }
+  .lightbox.show { display: flex; }
+  .lightbox img {
+    max-width: 95vw; max-height: 80vh; object-fit: contain;
+    border-radius: 6px;
+  }
+  .lightbox .lb-info {
+    color: var(--muted); font: 13px/1.4 system-ui;
+    margin-top: 12px; text-align: center;
+  }
+  .lightbox .lb-info .seq { color: var(--text); font-weight: 600; }
+  .lightbox .lb-close {
+    position: absolute; top: 16px; right: 24px;
+    background: transparent; border: none; color: white;
+    font-size: 28px; cursor: pointer; line-height: 1; padding: 4px 12px;
+  }
+  .lightbox .lb-nav {
+    position: absolute; top: 50%; transform: translateY(-50%);
+    background: rgba(255,255,255,0.08); border: none; color: white;
+    font-size: 32px; cursor: pointer; padding: 12px 18px; border-radius: 8px;
+  }
+  .lightbox .lb-nav:hover { background: rgba(255,255,255,0.16); }
+  .lightbox .lb-prev { left: 16px; }
+  .lightbox .lb-next { right: 16px; }
+  .lightbox .lb-nav:disabled { opacity: 0.3; cursor: default; }
+
   /* Toast */
   .toast {
     position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
@@ -343,6 +479,10 @@ export const USER_UI_HTML = `<!doctype html>
   <header>
     <div class="logo">🦗 <span class="accent">Grasshopper</span></div>
     <div class="chips" id="chips"></div>
+    <div class="tabs" id="tabs">
+      <div class="tab active" data-view="live">Live View</div>
+      <div class="tab" data-view="library">Library</div>
+    </div>
   </header>
 
   <div id="banner-slot"></div>
@@ -380,6 +520,15 @@ export const USER_UI_HTML = `<!doctype html>
       <button class="btn primary" id="tl-confirm">Start</button>
     </div>
   </div>
+</div>
+
+<!-- Lightbox overlay -->
+<div class="lightbox" id="lightbox">
+  <button class="lb-close" id="lb-close" aria-label="Close">×</button>
+  <button class="lb-nav lb-prev" id="lb-prev" aria-label="Previous">‹</button>
+  <img id="lb-img" alt="" />
+  <button class="lb-nav lb-next" id="lb-next" aria-label="Next">›</button>
+  <div class="lb-info" id="lb-info"></div>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -784,6 +933,7 @@ export const USER_UI_HTML = `<!doctype html>
 
   function refreshImgs() {
     if (!currentDeviceId) return;
+    if (currentView !== 'live') return;
     refreshImg('thermal');
     refreshImg('vis');
   }
@@ -905,7 +1055,7 @@ export const USER_UI_HTML = `<!doctype html>
         currentDeviceId = null;
         lastThermFrames = 0;
         lastThermFramesTs = 0;
-        if (!content.querySelector('.empty')) {
+        if (currentView === 'live' && !content.querySelector('.empty')) {
           content.innerHTML = '';
           content.appendChild(el('div', { class: 'empty' },
             el('div', { class: 'pulse' }),
@@ -914,6 +1064,24 @@ export const USER_UI_HTML = `<!doctype html>
           ));
         }
         updateChips(null, null);
+        return;
+      }
+
+      // Only rebuild Live View when actually showing it. Otherwise just
+      // update tracking state so chips stay correct on other tabs.
+      if (currentView !== 'live') {
+        if (currentDeviceId !== d.deviceId) currentDeviceId = d.deviceId;
+        // Still want chips updated even on Library/Detail.
+        const sr = await fetch('/api/devices/' + encodeURIComponent(d.deviceId) + '/state',
+                                { cache: 'no-store' });
+        const state = await sr.json();
+        // Track frame counter for Acquisition chip without touching DOM.
+        const live = state?.tick ?? state?.init;
+        if (live?.thermal && live.thermal.frames !== lastThermFrames) {
+          lastThermFrames = live.thermal.frames;
+          lastThermFramesTs = Date.now();
+        }
+        updateChips(d, state);
         return;
       }
 
@@ -936,6 +1104,264 @@ export const USER_UI_HTML = `<!doctype html>
       console.warn('poll error', e);
     }
   }
+
+  // ───── Library + detail views ─────
+  //
+  // currentView controls what poll() renders into #content. The Live View
+  // path is unchanged. Library view doesn't need 250 ms refresh — it loads
+  // once on entry and on explicit refresh. Detail view loads once on open.
+  let currentView = 'live';        // 'live' | 'library' | 'detail'
+  let currentSessionId = null;     // when in detail view
+  let detailCaptureList = [];      // for lightbox prev/next nav
+  let lightboxIdx = -1;
+
+  function setView(view, sid) {
+    currentView = view;
+    currentSessionId = sid || null;
+    document.querySelectorAll('.tab').forEach((t) => {
+      t.classList.toggle('active',
+        view === 'detail' ? t.dataset.view === 'library'
+                          : t.dataset.view === view);
+    });
+    const content = document.getElementById('content');
+    content.innerHTML = '';
+    if (view === 'live') {
+      // Force re-render of live view on next poll() tick.
+      currentDeviceId = null;
+      poll();
+    } else if (view === 'library') {
+      content.appendChild(buildLibraryView());
+      loadLibrary();
+    } else if (view === 'detail') {
+      content.appendChild(buildDetailView(sid));
+      loadDetail(sid);
+    }
+  }
+
+  function buildLibraryView() {
+    const v = el('div', { class: 'library-view' });
+    const header = el('div', { class: 'library-header' },
+      el('h2', {}, 'Sessions'),
+      el('div', { class: 'meta', id: 'lib-meta' }, 'Loading…'));
+    const grid = el('div', { class: 'session-grid', id: 'session-grid' });
+    v.appendChild(header);
+    v.appendChild(grid);
+    return v;
+  }
+
+  async function loadLibrary() {
+    const meta = document.getElementById('lib-meta');
+    const grid = document.getElementById('session-grid');
+    if (!grid) return;
+    if (!currentDeviceId) {
+      meta.textContent = 'Waiting for device…';
+      return;
+    }
+    try {
+      const r = await fetch(
+        '/api/devices/' + encodeURIComponent(currentDeviceId) + '/sessions',
+        { headers: { 'Authorization': 'Bearer ' + authToken }, cache: 'no-store' }
+      );
+      if (!r.ok) {
+        meta.textContent = 'Failed: HTTP ' + r.status;
+        return;
+      }
+      const j = await r.json();
+      const list = j.sessions || [];
+      meta.textContent = (j.total ?? list.length) + ' sessions' +
+                         (j.truncated ? ' (showing newest ' + j.listed + ')' : '');
+      if (list.length === 0) {
+        grid.replaceChildren(el('div', { class: 'empty-library' },
+          el('h3', {}, 'No sessions yet'),
+          el('div', {},
+            'Press Capture or Start Timelapse on the Live View to record one.')));
+        return;
+      }
+      grid.replaceChildren(...list.map(renderSessionCard));
+    } catch (e) {
+      meta.textContent = 'Network error';
+    }
+  }
+
+  function renderSessionCard(s) {
+    const sid = s.sessionId || 'session_?';
+    const thumbUrl = currentDeviceId
+      ? '/api/devices/' + encodeURIComponent(currentDeviceId) +
+        '/sessions/' + encodeURIComponent(sid) + '/file/000001_vis.jpg'
+      : '';
+    const isTl = s.mode === 'timelapse';
+    const incomplete = isTl && s.complete === false;
+    const dur = (s.durationSec != null && s.durationSec > 0)
+      ? fmtElapsed(s.durationSec * 1000) : '—';
+    const ts = s.timestamp ? new Date(s.timestamp * 1000) : null;
+    const tsTxt = ts ? ts.toLocaleString() : '';
+
+    const card = el('div', {
+      class: 'session-card',
+      onclick: () => setView('detail', sid),
+    });
+    const thumbWrap = el('div', { class: 'thumb-wrap' });
+    if (thumbUrl) {
+      const img = el('img', { class: 'thumb', loading: 'lazy', src: thumbUrl });
+      img.onerror = () => {
+        thumbWrap.replaceChildren(el('div', { class: 'thumb-empty' }, 'no preview'));
+      };
+      thumbWrap.appendChild(img);
+    } else {
+      thumbWrap.appendChild(el('div', { class: 'thumb-empty' }, 'no preview'));
+    }
+    const info = el('div', { class: 'info' },
+      el('div', { class: 'title' }, sid),
+      el('div', { class: 'row' }, (s.captureCount ?? '?') + ' captures · ' +
+        (isTl ? ('every ' + (s.intervalSec ?? '?') + 's · ' + dur) : 'single')),
+      tsTxt && el('div', { class: 'row' }, tsTxt),
+      el('div', { class: 'badges' },
+        el('span', { class: 'badge ' + (isTl ? 'tl' : 'single') },
+           isTl ? 'timelapse' : 'single'),
+        s.captureVis && s.captureTherm
+          ? el('span', { class: 'badge' }, 'vis+therm')
+          : (s.captureVis ? el('span', { class: 'badge' }, 'vis')
+                          : el('span', { class: 'badge' }, 'therm')),
+        incomplete && el('span', { class: 'badge incomplete' }, 'incomplete')));
+    card.appendChild(thumbWrap);
+    card.appendChild(info);
+    return card;
+  }
+
+  function buildDetailView(sid) {
+    const v = el('div', {});
+    const header = el('div', { class: 'detail-header' },
+      el('button', { class: 'back', onclick: () => setView('library') }, '← Library'),
+      el('h2', {}, sid));
+    const meta = el('div', { class: 'detail-meta', id: 'detail-meta' });
+    const grid = el('div', { class: 'capture-grid', id: 'capture-grid' });
+    grid.appendChild(el('div', { class: 'empty-library' }, 'Loading…'));
+    v.appendChild(header);
+    v.appendChild(meta);
+    v.appendChild(grid);
+    return v;
+  }
+
+  async function loadDetail(sid) {
+    const meta = document.getElementById('detail-meta');
+    const grid = document.getElementById('capture-grid');
+    if (!grid || !currentDeviceId) return;
+    try {
+      const r = await fetch(
+        '/api/devices/' + encodeURIComponent(currentDeviceId) +
+        '/sessions/' + encodeURIComponent(sid),
+        { headers: { 'Authorization': 'Bearer ' + authToken }, cache: 'no-store' }
+      );
+      if (!r.ok) {
+        grid.replaceChildren(el('div', { class: 'empty-library' },
+          'Failed: HTTP ' + r.status));
+        return;
+      }
+      const j = await r.json();
+      const m = j.meta || {};
+      meta.replaceChildren(
+        metaItem('Mode',      m.mode || '?'),
+        metaItem('Captures',  String(j.captureCount ?? '?') +
+                              (j.truncated ? ' (truncated)' : '')),
+        m.intervalSec > 0 ? metaItem('Interval', m.intervalSec + 's') : null,
+        m.durationSec > 0 ? metaItem('Duration', fmtElapsed(m.durationSec * 1000)) : null,
+        metaItem('Started',   m.timestamp
+                              ? new Date(m.timestamp * 1000).toLocaleString()
+                              : '?'),
+        metaItem('Complete',  m.complete === false ? 'no' : 'yes'),
+      );
+      const captures = j.captures || [];
+      detailCaptureList = captures.map((c) => ({
+        seq: c.seq,
+        sessionId: sid,
+        visFile: pad6(c.seq) + '_vis.jpg',
+        thermFile: pad6(c.seq) + '_therm.jpg',
+        visOk: c.visOk, thermOk: c.thermOk,
+        sessionMs: c.sessionMs, timestamp: c.timestamp,
+      }));
+      if (detailCaptureList.length === 0) {
+        grid.replaceChildren(el('div', { class: 'empty-library' },
+          'No captures recorded.'));
+        return;
+      }
+      grid.replaceChildren(...detailCaptureList.map((c, idx) => {
+        const tile = el('div', { class: 'capture-tile',
+          onclick: () => openLightbox(idx) });
+        if (c.visOk) {
+          tile.appendChild(el('img', { loading: 'lazy',
+            src: '/api/devices/' + encodeURIComponent(currentDeviceId) +
+                 '/sessions/' + encodeURIComponent(sid) +
+                 '/file/' + c.visFile }));
+        } else {
+          tile.appendChild(el('div', { class: 'thumb-empty',
+            style: 'display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted);font-size:11px' },
+            'no vis'));
+        }
+        tile.appendChild(el('div', { class: 'seq' }, '#' + c.seq));
+        return tile;
+      }));
+    } catch (e) {
+      grid.replaceChildren(el('div', { class: 'empty-library' }, 'Network error'));
+    }
+  }
+
+  function pad6(n) { return String(n).padStart(6, '0'); }
+  function metaItem(k, v) {
+    if (v == null) return null;
+    return el('div', { class: 'item' },
+      el('div', { class: 'k' }, k),
+      el('div', { class: 'v' }, String(v)));
+  }
+
+  // ───── Lightbox ─────
+  function openLightbox(idx) {
+    if (idx < 0 || idx >= detailCaptureList.length) return;
+    lightboxIdx = idx;
+    const lb = document.getElementById('lightbox');
+    lb.classList.add('show');
+    renderLightbox();
+  }
+  function closeLightbox() {
+    document.getElementById('lightbox').classList.remove('show');
+    lightboxIdx = -1;
+  }
+  function navLightbox(delta) {
+    const next = lightboxIdx + delta;
+    if (next < 0 || next >= detailCaptureList.length) return;
+    lightboxIdx = next;
+    renderLightbox();
+  }
+  function renderLightbox() {
+    const c = detailCaptureList[lightboxIdx];
+    if (!c) return;
+    const img = document.getElementById('lb-img');
+    img.src = '/api/devices/' + encodeURIComponent(currentDeviceId) +
+              '/sessions/' + encodeURIComponent(c.sessionId) +
+              '/file/' + c.visFile;
+    const info = document.getElementById('lb-info');
+    info.replaceChildren(
+      el('span', { class: 'seq' }, '#' + c.seq + ' / ' + detailCaptureList.length),
+      el('span', {}, ' · ' + c.visFile),
+      c.timestamp ? el('span', {}, ' · ' + new Date(c.timestamp * 1000).toLocaleString()) : null,
+    );
+    document.getElementById('lb-prev').disabled = lightboxIdx === 0;
+    document.getElementById('lb-next').disabled = lightboxIdx === detailCaptureList.length - 1;
+  }
+  document.getElementById('lb-close').onclick = closeLightbox;
+  document.getElementById('lb-prev').onclick = () => navLightbox(-1);
+  document.getElementById('lb-next').onclick = () => navLightbox(1);
+  document.addEventListener('keydown', (e) => {
+    const lb = document.getElementById('lightbox');
+    if (!lb.classList.contains('show')) return;
+    if (e.key === 'Escape') closeLightbox();
+    else if (e.key === 'ArrowLeft') navLightbox(-1);
+    else if (e.key === 'ArrowRight') navLightbox(1);
+  });
+
+  // Tab clicks
+  document.querySelectorAll('#tabs .tab').forEach((t) => {
+    t.onclick = () => setView(t.dataset.view);
+  });
 
   async function checkSecurityPosture() {
     try {

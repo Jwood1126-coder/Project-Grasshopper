@@ -116,6 +116,168 @@ app.post('/api/devices/:id/cmd', async (c) => {
   return c.json({ ok: true })
 })
 
+// ---- Sessions endpoints --------------------------------------------------
+//
+// These wrap the device-side sessions.* commands so the UI calls a regular
+// HTTP endpoint and gets back the data field directly. The relay generates
+// the cmd id, sends over WS, and waits for the matching cmd.result. The
+// pending-cmd table is resolved by the WS event handler below.
+//
+// All sessions endpoints require Bearer auth — they trigger SD work on the
+// device, so we don't want anonymous internet traffic spamming them.
+
+interface PendingCmd {
+  resolve: (data: unknown, msg: string) => void
+  reject: (msg: string) => void
+  timer: ReturnType<typeof setTimeout>
+}
+const pendingCmds = new Map<string, PendingCmd>()
+let nextCmdSeq = 1
+
+function executeCmd(
+  deviceId: string,
+  cmd: string,
+  payload: Record<string, unknown>,
+  timeoutMs = 10000,
+): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const d = store.get(deviceId)
+    if (!d) { reject('unknown device'); return }
+    if (!d.socket || d.socket.readyState !== 1) { reject('device offline'); return }
+    const id = `srv-${nextCmdSeq++}-${Date.now().toString(36)}`
+    const timer = setTimeout(() => {
+      pendingCmds.delete(id)
+      reject(`timeout waiting for cmd.result (${cmd})`)
+    }, timeoutMs)
+    pendingCmds.set(id, {
+      resolve: (data) => resolve(data),
+      reject: (msg) => reject(msg),
+      timer,
+    })
+    d.socket.send(JSON.stringify({ type: 'cmd', cmd, id, ...payload }))
+  })
+}
+
+function requireBearer(c: any): true | Response {
+  const auth = c.req.header('Authorization') || ''
+  const presented = auth.startsWith('Bearer ') ? auth.slice(7) : ''
+  if (!presented || presented !== RELAY_TOKEN) {
+    return c.json({ error: 'unauthorized' }, 401)
+  }
+  return true
+}
+
+app.get('/api/devices/:id/sessions', async (c) => {
+  const auth = requireBearer(c); if (auth !== true) return auth
+  try {
+    const data = await executeCmd(c.req.param('id'), 'sessions.list', {})
+    return c.json(data ?? {})
+  } catch (msg) {
+    return c.json({ error: String(msg) }, 502)
+  }
+})
+
+app.get('/api/devices/:id/sessions/:sid', async (c) => {
+  const auth = requireBearer(c); if (auth !== true) return auth
+  try {
+    const data = await executeCmd(c.req.param('id'), 'sessions.get', {
+      sessionId: c.req.param('sid'),
+    })
+    return c.json(data ?? {})
+  } catch (msg) {
+    return c.json({ error: String(msg) }, 502)
+  }
+})
+
+// File fetch — loops session.read_file chunks until eof, decodes base64,
+// returns binary. Small in-memory LRU cache so repeated thumbnail loads
+// don't hit the device every time. Cache is byte-bounded; entries are
+// evicted in insertion order (Map iteration order = insertion order).
+const FILE_CACHE_MAX_BYTES = 32 * 1024 * 1024 // 32 MB
+const fileCache = new Map<string, { bytes: Uint8Array; ts: number }>()
+let fileCacheBytes = 0
+
+function cacheGet(key: string): Uint8Array | undefined {
+  const e = fileCache.get(key)
+  if (!e) return undefined
+  // Refresh insertion order on hit
+  fileCache.delete(key); fileCache.set(key, e)
+  return e.bytes
+}
+function cachePut(key: string, bytes: Uint8Array) {
+  if (bytes.byteLength > FILE_CACHE_MAX_BYTES / 4) return // skip oversize
+  fileCache.set(key, { bytes, ts: Date.now() })
+  fileCacheBytes += bytes.byteLength
+  while (fileCacheBytes > FILE_CACHE_MAX_BYTES) {
+    const oldest = fileCache.keys().next().value
+    if (!oldest) break
+    const drop = fileCache.get(oldest)!
+    fileCache.delete(oldest)
+    fileCacheBytes -= drop.bytes.byteLength
+  }
+}
+
+// Public (no Bearer): thumbnails need to load via plain <img src=>. Cache
+// makes repeat hits cheap; the per-file SD work is bounded.
+app.get('/api/devices/:id/sessions/:sid/file/:filename', async (c) => {
+  const deviceId = c.req.param('id')
+  const sid = c.req.param('sid')
+  const filename = c.req.param('filename')
+  const cacheKey = `${deviceId}:${sid}:${filename}`
+  const cached = cacheGet(cacheKey)
+  if (cached) {
+    c.header('Content-Type', guessMime(filename))
+    c.header('X-Cache', 'HIT')
+    return c.body(cached as any)
+  }
+
+  // Pull chunks until eof.
+  const CHUNK = 16 * 1024
+  let offset = 0
+  const chunks: Uint8Array[] = []
+  let totalSize = 0
+  for (;;) {
+    let data: any
+    try {
+      data = await executeCmd(deviceId, 'session.read_file', {
+        sessionId: sid, filename, offset, maxLen: CHUNK,
+      }, 15000)
+    } catch (msg) {
+      return c.json({ error: String(msg) }, 502)
+    }
+    if (!data || typeof data !== 'object' || typeof data.b64 !== 'string') {
+      return c.json({ error: 'malformed read_file response' }, 502)
+    }
+    const buf = Uint8Array.from(Buffer.from(data.b64, 'base64'))
+    chunks.push(buf)
+    offset += buf.byteLength
+    totalSize = data.totalSize ?? totalSize
+    if (data.eof || buf.byteLength === 0) break
+    if (offset > 50 * 1024 * 1024) {
+      return c.json({ error: 'file too large (>50MB)' }, 413)
+    }
+  }
+  const bytes = concatBytes(chunks, totalSize)
+  cachePut(cacheKey, bytes)
+  c.header('Content-Type', guessMime(filename))
+  c.header('X-Cache', 'MISS')
+  return c.body(bytes as any)
+})
+
+function guessMime(filename: string): string {
+  if (filename.endsWith('.jpg') || filename.endsWith('.jpeg')) return 'image/jpeg'
+  if (filename.endsWith('.json')) return 'application/json'
+  if (filename.endsWith('.jsonl')) return 'application/x-ndjson'
+  return 'application/octet-stream'
+}
+function concatBytes(parts: Uint8Array[], expected: number): Uint8Array {
+  const total = parts.reduce((s, p) => s + p.byteLength, 0)
+  const out = new Uint8Array(expected || total)
+  let o = 0
+  for (const p of parts) { out.set(p, o); o += p.byteLength }
+  return out
+}
+
 // User-facing UI (Phase 1: Live View). The polished surface end-users see.
 app.get('/', (c) => {
   c.header('Content-Type', 'text/html; charset=utf-8')
@@ -270,7 +432,22 @@ const server = Bun.serve<WsCtx>({
             id: typeof msg.id === 'string' ? msg.id : undefined,
             cmd: typeof msg.cmd === 'string' ? msg.cmd : undefined,
             ok: typeof msg.ok === 'boolean' ? msg.ok : undefined,
+            // Structured payload (sessions.list / sessions.get /
+            // session.read_file). Anything that isn't an object/array is
+            // dropped — the field is meant for typed responses, not
+            // arbitrary scalars.
+            data: (msg.data && typeof msg.data === 'object') ? msg.data : undefined,
           })
+          // Resolve a pending HTTP wait if this is the cmd.result we issued.
+          if (msg.kind === 'cmd.result' && typeof msg.id === 'string') {
+            const pending = pendingCmds.get(msg.id)
+            if (pending) {
+              pendingCmds.delete(msg.id)
+              clearTimeout(pending.timer)
+              if (msg.ok === true) pending.resolve(msg.data, msg.msg ?? '')
+              else                 pending.reject(msg.msg ?? 'cmd failed')
+            }
+          }
           break
         case 'log':
         case 'logline':
@@ -295,6 +472,12 @@ const server = Bun.serve<WsCtx>({
           msg: `code=${code} reason=${reason || ''}`,
         })
         console.log(`[ws] close ${id} code=${code}`)
+        // Fail any in-flight HTTP cmd waits so they don't hang to timeout.
+        for (const [pid, p] of pendingCmds) {
+          clearTimeout(p.timer)
+          p.reject('device disconnected mid-cmd')
+          pendingCmds.delete(pid)
+        }
       }
     },
   },
