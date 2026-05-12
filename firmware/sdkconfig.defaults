@@ -51,3 +51,19 @@ CONFIG_LOG_MAXIMUM_LEVEL_INFO=y
 # Bootloader / image
 CONFIG_BOOTLOADER_LOG_LEVEL_INFO=y
 CONFIG_COMPILER_OPTIMIZATION_DEFAULT=y
+
+# FATFS — enable Long File Names (LFN_STACK variant). Without LFN, FATFS
+# rejects any filename >8.3 with errno=22 EINVAL, breaking session_<id>/
+# directory and human-readable capture filenames. STACK variant uses
+# ~4 KB of caller-task stack but doesn't allocate from heap (LFN_HEAP
+# was tried — both crashed identically due to a separate WiFi-config
+# issue, but STACK is the right default for our usage pattern).
+# CONFIG_FATFS_LFN_NONE is not set
+CONFIG_FATFS_LFN_STACK=y
+CONFIG_FATFS_MAX_LFN=255
+
+# Wi-Fi STA — committed here so 'rm sdkconfig' (used to apply Kconfig
+# changes) doesn't silently lose them and brick the relay boot path.
+# Phase 4 will move this to NVS via captive portal.
+CONFIG_GRASSHOPPER_WIFI_SSID="iPhone 256"
+CONFIG_GRASSHOPPER_WIFI_PASS="oscar123"

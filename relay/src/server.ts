@@ -14,6 +14,13 @@ app.get('/health', (c) =>
     version: '0.1.0',
     devices: store.list().length,
     ts: Date.now(),
+    // UI uses this to surface a security banner when the deployment is
+    // using the dev-token fallback. Don't expose the actual token —
+    // just the boolean. RAILWAY_PUBLIC_DOMAIN is set on Railway deploys
+    // so the warning specifically targets public exposure.
+    tokenIsDevDefault: process.env.RELAY_TOKEN === undefined ||
+                       process.env.RELAY_TOKEN === 'dev-token',
+    publiclyExposed: !!process.env.RAILWAY_PUBLIC_DOMAIN,
   })
 )
 

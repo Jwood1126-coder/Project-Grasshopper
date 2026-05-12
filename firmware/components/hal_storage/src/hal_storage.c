@@ -165,6 +165,23 @@ int hal_storage_sd_atomic_write(const char *path,
     return (int)len;
 }
 
+// Stat-first mkdir_p. mkdir() on a FATFS mount point itself can return
+// EACCES (or other non-EEXIST errno depending on driver), which made the
+// older "fail unless EEXIST" check abort on the very first segment.
+// Solution: stat(dir) first; if it already exists as a directory, skip.
+static esp_err_t mkdir_one(const char *p) {
+    struct stat st;
+    if (stat(p, &st) == 0) {
+        if (S_ISDIR(st.st_mode)) return ESP_OK;
+        ESP_LOGE(TAG, "%s exists but isn't a directory", p);
+        return ESP_FAIL;
+    }
+    if (mkdir(p, 0755) == 0) return ESP_OK;
+    if (errno == EEXIST) return ESP_OK;
+    ESP_LOGE(TAG, "mkdir(%s) failed: errno=%d", p, errno);
+    return ESP_FAIL;
+}
+
 esp_err_t hal_storage_sd_mkdir_p(const char *path) {
     if (!s_sd_mounted || !path) return ESP_ERR_INVALID_STATE;
 
@@ -176,16 +193,10 @@ esp_err_t hal_storage_sd_mkdir_p(const char *path) {
     for (size_t i = 1; i < n; i++) {
         if (tmp[i] == '/') {
             tmp[i] = 0;
-            if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
-                ESP_LOGE(TAG, "mkdir(%s) failed: errno=%d", tmp, errno);
-                return ESP_FAIL;
-            }
+            esp_err_t e = mkdir_one(tmp);
+            if (e != ESP_OK) return e;
             tmp[i] = '/';
         }
     }
-    if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
-        ESP_LOGE(TAG, "mkdir(%s) failed: errno=%d", tmp, errno);
-        return ESP_FAIL;
-    }
-    return ESP_OK;
+    return mkdir_one(tmp);
 }

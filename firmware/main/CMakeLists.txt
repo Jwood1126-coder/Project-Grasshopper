@@ -1,7 +1,7 @@
 idf_component_register(
-    SRCS "app_main.c"
+    SRCS "app_main.c" "capture.c"
     INCLUDE_DIRS "." "include"
-    REQUIRES nvs_flash esp_event esp_timer net_wifi net_relay proto hal_lepton hal_camera hal_storage hal_oled
+    REQUIRES nvs_flash esp_event esp_timer net_wifi net_relay proto hal_lepton hal_camera hal_storage hal_oled espressif__esp32-camera json
 )
 
 # Compile-time version string. Override at build time:

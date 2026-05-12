@@ -231,6 +231,15 @@ export const USER_UI_HTML = `<!doctype html>
   footer a { color: var(--muted); text-decoration: none; }
   footer a:hover { color: var(--accent); }
 
+  /* Security banner — shown when relay is publicly exposed with the
+     dev-token default. Anyone with the URL can issue commands. */
+  .insecure-banner {
+    background: #3a1f23; border: 1px solid var(--err); border-radius: 8px;
+    padding: 12px 14px; margin-bottom: 16px; color: #ffc7c9;
+    font-size: 13px; line-height: 1.5;
+  }
+  .insecure-banner strong { color: var(--err); }
+
   /* Toast for command feedback */
   .toast {
     position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
@@ -251,6 +260,8 @@ export const USER_UI_HTML = `<!doctype html>
     <div class="logo">🦗 <span class="accent">Grasshopper</span></div>
     <div class="chips" id="chips"></div>
   </header>
+
+  <div id="banner-slot"></div>
 
   <div id="content">
     <div class="empty">
@@ -709,6 +720,29 @@ export const USER_UI_HTML = `<!doctype html>
       console.warn('poll error', e);
     }
   }
+
+  // One-time security check at boot: if the relay is publicly exposed
+  // (Railway) AND still using the dev-token default, anyone with this
+  // URL can issue commands. Surface a loud banner.
+  async function checkSecurityPosture() {
+    try {
+      const r = await fetch('/health', { cache: 'no-store' });
+      const j = await r.json();
+      if (j.tokenIsDevDefault && j.publiclyExposed) {
+        const slot = document.getElementById('banner-slot');
+        if (slot && !slot.firstChild) {
+          slot.appendChild(el('div', { class: 'insecure-banner' },
+            el('strong', {}, '⚠ Insecure default token in use. '),
+            'Anyone with this URL can issue commands (Capture, Reboot, FFC). ',
+            'Set ',
+            el('code', {}, 'RELAY_TOKEN'),
+            ' to a unique secret in Railway env vars, then update the Token field in Diagnostics below.'
+          ));
+        }
+      }
+    } catch {}
+  }
+  checkSecurityPosture();
 
   poll();
   setInterval(poll, 2000);

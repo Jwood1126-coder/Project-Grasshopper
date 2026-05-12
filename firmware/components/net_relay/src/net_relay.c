@@ -24,6 +24,7 @@
 static const char *TAG = "net_relay";
 static esp_websocket_client_handle_t s_client = NULL;
 static volatile bool s_connected = false;
+static net_relay_cmd_handler_t s_cmd_handler = NULL;
 
 // ---- Inbound message buffer ----
 //
@@ -56,29 +57,37 @@ static void send_hello(void) {
 //
 // Every command returns a `cmd.result` event back to the relay. UI
 // matches the `id` field to its outstanding command so retries over a
-// flaky link don't produce stale state. Use small static buffers — these
-// are emitted from the WS receive task which has a fixed stack.
+// flaky link don't produce stale state.
+//
+// Built with cJSON so the msg field is properly escaped. Earlier snprintf
+// version was fine for fixed messages but unsafe once SD paths, file
+// names, or user labels could appear in the msg (a single embedded
+// quote or backslash would corrupt the JSON envelope). cJSON also lets
+// us attach an optional structured `data` object for future use (e.g.
+// returning the new session id alongside capture.now's success message).
 static void send_cmd_result(const char *cmd_type, const char *cmd_id,
                              bool ok, const char *msg) {
-    char buf[384];
-    int n = snprintf(buf, sizeof(buf),
-        "{\"type\":\"event\","
-         "\"kind\":\"cmd.result\","
-         "\"id\":\"%s\","
-         "\"cmd\":\"%s\","
-         "\"ok\":%s,"
-         "\"msg\":\"%s\","
-         "\"ts\":%llu}",
-        cmd_id ? cmd_id : "",
-        cmd_type ? cmd_type : "",
-        ok ? "true" : "false",
-        msg ? msg : "",
-        (unsigned long long)(esp_timer_get_time() / 1000));
-    if (n > 0 && n < (int)sizeof(buf) && s_connected) {
-        esp_websocket_client_send_text(s_client, buf, n, pdMS_TO_TICKS(1000));
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return;
+    cJSON_AddStringToObject(root, "type", "event");
+    cJSON_AddStringToObject(root, "kind", "cmd.result");
+    cJSON_AddStringToObject(root, "id",   cmd_id   ? cmd_id   : "");
+    cJSON_AddStringToObject(root, "cmd",  cmd_type ? cmd_type : "");
+    cJSON_AddBoolToObject(root,   "ok",   ok);
+    cJSON_AddStringToObject(root, "msg",  msg      ? msg      : "");
+    cJSON_AddNumberToObject(root, "ts",   (double)(esp_timer_get_time() / 1000));
+
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json) return;
+
+    if (s_connected) {
+        size_t len = strlen(json);
+        esp_websocket_client_send_text(s_client, json, (int)len, pdMS_TO_TICKS(1000));
         ESP_LOGI(TAG, "cmd.result %s id=%s %s msg=\"%s\"",
                  cmd_type, cmd_id, ok ? "OK" : "FAIL", msg);
     }
+    free(json);
 }
 
 // ---- Command dispatch ----
@@ -128,15 +137,17 @@ static void dispatch_cmd(const cJSON *root) {
         return;  // unreachable
     }
 
-    if (strcmp(cmd, "capture.now") == 0 ||
-        strcmp(cmd, "timelapse.start") == 0 ||
-        strcmp(cmd, "timelapse.stop") == 0) {
-        send_cmd_result(cmd, id, false,
-                        "not yet implemented (Phase 3: timelapse backend)");
+    // Forward anything else to the registered handler (capture.now,
+    // timelapse.start/stop, settings.update, etc.). Handler signature
+    // takes the payload as a void* to keep cJSON out of the public header.
+    if (s_cmd_handler) {
+        char msg[160] = {0};
+        bool ok = s_cmd_handler(cmd, id, root, msg, sizeof(msg));
+        send_cmd_result(cmd, id, ok, msg);
         return;
     }
 
-    send_cmd_result(cmd, id, false, "unknown command");
+    send_cmd_result(cmd, id, false, "unknown command (no handler registered)");
 }
 
 static void handle_text_frame(const char *data, size_t len) {
@@ -257,3 +268,7 @@ esp_err_t net_relay_send_binary(const void *buf, size_t len) {
 }
 
 bool net_relay_is_connected(void) { return s_connected; }
+
+void net_relay_register_cmd_handler(net_relay_cmd_handler_t fn) {
+    s_cmd_handler = fn;
+}
