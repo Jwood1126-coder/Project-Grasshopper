@@ -62,11 +62,13 @@ static void send_hello(void) {
 // Built with cJSON so the msg field is properly escaped. Earlier snprintf
 // version was fine for fixed messages but unsafe once SD paths, file
 // names, or user labels could appear in the msg (a single embedded
-// quote or backslash would corrupt the JSON envelope). cJSON also lets
-// us attach an optional structured `data` object for future use (e.g.
-// returning the new session id alongside capture.now's success message).
-static void send_cmd_result(const char *cmd_type, const char *cmd_id,
-                             bool ok, const char *msg) {
+// quote or backslash would corrupt the JSON envelope). The optional
+// data_json argument is parsed and embedded under "data" — used by
+// sessions.* commands to attach structured payloads (file lists, file
+// chunks) that can't fit in a free-text msg.
+void net_relay_emit_cmd_result(const char *cmd_type, const char *cmd_id,
+                                bool ok, const char *msg,
+                                const char *data_json) {
     cJSON *root = cJSON_CreateObject();
     if (!root) return;
     cJSON_AddStringToObject(root, "type", "event");
@@ -77,6 +79,15 @@ static void send_cmd_result(const char *cmd_type, const char *cmd_id,
     cJSON_AddStringToObject(root, "msg",  msg      ? msg      : "");
     cJSON_AddNumberToObject(root, "ts",   (double)(esp_timer_get_time() / 1000));
 
+    if (data_json && *data_json) {
+        cJSON *data = cJSON_Parse(data_json);
+        if (data) {
+            cJSON_AddItemToObject(root, "data", data);
+        } else {
+            ESP_LOGW(TAG, "cmd.result data_json failed to parse, omitting");
+        }
+    }
+
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (!json) return;
@@ -84,10 +95,17 @@ static void send_cmd_result(const char *cmd_type, const char *cmd_id,
     if (s_connected) {
         size_t len = strlen(json);
         esp_websocket_client_send_text(s_client, json, (int)len, pdMS_TO_TICKS(1000));
-        ESP_LOGI(TAG, "cmd.result %s id=%s %s msg=\"%s\"",
-                 cmd_type, cmd_id, ok ? "OK" : "FAIL", msg);
+        ESP_LOGI(TAG, "cmd.result %s id=%s %s msg=\"%s\"%s",
+                 cmd_type, cmd_id, ok ? "OK" : "FAIL", msg,
+                 data_json ? " (+data)" : "");
     }
     free(json);
+}
+
+// Convenience wrapper for the dispatcher's own use: no data payload.
+static inline void send_cmd_result(const char *cmd_type, const char *cmd_id,
+                                    bool ok, const char *msg) {
+    net_relay_emit_cmd_result(cmd_type, cmd_id, ok, msg, NULL);
 }
 
 // ---- Command dispatch ----
@@ -138,12 +156,29 @@ static void dispatch_cmd(const cJSON *root) {
     }
 
     // Forward anything else to the registered handler (capture.now,
-    // timelapse.start/stop, settings.update, etc.). Handler signature
-    // takes the payload as a void* to keep cJSON out of the public header.
+    // timelapse.start/stop, settings.update, sessions.*, etc.). Handler
+    // signature takes the payload as a void* to keep cJSON out of the
+    // public header.
+    //
+    // DEFERRED return = handler enqueued the work to a background task
+    // and will emit cmd.result itself when done (used by sessions.* so
+    // SD scans don't block the websocket task). For DEFERRED, msg may
+    // be empty or hold a queue-status string for logs only.
     if (s_cmd_handler) {
         char msg[160] = {0};
-        bool ok = s_cmd_handler(cmd, id, root, msg, sizeof(msg));
-        send_cmd_result(cmd, id, ok, msg);
+        net_relay_cmd_status_t st = s_cmd_handler(cmd, id, root, msg, sizeof(msg));
+        switch (st) {
+            case NET_RELAY_CMD_OK:
+                send_cmd_result(cmd, id, true, msg);
+                break;
+            case NET_RELAY_CMD_FAIL:
+                send_cmd_result(cmd, id, false, msg);
+                break;
+            case NET_RELAY_CMD_DEFERRED:
+                ESP_LOGI(TAG, "cmd %s id=%s deferred to worker (%s)",
+                         cmd, id, msg[0] ? msg : "no-msg");
+                break;
+        }
         return;
     }
 

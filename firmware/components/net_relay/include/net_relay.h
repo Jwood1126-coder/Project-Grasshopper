@@ -40,13 +40,32 @@ bool net_relay_is_connected(void);
 //   - msg_out   — caller-owned buffer for the human-readable result msg
 //   - msg_cap   — capacity of msg_out
 //
-// Returns: true on success, false on failure. The msg_out string is
-// reported back to the relay as the cmd.result event's `msg` field.
-typedef bool (*net_relay_cmd_handler_t)(const char *cmd, const char *id,
-                                         const void *payload_json_root,
-                                         char *msg_out, size_t msg_cap);
+// Returns:
+//   NET_RELAY_CMD_OK       — synchronous success; dispatcher emits cmd.result
+//   NET_RELAY_CMD_FAIL     — synchronous failure; dispatcher emits cmd.result
+//   NET_RELAY_CMD_DEFERRED — handler took ownership; it must call
+//                            net_relay_emit_cmd_result() once work completes
+//                            (used for SD scans / file reads on a worker)
+typedef enum {
+    NET_RELAY_CMD_OK = 0,
+    NET_RELAY_CMD_FAIL = 1,
+    NET_RELAY_CMD_DEFERRED = 2,
+} net_relay_cmd_status_t;
+
+typedef net_relay_cmd_status_t (*net_relay_cmd_handler_t)(
+    const char *cmd, const char *id,
+    const void *payload_json_root,
+    char *msg_out, size_t msg_cap);
 
 void net_relay_register_cmd_handler(net_relay_cmd_handler_t fn);
+
+// Emit a cmd.result event from anywhere (including a worker task).
+// `msg` is the human-readable result; `data_json` is an optional
+// already-serialized JSON value (object/array) embedded as the "data"
+// field — pass NULL to omit. Caller retains ownership of all strings.
+// Drops silently if the WS is not connected.
+void net_relay_emit_cmd_result(const char *cmd, const char *id, bool ok,
+                                const char *msg, const char *data_json);
 
 #ifdef __cplusplus
 }

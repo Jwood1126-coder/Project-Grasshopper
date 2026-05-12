@@ -32,6 +32,7 @@
 #include "sdkconfig.h"
 
 #include "capture.h"
+#include "sessions.h"
 #include "cJSON.h"
 
 // Lepton frame geometry — 160x120 raw uint16.
@@ -434,11 +435,10 @@ void thermal_preview_task(void *arg) {
 }
 
 // Command handler — dispatched by net_relay for non-built-in commands.
-// Returns true on success (cmd.result will be ok=true), false on failure.
-// The msg_out string is reported back to the relay as the result message.
-static bool app_cmd_handler(const char *cmd, const char *id,
-                             const void *payload_json_root,
-                             char *msg_out, size_t msg_cap) {
+// Return values per net_relay_cmd_status_t (OK/FAIL/DEFERRED).
+static net_relay_cmd_status_t app_cmd_handler(const char *cmd, const char *id,
+                                               const void *payload_json_root,
+                                               char *msg_out, size_t msg_cap) {
     (void)id;
     const cJSON *payload = (const cJSON *)payload_json_root;
 
@@ -446,7 +446,7 @@ static bool app_cmd_handler(const char *cmd, const char *id,
         char session_id[64];
         esp_err_t err = capture_now(session_id, sizeof(session_id),
                                      msg_out, msg_cap);
-        return err == ESP_OK;
+        return err == ESP_OK ? NET_RELAY_CMD_OK : NET_RELAY_CMD_FAIL;
     }
 
     if (strcmp(cmd, "timelapse.start") == 0) {
@@ -465,16 +465,67 @@ static bool app_cmd_handler(const char *cmd, const char *id,
         esp_err_t err = timelapse_start(interval, capture_vis, capture_therm,
                                          session_id, sizeof(session_id),
                                          msg_out, msg_cap);
-        return err == ESP_OK;
+        return err == ESP_OK ? NET_RELAY_CMD_OK : NET_RELAY_CMD_FAIL;
     }
 
     if (strcmp(cmd, "timelapse.stop") == 0) {
         esp_err_t err = timelapse_stop(msg_out, msg_cap);
-        return err == ESP_OK;
+        return err == ESP_OK ? NET_RELAY_CMD_OK : NET_RELAY_CMD_FAIL;
+    }
+
+    // sessions.* — offload to worker so the WS task isn't blocked by SD.
+    if (strcmp(cmd, "sessions.list") == 0) {
+        if (sessions_enqueue_list(id) != ESP_OK) {
+            snprintf(msg_out, msg_cap, "sessions queue full");
+            return NET_RELAY_CMD_FAIL;
+        }
+        snprintf(msg_out, msg_cap, "queued");
+        return NET_RELAY_CMD_DEFERRED;
+    }
+    if (strcmp(cmd, "sessions.get") == 0) {
+        const char *sid = NULL;
+        if (payload) {
+            const cJSON *s = cJSON_GetObjectItemCaseSensitive(payload, "sessionId");
+            if (cJSON_IsString(s)) sid = s->valuestring;
+        }
+        if (!sid) {
+            snprintf(msg_out, msg_cap, "missing sessionId");
+            return NET_RELAY_CMD_FAIL;
+        }
+        if (sessions_enqueue_get(id, sid) != ESP_OK) {
+            snprintf(msg_out, msg_cap, "sessions queue full");
+            return NET_RELAY_CMD_FAIL;
+        }
+        snprintf(msg_out, msg_cap, "queued");
+        return NET_RELAY_CMD_DEFERRED;
+    }
+    if (strcmp(cmd, "session.read_file") == 0) {
+        const char *sid = NULL, *fn = NULL;
+        uint32_t off = 0, mlen = 0;
+        if (payload) {
+            const cJSON *s = cJSON_GetObjectItemCaseSensitive(payload, "sessionId");
+            const cJSON *f = cJSON_GetObjectItemCaseSensitive(payload, "filename");
+            const cJSON *o = cJSON_GetObjectItemCaseSensitive(payload, "offset");
+            const cJSON *m = cJSON_GetObjectItemCaseSensitive(payload, "maxLen");
+            if (cJSON_IsString(s)) sid = s->valuestring;
+            if (cJSON_IsString(f)) fn = f->valuestring;
+            if (cJSON_IsNumber(o)) off = (uint32_t)o->valuedouble;
+            if (cJSON_IsNumber(m)) mlen = (uint32_t)m->valuedouble;
+        }
+        if (!sid || !fn) {
+            snprintf(msg_out, msg_cap, "missing sessionId/filename");
+            return NET_RELAY_CMD_FAIL;
+        }
+        if (sessions_enqueue_read_file(id, sid, fn, off, mlen) != ESP_OK) {
+            snprintf(msg_out, msg_cap, "sessions queue full");
+            return NET_RELAY_CMD_FAIL;
+        }
+        snprintf(msg_out, msg_cap, "queued");
+        return NET_RELAY_CMD_DEFERRED;
     }
 
     snprintf(msg_out, msg_cap, "unknown command: %s", cmd);
-    return false;
+    return NET_RELAY_CMD_FAIL;
 }
 
 void app_main(void) {
@@ -499,6 +550,10 @@ void app_main(void) {
                                    CONFIG_GRASSHOPPER_WIFI_PASS);
     } else {
         ESP_LOGW(TAG, "no Wi-Fi SSID configured — skipping STA");
+    }
+
+    if (sessions_init() != ESP_OK) {
+        ESP_LOGW(TAG, "sessions worker failed to start — sessions.* will be unavailable");
     }
 
 #if CONFIG_GRASSHOPPER_RELAY_ENABLED

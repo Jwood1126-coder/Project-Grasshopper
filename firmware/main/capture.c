@@ -244,42 +244,29 @@ esp_err_t capture_now(char *session_id_out, size_t session_id_cap,
     }
 
     if (hal_storage_sd_mkdir_p(session_dir) != ESP_OK) {
-        // Fallback: skip subdirectory, write files flat to /sdcard root.
-        // Less organized but at least gets us bytes to disk so we can
-        // unblock Phase 4 UI work while we figure out FATFS mkdir.
-        ESP_LOGW(TAG, "mkdir failed; falling back to flat /sdcard layout");
-        snprintf(session_dir, sizeof(session_dir), "/sdcard");
+        hal_storage_sd_unlock();
+        free(vis_copy);
+        free(therm_jpg);
+        snprintf(msg_out, msg_cap, "mkdir %s failed", session_dir);
+        return ESP_FAIL;
     }
 
-    // Filenames always include session id so a /sdcard root fallback
-    // doesn't clobber across sessions. Paths join session_dir + filename.
     char path[160];
     esp_err_t vis_write_err = ESP_OK;
     esp_err_t therm_write_err = ESP_OK;
-    bool flat = (strcmp(session_dir, "/sdcard") == 0);
 
-    if (flat) {
-        snprintf(path, sizeof(path), "/sdcard/cap_%lu_vis.jpg", (unsigned long)sid);
-    } else {
-        snprintf(path, sizeof(path), "%s/000001_vis.jpg", session_dir);
-    }
+    snprintf(path, sizeof(path), "%s/000001_vis.jpg", session_dir);
     vis_write_err = write_file_sd_locked(path, vis_copy, vis_len);
 
     if (therm_ok) {
-        if (flat) {
-            snprintf(path, sizeof(path), "/sdcard/cap_%lu_therm.jpg", (unsigned long)sid);
-        } else {
-            snprintf(path, sizeof(path), "%s/000001_therm.jpg", session_dir);
-        }
+        snprintf(path, sizeof(path), "%s/000001_therm.jpg", session_dir);
         therm_write_err = write_file_sd_locked(path, therm_jpg, therm_len);
     }
 
-    // session.json + captures.jsonl only in subdir mode (root fallback
-    // would litter /sdcard with metadata files).
-    if (!flat) {
+    {
         char meta[512];
         int meta_len = snprintf(meta, sizeof(meta),
-            "{\"sessionId\":%lu,"
+            "{\"sessionId\":\"session_%lu\","
              "\"intervalSec\":0,"
              "\"captureCount\":1,"
              "\"timestamp\":%lu,"
