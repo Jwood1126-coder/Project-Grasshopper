@@ -1294,10 +1294,14 @@ export const USER_UI_HTML = `<!doctype html>
       }
       const j = await r.json();
       const m = j.meta || {};
+      const totalCaps = j.captureCount ?? '?';
+      const returned  = j.returnedCount;
+      const capsTxt = (j.truncated && returned != null)
+        ? returned + ' of ' + totalCaps + ' (truncated)'
+        : String(totalCaps);
       meta.replaceChildren(
         metaItem('Mode',      m.mode || '?'),
-        metaItem('Captures',  String(j.captureCount ?? '?') +
-                              (j.truncated ? ' (truncated)' : '')),
+        metaItem('Captures',  capsTxt),
         m.intervalSec > 0 ? metaItem('Interval', m.intervalSec + 's') : null,
         m.durationSec > 0 ? metaItem('Duration', fmtElapsed(m.durationSec * 1000)) : null,
         metaItem('Started',   m.timestamp

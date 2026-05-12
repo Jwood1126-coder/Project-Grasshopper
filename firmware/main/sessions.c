@@ -266,18 +266,26 @@ static void do_get(const sess_req_t *req) {
         return;
     }
 
+    // captureCount = authoritative count from meta (session.json).
+    // returnedCount = how many rows we actually included from
+    // captures.jsonl. They differ when we hit SESS_CAPTURES_MAX or
+    // when the session crashed before writing one of the two files.
+    double meta_count = json_num(meta, "captureCount", -1);
+    uint32_t cap_count = (meta_count >= 0) ? (uint32_t)meta_count : added;
+
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "sessionId", req->session_id);
     cJSON_AddItemToObject(root, "meta", meta);
     cJSON_AddItemToObject(root, "captures", captures);
-    cJSON_AddNumberToObject(root, "captureCount", added);
+    cJSON_AddNumberToObject(root, "captureCount", cap_count);
+    cJSON_AddNumberToObject(root, "returnedCount", added);
     cJSON_AddBoolToObject(root, "truncated", truncated);
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
 
-    char msg[80];
-    snprintf(msg, sizeof(msg), "%s: %lu captures%s",
-             req->session_id, (unsigned long)added,
+    char msg[100];
+    snprintf(msg, sizeof(msg), "%s: %lu/%lu captures%s",
+             req->session_id, (unsigned long)added, (unsigned long)cap_count,
              truncated ? " (truncated)" : "");
     net_relay_emit_cmd_result(req_cmd_name(req->type), req->cmd_id,
                                true, msg, json);

@@ -371,6 +371,15 @@ static void tl_append_capture_log(uint32_t seq, bool vis_ok, size_t vis_len,
 // Update session.json with the current count + complete flag. Caller
 // must hold sd_lock.
 static void tl_write_session_json(bool complete) {
+    // s_tl_started_ms is monotonic (esp_timer); we want unix epoch in
+    // session.json so the library can sort + render dates. Derive the
+    // start epoch by subtracting elapsed monotonic seconds from now.
+    // If NTP hasn't synced (time(NULL) ~= 0), this still yields a
+    // small but consistent value rather than seconds-since-boot.
+    uint64_t now_epoch    = (uint64_t)time(NULL);
+    uint64_t elapsed_sec  = ((esp_timer_get_time() / 1000) - s_tl_started_ms) / 1000;
+    uint64_t start_epoch  = now_epoch > elapsed_sec ? now_epoch - elapsed_sec : now_epoch;
+
     char meta[512];
     int meta_len = snprintf(meta, sizeof(meta),
         "{\"sessionId\":\"%s\","
@@ -385,11 +394,11 @@ static void tl_write_session_json(bool complete) {
         s_tl_session_id,
         (unsigned long)s_tl_interval_sec,
         (unsigned long)s_tl_capture_count,
-        (unsigned long long)(s_tl_started_ms / 1000),
+        (unsigned long long)start_epoch,
         s_tl_capture_vis ? "true" : "false",
         s_tl_capture_therm ? "true" : "false",
         complete ? "true" : "false",
-        (unsigned long long)((esp_timer_get_time() / 1000 - s_tl_started_ms) / 1000));
+        (unsigned long long)elapsed_sec);
     char path[160];
     snprintf(path, sizeof(path), "%s/session.json", s_tl_session_dir);
     hal_storage_sd_atomic_write(path, meta, (size_t)meta_len);
