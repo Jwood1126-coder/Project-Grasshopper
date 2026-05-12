@@ -407,6 +407,11 @@ const server = Bun.serve<WsCtx>({
         })
         store.setSocket(msg.deviceId, ws)
         console.log(`[ws] hello from ${msg.deviceId} fw=${msg.fwVersion ?? '?'}`)
+        // Push wall-clock time so the device can set its system clock
+        // even when NTP is blocked/slow on the local network. Sent
+        // immediately after hello; firmware applies via settimeofday()
+        // so time(NULL) and session.json timestamps reflect epoch.
+        ws.send(JSON.stringify({ type: 'time', epochMs: Date.now() }))
         store.appendEvent(msg.deviceId, {
           ts: Date.now(),
           kind: 'connected',

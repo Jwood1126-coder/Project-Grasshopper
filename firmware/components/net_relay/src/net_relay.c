@@ -2,6 +2,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <sys/time.h>
 
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
@@ -199,6 +200,22 @@ static void handle_text_frame(const char *data, size_t len) {
     const char *type = cJSON_IsString(type_field) ? type_field->valuestring : "";
     if (strcmp(type, "cmd") == 0) {
         dispatch_cmd(root);
+    } else if (strcmp(type, "time") == 0) {
+        // Relay pushes wall-clock right after hello so we don't depend
+        // on NTP working through whatever NAT we're behind. Apply via
+        // settimeofday so time(NULL) reflects epoch immediately.
+        const cJSON *epoch_field = cJSON_GetObjectItemCaseSensitive(root, "epochMs");
+        if (cJSON_IsNumber(epoch_field)) {
+            int64_t epoch_ms = (int64_t)epoch_field->valuedouble;
+            struct timeval tv = {
+                .tv_sec  = (time_t)(epoch_ms / 1000),
+                .tv_usec = (suseconds_t)((epoch_ms % 1000) * 1000),
+            };
+            settimeofday(&tv, NULL);
+            ESP_LOGI(TAG, "system clock set from relay: epoch=%lld ms", (long long)epoch_ms);
+        } else {
+            ESP_LOGW(TAG, "rx time msg without numeric epochMs");
+        }
     } else {
         ESP_LOGI(TAG, "rx text type=\"%s\" (no handler)", type);
     }
