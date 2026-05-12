@@ -37,40 +37,39 @@ static void power_cycle(void) {
 
 esp_err_t hal_lepton_boot(void) {
     power_cycle();
-    // Fox uses 5s here. Phase 3 sometimes converged at 2s + many
-    // sync-fail retries, but post-cycle Leptons appear to need the
-    // full ~5s for the OEM module to fully initialize — observed via
-    // OEM_FW_VER GET returning DATA_LEN=0 (Lepton not ready to
-    // respond) at 2s but populated values at 5s+.
-    ESP_LOGI(TAG, "waiting 5s for Lepton boot (matches Fox)...");
-    vTaskDelay(pdMS_TO_TICKS(5000));
+    // Fox uses 5s here. New Lepton 3.5 units sometimes need longer
+    // before responding to I2C; bump to 8s for safety.
+    ESP_LOGI(TAG, "waiting 8s for Lepton boot...");
+    vTaskDelay(pdMS_TO_TICKS(8000));
 
     esp_err_t err = lepton_cci_init();
     if (err != ESP_OK) return err;
-    // Diagnostic snapshot BEFORE configure — see what factory defaults
-    // the Lepton booted into.
+
+    // I2C address probe: confirm Lepton is on the bus before asking it
+    // anything. If this NACKs, the bus is silent — no point running
+    // CCI ops, the issue is physical (seating, wiring, power).
+    extern bool lepton_cci_probe_i2c(void);
+    if (!lepton_cci_probe_i2c()) {
+        ESP_LOGE(TAG, "Lepton I2C probe FAILED — check seating, SDA/SCL/VIN, MOSFET");
+        return ESP_ERR_NOT_FOUND;
+    }
+
     lepton_cci_dump_state();
+
     err = lepton_cci_configure();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "CCI configure failed");
         return err;
     }
-    // Diagnostic snapshot AFTER configure — confirm our SETs took.
     lepton_cci_dump_state();
 
-    // EXPERIMENT: issue FFC before waiting for first frame. Fox runs
-    // FFC AFTER the first frame, but in our post-cycle-storm state the
-    // Lepton never emits a first frame to trigger FFC. FFC sometimes
-    // kicks a stuck pixel pipeline into life by forcing a calibration
-    // refresh — worth trying as a one-shot.
-    ESP_LOGW(TAG, "pre-emptive FFC (before first frame)...");
-    if (lepton_cci_run_ffc() == ESP_OK) {
-        ESP_LOGI(TAG, "pre-emptive FFC done");
-        // Give Lepton 1 s after FFC to settle.
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    } else {
-        ESP_LOGW(TAG, "pre-emptive FFC failed");
-    }
+    // NOTE: FFC at boot was an experiment that turned out to be
+    // counterproductive. After FFC, the Lepton emits duplicate frames
+    // (seg=0 on line 20) for several seconds while recalibrating,
+    // which our VoSPI assembler treats as a sync failure and bails.
+    // Fox runs FFC AFTER the first frame, and that's what we do too.
+    // Use lepton_cci_ffc_probe() manually (e.g., from a debug endpoint)
+    // when you want to verify FFC controller health.
 
     err = lepton_vospi_init();
     if (err != ESP_OK) return err;

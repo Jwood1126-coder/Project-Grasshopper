@@ -76,13 +76,48 @@ static inline uint32_t now_ms(void) {
 // SPI is owned by lepton_spi.cpp — see lepton_spi_init() below.
 
 // ---- Power-cycle the Lepton via MOSFET (fox approach) ----
+//
+// Rate-limited: 87 cycles in 30 min during a prior session left the
+// Lepton in a half-alive state (responds to CCI but won't stream).
+// Guard rails:
+//   - Min 60 s between cycles. Lepton boot + OEM init + first VoSPI
+//     emission takes 5–10 s; <60 s gap is empirically abusive.
+//   - Hard cap of LEP_RESET_MAX_PER_SESSION cycles per power-on. After
+//     that we latch into "manual reset required" and log loudly. The
+//     auto-reset path then becomes a no-op for the rest of this boot.
+#define LEP_RESET_MIN_INTERVAL_MS 60000
+#define LEP_RESET_MAX_PER_SESSION 5
+
+static volatile uint32_t s_last_reset_ms = 0;
+static volatile bool     s_reset_latched = false;
 
 static void vospi_power_cycle_hardware(uint32_t boot_wait_ms) {
+    uint32_t t = now_ms();
+
+    if (s_reset_latched) {
+        ESP_LOGE(TAG, "reset SUPPRESSED — session cap (%d) reached; manual reset required",
+                 LEP_RESET_MAX_PER_SESSION);
+        return;
+    }
+    if (s_last_reset_ms != 0 && (t - s_last_reset_ms) < LEP_RESET_MIN_INTERVAL_MS) {
+        uint32_t wait = LEP_RESET_MIN_INTERVAL_MS - (t - s_last_reset_ms);
+        ESP_LOGW(TAG, "reset SUPPRESSED — only %u ms since last reset (need %d), wait %u ms",
+                 (unsigned)(t - s_last_reset_ms), LEP_RESET_MIN_INTERVAL_MS, (unsigned)wait);
+        return;
+    }
+    if (s_hardware_resets + 1 >= LEP_RESET_MAX_PER_SESSION) {
+        ESP_LOGW(TAG, "this is reset #%lu of %d — session cap will latch after this one",
+                 (unsigned long)(s_hardware_resets + 1), LEP_RESET_MAX_PER_SESSION);
+        s_reset_latched = true;
+    }
+
     s_hardware_resets++;
+    s_last_reset_ms = t;
     gpio_set_level(LEP_SPI_CS, 1);
 
     if (LEP_POWER_PIN >= 0) {
-        ESP_LOGW(TAG, "power-cycle Lepton via MOSFET (gpio %d)", LEP_POWER_PIN);
+        ESP_LOGW(TAG, "power-cycle Lepton via MOSFET (gpio %d) — reset #%lu",
+                 LEP_POWER_PIN, (unsigned long)s_hardware_resets);
         gpio_config_t mos_cfg = {
             .pin_bit_mask = 1ULL << LEP_POWER_PIN,
             .mode = GPIO_MODE_OUTPUT,
@@ -320,7 +355,7 @@ static void vospi_task(void *arg) {
             extern void lepton_vospi_dbg_dump(void);
             lepton_vospi_dbg_dump();
         }
-        if (s_total_packets % 180000 == 0) {
+        if (s_total_packets % 60000 == 0) {
             ESP_LOGI(TAG, "frames=%lu total=%lu valid=%lu discard=%lu",
                      (unsigned long)s_frame_counter,
                      (unsigned long)s_total_packets,
@@ -335,6 +370,26 @@ static void vospi_task(void *arg) {
                      (unsigned long)s_diag_seg_zero,
                      (unsigned long)s_diag_splice_detected,
                      (unsigned long)s_hardware_resets);
+        }
+
+        // Periodic line-20 segment-ID histogram. Healthy: all 4 IDs
+        // cycling. Pathology we care about: only seg 0/2/4 visible
+        // (Lepton 3.5 quirk with TLinear=1) — see lep CCI configure.
+        static uint32_t s_seg_id_hist[8] = {0};
+        if (valid && line == 20) {
+            s_seg_id_hist[seg & 0x7]++;
+            uint32_t total = 0;
+            for (int i = 0; i < 8; i++) total += s_seg_id_hist[i];
+            if (total % 1000 == 0) {
+                ESP_LOGI(TAG, "line-20 seg ID hist (n=%lu): "
+                              "0:%lu 1:%lu 2:%lu 3:%lu 4:%lu",
+                         (unsigned long)total,
+                         (unsigned long)s_seg_id_hist[0],
+                         (unsigned long)s_seg_id_hist[1],
+                         (unsigned long)s_seg_id_hist[2],
+                         (unsigned long)s_seg_id_hist[3],
+                         (unsigned long)s_seg_id_hist[4]);
+            }
         }
 
         switch (state) {

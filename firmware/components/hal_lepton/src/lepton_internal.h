@@ -30,6 +30,7 @@ esp_err_t lepton_cci_init(void);
 esp_err_t lepton_cci_oem_reboot(void);
 esp_err_t lepton_cci_configure(void);
 void      lepton_cci_dump_state(void);
+void      lepton_cci_ffc_probe(void);   // FFC + 2-s status poll diagnostic
 esp_err_t lepton_cci_run_ffc(void);
 esp_err_t lepton_cci_set_agc(bool enable);
 esp_err_t lepton_cci_set_gain(int mode);
