@@ -561,7 +561,9 @@ esp_err_t timelapse_start(uint32_t interval_sec,
 
     s_tl_stop = false;
     s_tl_active = true;
-    BaseType_t r = xTaskCreate(tl_task, "tl", 6144, NULL, 5, &s_tl_task);
+    // Pin to core 0 so SPI reader on core 1 isn't displaced by the
+    // capture iteration's heap_caps_malloc + JPEG encode + SD write.
+    BaseType_t r = xTaskCreatePinnedToCore(tl_task, "tl", 6144, NULL, 5, &s_tl_task, 0);
     if (r != pdPASS) {
         s_tl_active = false;
         xSemaphoreGive(s_tl_mutex);

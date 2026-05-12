@@ -421,7 +421,10 @@ esp_err_t sessions_init(void) {
     if (s_queue) return ESP_OK;
     s_queue = xQueueCreate(SESS_QUEUE_LEN, sizeof(sess_req_t));
     if (!s_queue) return ESP_ERR_NO_MEM;
-    BaseType_t r = xTaskCreate(worker_task, "sessions", 6144, NULL, 4, &s_task);
+    // Pin to core 0. Core 1 is reserved for the VoSPI reader; SD work
+    // here can take tens of ms and would otherwise displace the reader's
+    // tight 0.5 ms packet cadence.
+    BaseType_t r = xTaskCreatePinnedToCore(worker_task, "sessions", 6144, NULL, 4, &s_task, 0);
     if (r != pdPASS) {
         vQueueDelete(s_queue);
         s_queue = NULL;

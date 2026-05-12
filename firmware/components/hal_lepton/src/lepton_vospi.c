@@ -42,8 +42,12 @@ static uint8_t  *s_pkt = NULL;              // 164B packet buffer (no special ca
                                             // Arduino's SPIClass copies byte-by-byte from FIFO)
 static volatile int s_write_idx = 0;
 
-// Mutex protecting frame counter + write index
-static SemaphoreHandle_t s_mutex = NULL;
+// Tiny critical-section lock protecting only the s_write_idx flip +
+// s_frame_counter inc. NOT held during memcpy or SPI work — that
+// previously blocked the reader for ~1 ms each preview tick, which
+// caused the Lepton's continuous VoSPI stream to overrun and produce
+// the lineMismatch / sync-loop pathology. Atomic swap is microseconds.
+static portMUX_TYPE s_idx_lock = portMUX_INITIALIZER_UNLOCKED;
 
 // Reader task
 static TaskHandle_t s_task = NULL;
@@ -134,12 +138,10 @@ static void vospi_power_cycle_hardware(uint32_t boot_wait_ms) {
     ESP_LOGI(TAG, "waiting %u ms for Lepton boot...", (unsigned)boot_wait_ms);
     vTaskDelay(pdMS_TO_TICKS(boot_wait_ms));
 
-    if (s_mutex) {
-        xSemaphoreTake(s_mutex, portMAX_DELAY);
-        s_frame_counter = 0;
-        s_last_frame_ms = 0;
-        xSemaphoreGive(s_mutex);
-    }
+    portENTER_CRITICAL(&s_idx_lock);
+    s_frame_counter = 0;
+    s_last_frame_ms = 0;
+    portEXIT_CRITICAL(&s_idx_lock);
 }
 
 // ---- Read one VoSPI packet (164 B) ----
@@ -552,13 +554,15 @@ static void vospi_task(void *arg) {
                         break;
                     }
 
-                    // Frame complete — flip buffers.
+                    // Frame complete — flip buffers. Spinlock held only
+                    // for the swap+counter inc (~50 cycles); reader is
+                    // never blocked on get_frame's memcpy.
                     memcpy((void *)s_last_seg_ids, cur_seg_ids, 4);
-                    xSemaphoreTake(s_mutex, portMAX_DELAY);
+                    portENTER_CRITICAL(&s_idx_lock);
                     s_write_idx = 1 - wi;
                     s_frame_counter++;
                     s_last_frame_ms = now_ms();
-                    xSemaphoreGive(s_mutex);
+                    portEXIT_CRITICAL(&s_idx_lock);
 
                     if (!logged_first) {
                         ESP_LOGI(TAG, "first frame! seg ids: %d %d %d %d",
@@ -592,11 +596,6 @@ static void vospi_task(void *arg) {
 // ---- Public init ----
 
 esp_err_t lepton_vospi_init(void) {
-    if (!s_mutex) {
-        s_mutex = xSemaphoreCreateMutex();
-        if (!s_mutex) return ESP_ERR_NO_MEM;
-    }
-
     if (!s_frame[0]) s_frame[0] = heap_caps_malloc(LEP_FRAME_BYTES, MALLOC_CAP_SPIRAM);
     if (!s_frame[1]) s_frame[1] = heap_caps_malloc(LEP_FRAME_BYTES, MALLOC_CAP_SPIRAM);
     if (!s_frame[0] || !s_frame[1]) {
@@ -647,10 +646,15 @@ void lepton_vospi_start(void) {
 
 bool lepton_vospi_get_frame(uint16_t *dst) {
     if (s_frame_counter == 0) return false;
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    // Snapshot the read pointer atomically. If the reader flips
+    // s_write_idx while we're memcpying, the worst case is a torn
+    // frame (top from frame N, bottom from frame N+1). Acceptable
+    // for thermal preview, and far better than blocking the reader's
+    // SPI loop for the full memcpy.
+    portENTER_CRITICAL(&s_idx_lock);
     int read_idx = 1 - s_write_idx;
+    portEXIT_CRITICAL(&s_idx_lock);
     memcpy(dst, s_frame[read_idx], LEP_FRAME_BYTES);
-    xSemaphoreGive(s_mutex);
     return true;
 }
 
