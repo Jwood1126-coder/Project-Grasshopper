@@ -350,49 +350,11 @@ static void vospi_task(void *arg) {
         s_total_packets++;
         if (valid) s_valid_packets++; else s_discard_packets++;
 
-
-
-        // Periodic stat dump (every ~10 k packets so we get fast feedback).
-        if (s_total_packets % 10000 == 0) {
-            extern void lepton_vospi_dbg_dump(void);
-            lepton_vospi_dbg_dump();
-        }
-        if (s_total_packets % 60000 == 0) {
-            ESP_LOGI(TAG, "frames=%lu total=%lu valid=%lu discard=%lu",
-                     (unsigned long)s_frame_counter,
-                     (unsigned long)s_total_packets,
-                     (unsigned long)s_valid_packets,
-                     (unsigned long)s_discard_packets);
-            ESP_LOGI(TAG, "diag: sync=%lu line_mm=%lu seg_not1=%lu seg_mm=%lu fto=%lu sz=%lu splice=%lu hw=%lu",
-                     (unsigned long)s_diag_sync_entries,
-                     (unsigned long)s_diag_line_mismatch,
-                     (unsigned long)s_diag_seg_not1,
-                     (unsigned long)s_diag_seg_mismatch,
-                     (unsigned long)s_diag_frame_timeout,
-                     (unsigned long)s_diag_seg_zero,
-                     (unsigned long)s_diag_splice_detected,
-                     (unsigned long)s_hardware_resets);
-        }
-
-        // Periodic line-20 segment-ID histogram. Healthy: all 4 IDs
-        // cycling. Pathology we care about: only seg 0/2/4 visible
-        // (Lepton 3.5 quirk with TLinear=1) — see lep CCI configure.
-        static uint32_t s_seg_id_hist[8] = {0};
-        if (valid && line == 20) {
-            s_seg_id_hist[seg & 0x7]++;
-            uint32_t total = 0;
-            for (int i = 0; i < 8; i++) total += s_seg_id_hist[i];
-            if (total % 1000 == 0) {
-                ESP_LOGI(TAG, "line-20 seg ID hist (n=%lu): "
-                              "0:%lu 1:%lu 2:%lu 3:%lu 4:%lu",
-                         (unsigned long)total,
-                         (unsigned long)s_seg_id_hist[0],
-                         (unsigned long)s_seg_id_hist[1],
-                         (unsigned long)s_seg_id_hist[2],
-                         (unsigned long)s_seg_id_hist[3],
-                         (unsigned long)s_seg_id_hist[4]);
-            }
-        }
+        // ESP_LOG used to fire here every 10 k / 60 k packets and on
+        // every 1000th line-20 segment ID. UART blocks for ms inside
+        // the log calls; that alone is enough to miss VoSPI packets.
+        // All the same data is exposed via tick stats — no logging in
+        // this hot path.
 
         switch (state) {
         case SYNC:
@@ -587,9 +549,20 @@ static void vospi_task(void *arg) {
             break;
         }
 
-        // Yield: SYNC sleeps to feed watchdog; READING just yields.
-        if (state == SYNC) vTaskDelay(1);
-        else if (expect_line % 30 == 0) taskYIELD();
+        // Yield: in SYNC we used to vTaskDelay(1) per iteration, which
+        // capped throughput at ~500 packets/s and made re-acquisition
+        // slow enough that the next frame would already be mid-stream
+        // by the time we synced — perpetuating the abort loop. Now we
+        // taskYIELD() per iteration (zero-cost when nothing else is on
+        // core 1) and only vTaskDelay(1) every 100 iterations to feed
+        // the task watchdog (IDLE0 task on core 1 needs a slot).
+        if (state == SYNC) {
+            static uint16_t s_sync_yield_n = 0;
+            if (++s_sync_yield_n >= 100) { s_sync_yield_n = 0; vTaskDelay(1); }
+            else taskYIELD();
+        } else if (expect_line % 30 == 0) {
+            taskYIELD();
+        }
     }
 }
 
