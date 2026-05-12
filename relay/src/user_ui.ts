@@ -1,22 +1,17 @@
-// Grasshopper user-facing UI — Phase 1 (Live View) + Phase 2 (commands).
+// Grasshopper user-facing UI — Phase 1-4.
 //
 // Self-contained HTML/CSS/JS, no framework. Served at GET /.
-// Polls /api/devices and /api/devices/:id/state for live data, refreshes
-// thermal + visible last-frame previews every ~250 ms.
 //
-// Three health indicators (codex's distinction):
-//   1. Transport health — relay says device is online (WS connected)
-//   2. Acquisition health — Lepton frame counter increasing, valid:total ratio
-//   3. Preview freshness — age of last JPEG (could be stale even if 1+2 are OK)
-// All three are surfaced separately so a stale preview doesn't read as live.
-//
-// Phase 2 commands:
-//   - UI generates a unique id per command, POSTs to /api/devices/:id/cmd
-//   - Polls /api/devices/:id/events?since=<ts> looking for cmd.result with id
-//   - Result toast shows ok/fail + msg, button reverts from pending state
-//
-// Auth: token from URL hash (#token=...) or localStorage; defaults to
-// 'dev-token' which works on the current Railway deploy.
+// Phase 4 changes:
+//  - Active timelapse detection: when device reports timelapse.active,
+//    swap the Start button for a red Stop button + show a session-active
+//    banner with capture count + elapsed time.
+//  - Timelapse settings modal: tap Start → choose interval (5s / 10s /
+//    30s / 1 min / 5 min / 15 min) and toggle vis / thermal capture.
+//  - Loosened staleness thresholds: thermal preview now updates every
+//    750 ms on the device side; UI marks panels stale at 6 s (warn at 3 s).
+//  - Better desktop / iPad layout: max-width 1600 px, larger panels,
+//    actions inline beside the views on wide screens.
 
 export const USER_UI_HTML = `<!doctype html>
 <html lang="en">
@@ -50,14 +45,18 @@ export const USER_UI_HTML = `<!doctype html>
     -webkit-font-smoothing: antialiased;
     -webkit-tap-highlight-color: transparent;
   }
-  .app { max-width: 1200px; margin: 0 auto; padding: 16px; padding-bottom: env(safe-area-inset-bottom, 16px); }
+  .app {
+    max-width: 1600px; margin: 0 auto;
+    padding: 18px clamp(12px, 3vw, 32px);
+    padding-bottom: env(safe-area-inset-bottom, 18px);
+  }
 
   /* ─── Header ─── */
   header {
     display: flex; align-items: center; justify-content: space-between;
-    padding: 8px 4px 20px; gap: 12px; flex-wrap: wrap;
+    padding: 8px 4px 22px; gap: 14px; flex-wrap: wrap;
   }
-  .logo { font: 600 20px/1 -apple-system; letter-spacing: -0.01em; flex-shrink: 0; }
+  .logo { font: 600 22px/1 -apple-system; letter-spacing: -0.01em; flex-shrink: 0; }
   .logo .accent { color: var(--accent); }
   .chips { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
   .chip {
@@ -91,35 +90,60 @@ export const USER_UI_HTML = `<!doctype html>
   }
   @keyframes pulse-ring { 0% { transform: scale(0.6); opacity: 0.6; } 100% { transform: scale(1.3); opacity: 0; } }
 
+  /* ─── Active timelapse banner ─── */
+  .tl-banner {
+    background: linear-gradient(180deg, #1a3a2c 0%, #0e2418 100%);
+    border: 1px solid #2a5a3c; border-radius: 12px;
+    padding: 14px 18px; margin-bottom: 16px;
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  }
+  .tl-banner .icon {
+    width: 38px; height: 38px; flex-shrink: 0;
+    border-radius: 50%; background: var(--ok);
+    display: flex; align-items: center; justify-content: center;
+    color: #001a08; font-size: 16px; font-weight: 700;
+    animation: pulse 2s ease-in-out infinite;
+  }
+  .tl-banner .info { flex: 1; min-width: 200px; }
+  .tl-banner .info .title { font-size: 14px; font-weight: 600; color: var(--ok); }
+  .tl-banner .info .meta { font: 13px/1.4 ui-monospace, monospace; color: #a8d4b8; margin-top: 2px; }
+  .tl-banner .stop-btn {
+    background: var(--err); color: #1a0e10; border: none;
+    border-radius: 8px; padding: 10px 18px; font: 600 14px -apple-system;
+    cursor: pointer; transition: all 0.15s;
+  }
+  .tl-banner .stop-btn:hover:not(:disabled) { background: #ff8a8c; }
+  .tl-banner .stop-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
   /* ─── View grid (mobile-first stack, desktop side-by-side) ─── */
   .views {
-    display: grid; gap: 12px;
+    display: grid; gap: 14px;
     grid-template-columns: 1fr;
-    margin-bottom: 16px;
+    margin-bottom: 18px;
   }
-  @media (min-width: 720px) {
-    .views { grid-template-columns: 1fr 1fr; }
+  @media (min-width: 700px) {
+    .views { grid-template-columns: 1fr 1fr; gap: 16px; }
   }
 
   .panel {
-    background: var(--panel-bg); border: 1px solid var(--border); border-radius: 12px;
+    background: var(--panel-bg); border: 1px solid var(--border); border-radius: 14px;
     overflow: hidden; position: relative; aspect-ratio: 4/3;
     display: flex; flex-direction: column;
     transition: opacity 0.4s;
   }
-  .panel.stale img { opacity: 0.5; filter: saturate(0.5); }
+  .panel.stale img { opacity: 0.55; filter: saturate(0.5) brightness(0.85); }
   .panel-label {
-    position: absolute; top: 10px; left: 12px; z-index: 2;
+    position: absolute; top: 12px; left: 14px; z-index: 2;
     font: 600 10px/1 ui-sans-serif; letter-spacing: 0.08em; text-transform: uppercase;
-    color: var(--text); padding: 5px 9px; border-radius: 4px;
-    background: rgba(10, 14, 20, 0.7); backdrop-filter: blur(8px);
+    color: var(--text); padding: 6px 10px; border-radius: 5px;
+    background: rgba(10, 14, 20, 0.75); backdrop-filter: blur(8px);
   }
   .panel-label.thermal { color: var(--accent-warm); }
   .panel-meta {
-    position: absolute; top: 10px; right: 12px; z-index: 2;
+    position: absolute; top: 12px; right: 14px; z-index: 2;
     font: 500 11px/1 ui-monospace, monospace; color: var(--muted);
-    padding: 5px 9px; border-radius: 4px;
-    background: rgba(10, 14, 20, 0.7); backdrop-filter: blur(8px);
+    padding: 6px 10px; border-radius: 5px;
+    background: rgba(10, 14, 20, 0.75); backdrop-filter: blur(8px);
     display: flex; gap: 6px; align-items: center;
   }
   .panel-meta .age.warn { color: var(--warn); }
@@ -134,9 +158,9 @@ export const USER_UI_HTML = `<!doctype html>
     color: var(--muted); font-size: 13px; font-style: italic;
   }
   .panel.stale::after {
-    content: 'stale preview'; position: absolute; bottom: 10px; left: 12px;
+    content: 'stale'; position: absolute; bottom: 12px; left: 14px;
     font: 600 10px/1 ui-sans-serif; letter-spacing: 0.08em; text-transform: uppercase;
-    color: var(--warn); padding: 5px 9px; border-radius: 4px;
+    color: var(--warn); padding: 6px 10px; border-radius: 5px;
     background: rgba(26, 22, 14, 0.85); backdrop-filter: blur(8px);
   }
 
@@ -147,7 +171,11 @@ export const USER_UI_HTML = `<!doctype html>
   }
   .actions-secondary {
     display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
-    margin-bottom: 20px;
+    margin-bottom: 22px;
+  }
+  @media (min-width: 1100px) {
+    /* On wide screens, use a single 4-column row for primary + secondary actions */
+    .actions, .actions-secondary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   }
   .btn {
     display: flex; align-items: center; justify-content: center; gap: 8px;
@@ -158,7 +186,7 @@ export const USER_UI_HTML = `<!doctype html>
     -webkit-user-select: none; user-select: none;
     position: relative;
   }
-  .btn.sm { height: 40px; font-size: 13px; }
+  .btn.sm { height: 42px; font-size: 13px; }
   .btn:hover:not(:disabled) { background: var(--surface-2); border-color: #3d4a5c; }
   .btn:active:not(:disabled) { transform: scale(0.98); }
   .btn:disabled { opacity: 0.4; cursor: not-allowed; }
@@ -167,11 +195,6 @@ export const USER_UI_HTML = `<!doctype html>
   .btn.danger { color: var(--err); border-color: #3a1f23; }
   .btn.danger:hover:not(:disabled) { background: #1a0e10; }
   .btn .icon { font-size: 18px; line-height: 1; }
-  .btn .badge {
-    font: 500 10px/1 ui-monospace, monospace;
-    padding: 2px 6px; border-radius: 4px;
-    background: rgba(0,0,0,0.2); margin-left: 4px; opacity: 0.7;
-  }
   .btn.pending { animation: pending 1.2s ease-in-out infinite; }
   @keyframes pending { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
 
@@ -231,16 +254,77 @@ export const USER_UI_HTML = `<!doctype html>
   footer a { color: var(--muted); text-decoration: none; }
   footer a:hover { color: var(--accent); }
 
-  /* Security banner — shown when relay is publicly exposed with the
-     dev-token default. Anyone with the URL can issue commands. */
+  /* ─── Modal (timelapse settings) ─── */
+  .modal-bg {
+    position: fixed; inset: 0; z-index: 200;
+    background: rgba(0, 0, 0, 0.6); backdrop-filter: blur(4px);
+    display: none; align-items: flex-end; justify-content: center;
+    padding: 0;
+  }
+  .modal-bg.show { display: flex; animation: fade-in 0.18s ease; }
+  @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+  @media (min-width: 600px) {
+    .modal-bg { align-items: center; padding: 20px; }
+  }
+  .modal {
+    background: var(--surface); border: 1px solid var(--border);
+    border-top-left-radius: 16px; border-top-right-radius: 16px;
+    width: 100%; max-width: 480px; padding: 20px 22px 22px;
+    box-shadow: 0 -8px 40px rgba(0, 0, 0, 0.4);
+    max-height: 92vh; overflow-y: auto;
+  }
+  @media (min-width: 600px) { .modal { border-radius: 16px; } }
+  .modal h3 { font-size: 17px; font-weight: 600; margin-bottom: 14px; }
+  .modal-row { margin-bottom: 16px; }
+  .modal-row > label { display: block; font-size: 12px; color: var(--muted);
+                        text-transform: uppercase; letter-spacing: 0.06em;
+                        margin-bottom: 8px; }
+  .interval-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px;
+  }
+  .interval-grid .iv {
+    background: var(--panel-bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px 8px; font: 500 14px ui-monospace;
+    cursor: pointer; text-align: center; transition: all 0.15s;
+    color: var(--text);
+  }
+  .interval-grid .iv:hover { background: var(--surface-2); }
+  .interval-grid .iv.active {
+    background: var(--accent); color: #001620;
+    border-color: var(--accent);
+  }
+  .toggle-row {
+    display: flex; gap: 8px;
+  }
+  .toggle-row .tog {
+    flex: 1; padding: 12px; background: var(--panel-bg);
+    border: 1px solid var(--border); border-radius: 8px;
+    cursor: pointer; transition: all 0.15s; text-align: center;
+    color: var(--muted); font: 500 13px -apple-system;
+    -webkit-user-select: none; user-select: none;
+  }
+  .toggle-row .tog.on {
+    background: var(--surface-2); color: var(--text);
+    border-color: #3d4a5c;
+  }
+  .toggle-row .tog.on .check { color: var(--ok); }
+  .modal-actions {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 20px;
+  }
+
+  /* Security banner */
   .insecure-banner {
     background: #3a1f23; border: 1px solid var(--err); border-radius: 8px;
     padding: 12px 14px; margin-bottom: 16px; color: #ffc7c9;
     font-size: 13px; line-height: 1.5;
   }
   .insecure-banner strong { color: var(--err); }
+  .insecure-banner code {
+    background: rgba(0,0,0,0.3); padding: 1px 6px; border-radius: 3px;
+    font-size: 12px;
+  }
 
-  /* Toast for command feedback */
+  /* Toast */
   .toast {
     position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
     background: var(--surface-2); border: 1px solid var(--border);
@@ -250,7 +334,7 @@ export const USER_UI_HTML = `<!doctype html>
     max-width: 90%; z-index: 100;
   }
   .toast.show { opacity: 1; }
-  .toast.ok { border-color: #1f3a28; }
+  .toast.ok { border-color: #1f3a28; color: var(--ok); }
   .toast.err { border-color: #3a1f23; color: var(--err); }
 </style>
 </head>
@@ -276,16 +360,37 @@ export const USER_UI_HTML = `<!doctype html>
   </footer>
 </div>
 
+<!-- Timelapse settings modal -->
+<div class="modal-bg" id="tl-modal">
+  <div class="modal">
+    <h3>Start Timelapse</h3>
+    <div class="modal-row">
+      <label>Interval</label>
+      <div class="interval-grid" id="iv-grid"></div>
+    </div>
+    <div class="modal-row">
+      <label>Capture</label>
+      <div class="toggle-row">
+        <div class="tog on" id="tog-vis"><span class="check">●</span> Visible</div>
+        <div class="tog on" id="tog-therm"><span class="check">●</span> Thermal</div>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeTlModal()">Cancel</button>
+      <button class="btn primary" id="tl-confirm">Start</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
-  // ───── Auth token (URL hash > localStorage > 'dev-token') ─────
+  // ───── Auth token ─────
   function loadToken() {
     const m = location.hash.match(/(?:^|[#&])token=([^&]+)/);
     if (m) {
       const t = decodeURIComponent(m[1]);
       try { localStorage.setItem('gh_token', t); } catch {}
-      // Strip from URL so it isn't visible to anyone glancing at the address bar.
       history.replaceState(null, '', location.pathname + location.search);
       return t;
     }
@@ -310,6 +415,15 @@ export const USER_UI_HTML = `<!doctype html>
     if (s < 60)   return s + 's';
     if (s < 3600) return Math.floor(s/60) + 'm';
     return Math.floor(s/3600) + 'h';
+  };
+  const fmtElapsed = (ms) => {
+    const s = Math.floor(ms / 1000);
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    if (h > 0) return h + 'h ' + m + 'm ' + sec + 's';
+    if (m > 0) return m + 'm ' + sec + 's';
+    return sec + 's';
   };
 
   const toast = (msg, kind) => {
@@ -336,19 +450,73 @@ export const USER_UI_HTML = `<!doctype html>
     return e;
   };
 
-  // ───── Per-device DOM (built once, mutated on poll) ─────
+  // ───── Per-device state (built once, mutated on poll) ─────
   let currentDeviceId = null;
   const fields = {};
-  // Track frame count progression for acquisition-health detection.
   let lastThermFrames = 0;
   let lastThermFramesTs = 0;
-  // Track preview age (relay-side timestamp from X-Frame-Age-Ms).
   let thermPreviewAgeMs = null;
   let visPreviewAgeMs = null;
-  // Pending command tracking: id → { type, sentAtMs, button, originalText }
   const pendingCmds = new Map();
   let lastEventsTs = Date.now();
 
+  // ───── Timelapse settings modal ─────
+  const TL_INTERVALS = [
+    { label: '5s',   sec: 5   },
+    { label: '10s',  sec: 10  },
+    { label: '30s',  sec: 30  },
+    { label: '1 min', sec: 60  },
+    { label: '5 min', sec: 300 },
+    { label: '15 min',sec: 900 },
+  ];
+  let tlSelectedInterval = 30;
+  let tlCaptureVis = true;
+  let tlCaptureTherm = true;
+
+  function buildIvGrid() {
+    const grid = document.getElementById('iv-grid');
+    grid.innerHTML = '';
+    TL_INTERVALS.forEach(opt => {
+      const e = el('div', {
+        class: 'iv' + (opt.sec === tlSelectedInterval ? ' active' : ''),
+        onclick: () => {
+          tlSelectedInterval = opt.sec;
+          buildIvGrid();
+        },
+      }, opt.label);
+      grid.appendChild(e);
+    });
+  }
+
+  function setupModalToggles() {
+    const v = document.getElementById('tog-vis');
+    const t = document.getElementById('tog-therm');
+    v.classList.toggle('on', tlCaptureVis);
+    t.classList.toggle('on', tlCaptureTherm);
+    v.onclick = () => { tlCaptureVis = !tlCaptureVis; v.classList.toggle('on', tlCaptureVis); };
+    t.onclick = () => { tlCaptureTherm = !tlCaptureTherm; t.classList.toggle('on', tlCaptureTherm); };
+  }
+
+  function openTlModal() {
+    buildIvGrid();
+    setupModalToggles();
+    document.getElementById('tl-modal').classList.add('show');
+  }
+  window.closeTlModal = () => {
+    document.getElementById('tl-modal').classList.remove('show');
+  };
+  document.getElementById('tl-confirm').onclick = () => {
+    if (!tlCaptureVis && !tlCaptureTherm) {
+      toast('Enable at least one of vis / thermal', 'err');
+      return;
+    }
+    closeTlModal();
+    sendCmd('timelapse.start',
+      { intervalSec: tlSelectedInterval, captureVis: tlCaptureVis, captureTherm: tlCaptureTherm },
+      null, 'Start Timelapse');
+  };
+
+  // ───── Live view DOM ─────
   function buildLiveView() {
     fields.thermalImg = el('img', { id: 'therm-img', alt: 'Thermal preview' });
     fields.thermalEmpty = el('div', { class: 'panel-empty' }, 'no thermal frames yet');
@@ -385,16 +553,16 @@ export const USER_UI_HTML = `<!doctype html>
 
     fields.tlBtn = el('button', {
       class: 'btn',
-      onclick: () => sendCmd('timelapse.start', { intervalSec: 30 }, fields.tlBtn, 'Start Timelapse'),
+      onclick: openTlModal,
     },
       el('span', { class: 'icon' }, '▶'),
-      el('span', { class: 'btn-label' }, 'Start Timelapse'));
+      el('span', { class: 'btn-label' }, 'Start Timelapse…'));
 
     fields.ffcBtn = el('button', {
       class: 'btn sm',
       onclick: () => sendCmd('thermal.ffc', {}, fields.ffcBtn, 'Run FFC'),
     },
-      el('span', {}, 'Run FFC'));
+      el('span', { class: 'btn-label' }, 'Run FFC'));
 
     fields.rebootBtn = el('button', {
       class: 'btn sm danger',
@@ -403,10 +571,11 @@ export const USER_UI_HTML = `<!doctype html>
         sendCmd('device.reboot', {}, fields.rebootBtn, 'Reboot');
       },
     },
-      el('span', {}, 'Reboot'));
+      el('span', { class: 'btn-label' }, 'Reboot'));
 
-    const actions = el('div', { class: 'actions' }, fields.captureBtn, fields.tlBtn);
-    const actionsSec = el('div', { class: 'actions-secondary' }, fields.ffcBtn, fields.rebootBtn);
+    fields.actions = el('div', { class: 'actions' }, fields.captureBtn, fields.tlBtn);
+    fields.actionsSec = el('div', { class: 'actions-secondary' }, fields.ffcBtn, fields.rebootBtn);
+    fields.tlBannerSlot = el('div', { id: 'tl-banner-slot' });
 
     fields.statBlock = el('div', { class: 'stat-grid' });
     const tokenInput = el('input', {
@@ -422,14 +591,15 @@ export const USER_UI_HTML = `<!doctype html>
       el('summary', {}, 'Diagnostics & device state'),
       el('div', { class: 'body' }, fields.statBlock, tokenRow));
 
-    return el('div', {}, views, actions, actionsSec, diagnostics);
+    return el('div', {}, fields.tlBannerSlot, views, fields.actions, fields.actionsSec, diagnostics);
   }
 
+  // ───── Live view update ─────
   function updateLiveView(d, state) {
     const therm = state?.init?.thermal;
     const vis = state?.init?.visible;
+    const tl = state?.init?.timelapse;
 
-    // Attach preview imgs once thermal/vis report ready.
     if (therm && therm.frames > 0 && !fields.thermalImg.parentElement) {
       fields.thermalPanel.appendChild(fields.thermalImg);
       fields.thermalEmpty.remove();
@@ -439,16 +609,14 @@ export const USER_UI_HTML = `<!doctype html>
       fields.visEmpty.remove();
     }
 
-    // Acquisition health: is the frame counter increasing?
     const now = Date.now();
     if (therm && therm.frames !== lastThermFrames) {
       lastThermFrames = therm.frames;
       lastThermFramesTs = now;
     }
     const acqStaleMs = now - lastThermFramesTs;
-    const acqStale = lastThermFramesTs === 0 || acqStaleMs > 8000;
+    const acqStale = lastThermFramesTs === 0 || acqStaleMs > 10000;
 
-    // Preview-age display per panel.
     if (therm) {
       const fpsTxt = therm.fps != null && therm.fps > 0
         ? therm.fps.toFixed(1) + ' fps' : therm.frames + ' frames';
@@ -462,17 +630,21 @@ export const USER_UI_HTML = `<!doctype html>
     setAge(fields.thermalAge, thermPreviewAgeMs);
     setAge(fields.visAge, visPreviewAgeMs);
 
-    // Mark thermal panel stale if preview age > 5s OR acquisition stalled
+    // Loosened: thermal preview updates every ~750 ms on the device,
+    // mark stale only at >6 s (warn at 3 s on the per-panel age label).
     if (therm && therm.frames > 0) {
-      const thermStale = (thermPreviewAgeMs != null && thermPreviewAgeMs > 5000) || acqStale;
+      const thermStale = (thermPreviewAgeMs != null && thermPreviewAgeMs > 6000) || acqStale;
       fields.thermalPanel.classList.toggle('stale', thermStale);
     }
     if (vis && vis.ready) {
-      const visStale = visPreviewAgeMs != null && visPreviewAgeMs > 5000;
+      const visStale = visPreviewAgeMs != null && visPreviewAgeMs > 6000;
       fields.visPanel.classList.toggle('stale', visStale);
     }
 
-    // Diagnostic stats — three-tier health
+    // Active timelapse banner + Start/Stop button toggle
+    updateTlBanner(tl);
+
+    // Diagnostics
     const validRatio = therm && therm.totalPackets > 0
       ? therm.validPackets / therm.totalPackets : 0;
     fields.statBlock.replaceChildren(
@@ -486,6 +658,7 @@ export const USER_UI_HTML = `<!doctype html>
            therm ? fmtPct(therm.validPackets, therm.totalPackets) : '—',
            validRatio > 0.5 ? 'ok' : (validRatio > 0.2 ? 'warn' : 'err')),
       stat('Frames committed', therm ? therm.frames : '—', therm && therm.frames > 0 ? 'ok' : ''),
+      stat('Timelapse', tl?.active ? 'active' : 'idle', tl?.active ? 'ok' : ''),
       stat('Device', d.deviceId, ''),
       stat('Firmware', d.fwVersion || '—', ''),
       stat('Wi-Fi', state?.init?.wifi?.ssid || '—', ''),
@@ -501,13 +674,56 @@ export const USER_UI_HTML = `<!doctype html>
     );
   }
 
+  function updateTlBanner(tl) {
+    const slot = fields.tlBannerSlot;
+    if (!slot) return;
+    const active = !!(tl && tl.active);
+
+    // Toggle Start button label/visibility.
+    if (fields.tlBtn) {
+      const lbl = fields.tlBtn.querySelector('.btn-label');
+      if (lbl) lbl.textContent = active ? 'Timelapse running…' : 'Start Timelapse…';
+      fields.tlBtn.disabled = active;
+      fields.tlBtn.style.opacity = active ? '0.55' : '';
+    }
+
+    if (!active) {
+      slot.replaceChildren();
+      return;
+    }
+
+    const elapsed = Date.now() - (tl.startedMs || Date.now());
+    const stopBtn = el('button', {
+      class: 'stop-btn',
+      id: 'tl-stop',
+      onclick: () => {
+        sendCmd('timelapse.stop', {}, stopBtn, 'Stop');
+      },
+    }, '■  Stop');
+
+    const banner = el('div', { class: 'tl-banner' },
+      el('div', { class: 'icon' }, '●'),
+      el('div', { class: 'info' },
+        el('div', { class: 'title' },
+          'Timelapse running · ' + tl.sessionId),
+        el('div', { class: 'meta' },
+          'every ' + tl.intervalSec + 's · ' +
+          tl.captureCount + ' captures · ' +
+          fmtElapsed(elapsed) +
+          (tl.captureVis && tl.captureTherm ? ' · vis+therm' :
+           tl.captureVis ? ' · vis only' : ' · therm only'))
+      ),
+      stopBtn);
+    slot.replaceChildren(banner);
+  }
+
   function setAge(elNode, ageMs) {
     if (!elNode) return;
     elNode.textContent = ageMs == null ? '—' : fmtAge(ageMs) + ' ago';
     elNode.className = 'age' +
       (ageMs == null ? '' :
-       ageMs > 5000 ? ' err' :
-       ageMs > 2000 ? ' warn' : '');
+       ageMs > 6000 ? ' err' :
+       ageMs > 3000 ? ' warn' : '');
   }
 
   function stat(k, v, kind) {
@@ -519,8 +735,6 @@ export const USER_UI_HTML = `<!doctype html>
   function updateChips(d, state) {
     const chips = document.getElementById('chips');
     chips.innerHTML = '';
-
-    // 1. Transport health
     const tChip = el('div', {
       class: d ? (d.online ? 'chip ok' : 'chip err') : 'chip err',
       title: 'Transport: WebSocket from device to relay',
@@ -529,9 +743,8 @@ export const USER_UI_HTML = `<!doctype html>
       d ? (d.online ? 'Live' : 'Offline') : 'No device');
     chips.appendChild(tChip);
 
-    // 2. Acquisition health (only if device is online)
     if (d && d.online) {
-      const acqStale = lastThermFramesTs === 0 || (Date.now() - lastThermFramesTs) > 8000;
+      const acqStale = lastThermFramesTs === 0 || (Date.now() - lastThermFramesTs) > 10000;
       const acqOk = lastThermFrames > 0 && !acqStale;
       chips.appendChild(el('div', {
         class: acqOk ? 'chip ok' : (lastThermFrames > 0 ? 'chip warn' : 'chip err'),
@@ -540,7 +753,7 @@ export const USER_UI_HTML = `<!doctype html>
     }
   }
 
-  // ───── Image refresh: preload-then-swap, capture relay-side age header ─────
+  // ───── Image refresh ─────
   async function refreshImg(modality) {
     if (!currentDeviceId) return;
     const url = '/api/devices/' + encodeURIComponent(currentDeviceId) +
@@ -558,7 +771,6 @@ export const USER_UI_HTML = `<!doctype html>
       if (img && img.parentElement) {
         const old = img.src;
         img.src = next;
-        // Revoke previous blob URL after new image loads (avoid leak).
         img.onload = () => { if (old.startsWith('blob:')) URL.revokeObjectURL(old); };
       } else {
         URL.revokeObjectURL(next);
@@ -572,7 +784,7 @@ export const USER_UI_HTML = `<!doctype html>
     refreshImg('vis');
   }
 
-  // ───── Command round-trip with id/result matching ─────
+  // ───── Commands with id/result ─────
   function newCmdId() {
     return 'c-' + Date.now().toString(36) + '-' +
            Math.random().toString(36).slice(2, 7);
@@ -590,7 +802,7 @@ export const USER_UI_HTML = `<!doctype html>
       button,
       originalText,
     });
-    setBtnPending(button, true);
+    if (button) setBtnPending(button, true);
 
     try {
       const r = await fetch(
@@ -608,7 +820,7 @@ export const USER_UI_HTML = `<!doctype html>
         const err = await r.json().catch(() => ({}));
         const status = r.status;
         pendingCmds.delete(id);
-        setBtnPending(button, false);
+        if (button) setBtnPending(button, false);
         const msg = status === 401 ? 'Unauthorized — set token in diagnostics' :
                     status === 404 ? 'Device not found' :
                     status === 409 ? 'Device offline' :
@@ -616,18 +828,17 @@ export const USER_UI_HTML = `<!doctype html>
         toast('Failed: ' + msg, 'err');
         return;
       }
-      // Success means command was forwarded to device. Now wait for cmd.result.
-      // 6s timeout — long enough for thermal.ffc (1.2s actual) + slack.
+      // Success → wait for cmd.result. Timeout 8s (covers thermal.ffc + slack).
       setTimeout(() => {
         if (pendingCmds.has(id)) {
           pendingCmds.delete(id);
-          setBtnPending(button, false);
+          if (button) setBtnPending(button, false);
           toast('No response from device for ' + cmdType, 'err');
         }
-      }, 6000);
+      }, 8000);
     } catch (e) {
       pendingCmds.delete(id);
-      setBtnPending(button, false);
+      if (button) setBtnPending(button, false);
       toast('Network error: ' + (e?.message || e), 'err');
     }
   }
@@ -647,6 +858,7 @@ export const USER_UI_HTML = `<!doctype html>
       button.disabled = false;
       if (lbl && button.dataset.origLabel) {
         lbl.textContent = button.dataset.origLabel;
+        delete button.dataset.origLabel;
       }
     }
   }
@@ -666,7 +878,7 @@ export const USER_UI_HTML = `<!doctype html>
         if (e.kind === 'cmd.result' && e.id && pendingCmds.has(e.id)) {
           const pending = pendingCmds.get(e.id);
           pendingCmds.delete(e.id);
-          setBtnPending(pending.button, false);
+          if (pending.button) setBtnPending(pending.button, false);
           toast(
             (e.ok ? '✓ ' : '✗ ') + pending.type + ': ' + (e.msg || ''),
             e.ok ? 'ok' : 'err'
@@ -721,9 +933,6 @@ export const USER_UI_HTML = `<!doctype html>
     }
   }
 
-  // One-time security check at boot: if the relay is publicly exposed
-  // (Railway) AND still using the dev-token default, anyone with this
-  // URL can issue commands. Surface a loud banner.
   async function checkSecurityPosture() {
     try {
       const r = await fetch('/health', { cache: 'no-store' });

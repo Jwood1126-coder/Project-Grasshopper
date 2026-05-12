@@ -151,6 +151,38 @@ static void send_init(void) {
 
     size_t n = Init_to_json(s_json_buf, sizeof(s_json_buf), &init);
     if (n > 0 && n < sizeof(s_json_buf)) {
+        // Inject timelapse status — proto schema doesn't have it yet.
+        timelapse_status_t tl = {0};
+        timelapse_get_status(&tl);
+        if (n > 1 && s_json_buf[n - 1] == '}') {
+            int extra;
+            if (tl.active) {
+                extra = snprintf(s_json_buf + n - 1,
+                    sizeof(s_json_buf) - (n - 1),
+                    ",\"timelapse\":{"
+                      "\"active\":true,"
+                      "\"sessionId\":\"%s\","
+                      "\"intervalSec\":%lu,"
+                      "\"captureCount\":%lu,"
+                      "\"startedMs\":%llu,"
+                      "\"captureVis\":%s,"
+                      "\"captureTherm\":%s"
+                    "}}",
+                    tl.session_id,
+                    (unsigned long)tl.interval_sec,
+                    (unsigned long)tl.capture_count,
+                    (unsigned long long)tl.started_ms,
+                    tl.capture_vis ? "true" : "false",
+                    tl.capture_therm ? "true" : "false");
+            } else {
+                extra = snprintf(s_json_buf + n - 1,
+                    sizeof(s_json_buf) - (n - 1),
+                    ",\"timelapse\":{\"active\":false}}");
+            }
+            if (extra > 0 && (size_t)(n - 1 + extra) < sizeof(s_json_buf)) {
+                n = (size_t)(n - 1 + extra);
+            }
+        }
         net_relay_send(s_json_buf, n);
         ESP_LOGI(TAG, "init sent (%u B)", (unsigned)n);
     } else {
@@ -225,6 +257,41 @@ static void tick_task(void *arg) {
 
         size_t n = Tick_to_json(s_json_buf, sizeof(s_json_buf), &tick);
         if (n > 0 && n < sizeof(s_json_buf)) {
+            // Inject timelapse status into the JSON before sending. The
+            // proto schema doesn't have a Timelapse_t yet (would require
+            // codegen changes), so we splice it in by hand: trim the
+            // trailing } and append ,"timelapse":{...}}.
+            timelapse_status_t tl = {0};
+            timelapse_get_status(&tl);
+            if (n > 1 && s_json_buf[n - 1] == '}') {
+                int extra;
+                if (tl.active) {
+                    extra = snprintf(s_json_buf + n - 1,
+                        sizeof(s_json_buf) - (n - 1),
+                        ",\"timelapse\":{"
+                          "\"active\":true,"
+                          "\"sessionId\":\"%s\","
+                          "\"intervalSec\":%lu,"
+                          "\"captureCount\":%lu,"
+                          "\"startedMs\":%llu,"
+                          "\"captureVis\":%s,"
+                          "\"captureTherm\":%s"
+                        "}}",
+                        tl.session_id,
+                        (unsigned long)tl.interval_sec,
+                        (unsigned long)tl.capture_count,
+                        (unsigned long long)tl.started_ms,
+                        tl.capture_vis ? "true" : "false",
+                        tl.capture_therm ? "true" : "false");
+                } else {
+                    extra = snprintf(s_json_buf + n - 1,
+                        sizeof(s_json_buf) - (n - 1),
+                        ",\"timelapse\":{\"active\":false}}");
+                }
+                if (extra > 0 && (size_t)(n - 1 + extra) < sizeof(s_json_buf)) {
+                    n = (size_t)(n - 1 + extra);
+                }
+            }
             net_relay_send(s_json_buf, n);
         } else {
             ESP_LOGE(TAG, "tick buffer too small (n=%u)", (unsigned)n);
@@ -328,11 +395,10 @@ static uint8_t *s_therm_preview_buf = NULL;
 void thermal_preview_task(void *arg) {
     (void)arg;
     while (1) {
-        // Slower than visible — VoSPI is at most ~9 fps and the
-        // preview is for a relay debug view, not a stream. 1.5 s
-        // gives the splice detector time to commit a clean frame
-        // between renders.
-        vTaskDelay(pdMS_TO_TICKS(1500));
+        // VoSPI is at most ~9 fps. 750 ms gives the splice detector
+        // time to commit a clean frame between renders, while keeping
+        // the UI feeling live (1.5 s was perceptibly stale).
+        vTaskDelay(pdMS_TO_TICKS(750));
         if (!net_relay_is_connected()) continue;
 
         if (!s_therm_preview_buf) {
