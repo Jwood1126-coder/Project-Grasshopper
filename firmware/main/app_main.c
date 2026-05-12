@@ -589,16 +589,16 @@ void app_main(void) {
         ESP_LOGW(TAG, "oled start failed — running headless");
     }
 
-    // Tick task — TLS write through mbedtls needs ≥6 KB of locals on
-    // top of our 1.5 KB JSON buf, hence 8 KB.
-    xTaskCreate(tick_task, "tick", 8192, NULL, 5, NULL);
+    // Tick + preview tasks all pinned to core 0. Core 1 is reserved
+    // for the VoSPI reader; any host-side stall there starves the
+    // Lepton's continuous packet stream and produces lineMismatch
+    // aborts. WiFi + esp_timer are already on core 0 by sdkconfig.
+    xTaskCreatePinnedToCore(tick_task, "tick", 8192, NULL, 5, NULL, 0);
 
-    // Preview tasks — visible JPEG (every 1 s) + thermal palette+JPEG
-    // (every 1.5 s). 8 KB stack: TLS write needs ≥6 KB, plus locals.
     extern void preview_task(void *);
     extern void thermal_preview_task(void *);
-    xTaskCreate(preview_task,         "preview",  8192, NULL, 4, NULL);
-    xTaskCreate(thermal_preview_task, "thermprv", 8192, NULL, 4, NULL);
+    xTaskCreatePinnedToCore(preview_task,         "preview",  8192, NULL, 4, NULL, 0);
+    xTaskCreatePinnedToCore(thermal_preview_task, "thermprv", 8192, NULL, 4, NULL, 0);
 
     ESP_LOGI(TAG, "boot complete; free heap=%u psram=%u",
              (unsigned)esp_get_free_heap_size(),
