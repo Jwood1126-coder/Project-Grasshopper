@@ -40,6 +40,14 @@ CONFIG_FREERTOS_HZ=1000
 # (Manual override — STATIC=4 — broke the IDF v5.3 build because the
 # default RX_BA_WIN of 6 must be ≤ 2 × static buffers.)
 
+# LWIP TCP/IP task affinity → core 0. By default it has no affinity and
+# runs at priority 18 — far above the VoSPI reader's priority 10. With
+# no affinity, every TCP packet (relay tick, preview frame, HTTP
+# response) can land on core 1 and preempt the reader for ms at a
+# time, producing line mismatches and frame aborts. Pin to core 0
+# alongside WiFi + esp_timer so core 1 is truly reserved for vospi.
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y
+
 # TLS: use the bundled cert chain so wss:// works without provisioning
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
