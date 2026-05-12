@@ -1,14 +1,19 @@
 #include "net_relay.h"
 
 #include <string.h>
+#include <stdlib.h>
 
+#include "cJSON.h"
 #include "esp_crt_bundle.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_websocket_client.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "hal_lepton.h"
 #include "proto_gen.h"
 #include "sdkconfig.h"
 
@@ -19,6 +24,15 @@
 static const char *TAG = "net_relay";
 static esp_websocket_client_handle_t s_client = NULL;
 static volatile bool s_connected = false;
+
+// ---- Inbound message buffer ----
+//
+// Bun fragments large WS messages on the relay side, so we have to be
+// able to reassemble incoming text frames. Practical inbound JSON is
+// small (cmd payloads), so 4 KB is plenty.
+#define INBOUND_BUF_SIZE 4096
+static char s_inbound_buf[INBOUND_BUF_SIZE];
+static size_t s_inbound_len = 0;
 
 static void send_hello(void) {
     Hello_t h = {
@@ -38,6 +52,113 @@ static void send_hello(void) {
     }
 }
 
+// ---- Command result emit ----
+//
+// Every command returns a `cmd.result` event back to the relay. UI
+// matches the `id` field to its outstanding command so retries over a
+// flaky link don't produce stale state. Use small static buffers — these
+// are emitted from the WS receive task which has a fixed stack.
+static void send_cmd_result(const char *cmd_type, const char *cmd_id,
+                             bool ok, const char *msg) {
+    char buf[384];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"type\":\"event\","
+         "\"kind\":\"cmd.result\","
+         "\"id\":\"%s\","
+         "\"cmd\":\"%s\","
+         "\"ok\":%s,"
+         "\"msg\":\"%s\","
+         "\"ts\":%llu}",
+        cmd_id ? cmd_id : "",
+        cmd_type ? cmd_type : "",
+        ok ? "true" : "false",
+        msg ? msg : "",
+        (unsigned long long)(esp_timer_get_time() / 1000));
+    if (n > 0 && n < (int)sizeof(buf) && s_connected) {
+        esp_websocket_client_send_text(s_client, buf, n, pdMS_TO_TICKS(1000));
+        ESP_LOGI(TAG, "cmd.result %s id=%s %s msg=\"%s\"",
+                 cmd_type, cmd_id, ok ? "OK" : "FAIL", msg);
+    }
+}
+
+// ---- Command dispatch ----
+//
+// Recognized commands (Phase 2):
+//   thermal.ffc    — call hal_lepton_run_ffc()
+//   device.reboot  — esp_restart() after sending result
+//   capture.now    — STUB (Phase 3 needs SD session backend)
+//   timelapse.start, timelapse.stop — STUB (Phase 3)
+//   ping           — health-check, always OK
+//
+// Each command MUST emit exactly one result event referencing the cmd id.
+static void dispatch_cmd(const cJSON *root) {
+    const cJSON *cmd_field = cJSON_GetObjectItemCaseSensitive(root, "cmd");
+    const cJSON *id_field  = cJSON_GetObjectItemCaseSensitive(root, "id");
+    const char *cmd = cJSON_IsString(cmd_field) ? cmd_field->valuestring : "";
+    const char *id  = cJSON_IsString(id_field)  ? id_field->valuestring  : "";
+
+    if (!cmd || !*cmd) {
+        send_cmd_result("(unknown)", id, false, "missing cmd field");
+        return;
+    }
+
+    ESP_LOGI(TAG, "cmd received: %s id=%s", cmd, id);
+
+    if (strcmp(cmd, "ping") == 0) {
+        send_cmd_result(cmd, id, true, "pong");
+        return;
+    }
+
+    if (strcmp(cmd, "thermal.ffc") == 0) {
+        esp_err_t err = hal_lepton_run_ffc();
+        if (err == ESP_OK) {
+            send_cmd_result(cmd, id, true, "FFC executed");
+        } else {
+            send_cmd_result(cmd, id, false, esp_err_to_name(err));
+        }
+        return;
+    }
+
+    if (strcmp(cmd, "device.reboot") == 0) {
+        // Send result FIRST, then reboot. Brief delay so the WS frame
+        // makes it onto the wire before esp_restart kills the radio.
+        send_cmd_result(cmd, id, true, "rebooting in 500 ms");
+        vTaskDelay(pdMS_TO_TICKS(500));
+        esp_restart();
+        return;  // unreachable
+    }
+
+    if (strcmp(cmd, "capture.now") == 0 ||
+        strcmp(cmd, "timelapse.start") == 0 ||
+        strcmp(cmd, "timelapse.stop") == 0) {
+        send_cmd_result(cmd, id, false,
+                        "not yet implemented (Phase 3: timelapse backend)");
+        return;
+    }
+
+    send_cmd_result(cmd, id, false, "unknown command");
+}
+
+static void handle_text_frame(const char *data, size_t len) {
+    if (len == 0 || len >= INBOUND_BUF_SIZE - 1) {
+        ESP_LOGW(TAG, "rx text len=%u out of range", (unsigned)len);
+        return;
+    }
+    cJSON *root = cJSON_ParseWithLength(data, len);
+    if (!root) {
+        ESP_LOGW(TAG, "rx text: invalid JSON (%u B)", (unsigned)len);
+        return;
+    }
+    const cJSON *type_field = cJSON_GetObjectItemCaseSensitive(root, "type");
+    const char *type = cJSON_IsString(type_field) ? type_field->valuestring : "";
+    if (strcmp(type, "cmd") == 0) {
+        dispatch_cmd(root);
+    } else {
+        ESP_LOGI(TAG, "rx text type=\"%s\" (no handler)", type);
+    }
+    cJSON_Delete(root);
+}
+
 static void on_event(void *arg, esp_event_base_t base, int32_t event_id,
                       void *event_data) {
     esp_websocket_event_data_t *ev = (esp_websocket_event_data_t *)event_data;
@@ -45,15 +166,34 @@ static void on_event(void *arg, esp_event_base_t base, int32_t event_id,
         case WEBSOCKET_EVENT_CONNECTED:
             ESP_LOGI(TAG, "connected");
             s_connected = true;
+            s_inbound_len = 0;
             send_hello();
             break;
         case WEBSOCKET_EVENT_DISCONNECTED:
             ESP_LOGW(TAG, "disconnected");
             s_connected = false;
+            s_inbound_len = 0;
             break;
         case WEBSOCKET_EVENT_DATA:
-            if (ev->op_code == 0x01 || ev->op_code == 0x02) {
-                ESP_LOGI(TAG, "rx %d bytes", ev->data_len);
+            // op_code 0x01 = text, 0x02 = binary, 0x00 = continuation,
+            // 0x09 = ping, 0x0A = pong. We only care about text for cmd.
+            if (ev->op_code == 0x01 || ev->op_code == 0x00) {
+                if (ev->data_len > 0 && ev->data_ptr) {
+                    if (s_inbound_len + ev->data_len < INBOUND_BUF_SIZE) {
+                        memcpy(s_inbound_buf + s_inbound_len, ev->data_ptr, ev->data_len);
+                        s_inbound_len += ev->data_len;
+                    } else {
+                        ESP_LOGW(TAG, "inbound buffer overflow, dropping");
+                        s_inbound_len = 0;
+                    }
+                }
+                // ev->payload_offset + ev->data_len == payload_len → final fragment
+                if (ev->payload_offset + ev->data_len >= ev->payload_len) {
+                    if (s_inbound_len > 0) {
+                        handle_text_frame(s_inbound_buf, s_inbound_len);
+                    }
+                    s_inbound_len = 0;
+                }
             }
             break;
         case WEBSOCKET_EVENT_ERROR:

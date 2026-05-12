@@ -38,6 +38,12 @@ export interface EventEntry {
   ts: number
   kind: string
   msg: string
+  // Optional fields populated for cmd.result events. UI matches outgoing
+  // commands to results by `id`, so retries over a flaky link don't
+  // produce stale UI state. See firmware net_relay::send_cmd_result.
+  id?: string
+  cmd?: string
+  ok?: boolean
 }
 
 const LOGS_PER_DEVICE = 1000

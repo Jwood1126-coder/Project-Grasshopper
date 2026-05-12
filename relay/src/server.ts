@@ -59,7 +59,13 @@ app.get('/api/devices/:id/logs', (c) => {
 app.get('/api/devices/:id/events', (c) => {
   const d = store.get(c.req.param('id'))
   if (!d) return c.json({ error: 'unknown device' }, 404)
-  return c.json({ events: d.events })
+  // Optional `?since=<ms>` filter for UI polling — returns only events
+  // newer than the given relay-receive timestamp. UI uses this to find
+  // the cmd.result matching its outstanding command id.
+  const sinceParam = c.req.query('since')
+  const since = sinceParam ? Number(sinceParam) : 0
+  const events = since > 0 ? d.events.filter((e) => e.ts > since) : d.events
+  return c.json({ events })
 })
 
 app.get('/api/devices/:id/last-frame.jpg', (c) => {
@@ -253,6 +259,10 @@ const server = Bun.serve<WsCtx>({
             ts: Date.now(),
             kind: msg.kind ?? '?',
             msg: msg.msg ?? '',
+            // cmd.result fields (optional — only present for command results)
+            id: typeof msg.id === 'string' ? msg.id : undefined,
+            cmd: typeof msg.cmd === 'string' ? msg.cmd : undefined,
+            ok: typeof msg.ok === 'boolean' ? msg.ok : undefined,
           })
           break
         case 'log':
