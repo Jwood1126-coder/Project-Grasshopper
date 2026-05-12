@@ -596,9 +596,13 @@ export const USER_UI_HTML = `<!doctype html>
 
   // ───── Live view update ─────
   function updateLiveView(d, state) {
-    const therm = state?.init?.thermal;
-    const vis = state?.init?.visible;
-    const tl = state?.init?.timelapse;
+    // Prefer tick (live) over init (boot snapshot). init.thermal.frames freezes
+    // at startup; tick.thermal.frames keeps moving. Same for timelapse.active —
+    // it never updates without this.
+    const live = state?.tick ?? state?.init ?? {};
+    const therm = live.thermal;
+    const vis = live.visible;
+    const tl = live.timelapse;
 
     if (therm && therm.frames > 0 && !fields.thermalImg.parentElement) {
       fields.thermalPanel.appendChild(fields.thermalImg);
@@ -661,14 +665,14 @@ export const USER_UI_HTML = `<!doctype html>
       stat('Timelapse', tl?.active ? 'active' : 'idle', tl?.active ? 'ok' : ''),
       stat('Device', d.deviceId, ''),
       stat('Firmware', d.fwVersion || '—', ''),
-      stat('Wi-Fi', state?.init?.wifi?.ssid || '—', ''),
+      stat('Wi-Fi', live.wifi?.ssid || '—', ''),
       stat('RSSI',
-           state?.init?.wifi?.rssi != null ? state.init.wifi.rssi + ' dBm' : '—',
-           state?.init?.wifi?.rssi > -65 ? 'ok' : (state?.init?.wifi?.rssi > -80 ? 'warn' : '')),
+           live.wifi?.rssi != null ? live.wifi.rssi + ' dBm' : '—',
+           live.wifi?.rssi > -65 ? 'ok' : (live.wifi?.rssi > -80 ? 'warn' : '')),
       stat('Free heap',
-           state?.init?.freeHeap != null ? Math.round(state.init.freeHeap / 1024) + ' KB' : '—', ''),
+           live.freeHeap != null ? Math.round(live.freeHeap / 1024) + ' KB' : '—', ''),
       stat('Free PSRAM',
-           state?.init?.freePsram != null ? Math.round(state.init.freePsram / 1048576) + ' MB' : '—', ''),
+           live.freePsram != null ? Math.round(live.freePsram / 1048576) + ' MB' : '—', ''),
       stat('Last seen',
            d.lastSeenMs ? fmtAge(Date.now() - d.lastSeenMs) + ' ago' : '—', ''),
     );
