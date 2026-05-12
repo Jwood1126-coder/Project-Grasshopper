@@ -124,6 +124,19 @@ static double json_num(const cJSON *obj, const char *key, double dflt) {
     return cJSON_IsNumber(v) ? v->valuedouble : dflt;
 }
 
+// Validate that session_id and filename are safe path components: no
+// slashes, no parent refs, basic charset only. Prevents UI from
+// reaching outside /sdcard/timelapse/.
+static bool safe_name(const char *s) {
+    if (!s || !*s) return false;
+    for (const char *p = s; *p; p++) {
+        char c = *p;
+        if (c == '/' || c == '\\' || c == ':') return false;
+        if (c == '.' && p[1] == '.') return false;
+    }
+    return strlen(s) < 64;
+}
+
 // ───────────── handlers ─────────────
 
 static void do_list(const sess_req_t *req) {
@@ -211,6 +224,11 @@ static void do_get(const sess_req_t *req) {
                                    false, "missing sessionId", NULL);
         return;
     }
+    if (!safe_name(req->session_id)) {
+        net_relay_emit_cmd_result(req_cmd_name(req->type), req->cmd_id,
+                                   false, "bad sessionId", NULL);
+        return;
+    }
     if (!hal_storage_sd_present()) {
         net_relay_emit_cmd_result(req_cmd_name(req->type), req->cmd_id,
                                    false, "SD not mounted", NULL);
@@ -264,19 +282,6 @@ static void do_get(const sess_req_t *req) {
     net_relay_emit_cmd_result(req_cmd_name(req->type), req->cmd_id,
                                true, msg, json);
     free(json);
-}
-
-// Validate that session_id and filename are safe path components: no
-// slashes, no parent refs, basic charset only. Prevents UI from
-// reaching outside /sdcard/timelapse/.
-static bool safe_name(const char *s) {
-    if (!s || !*s) return false;
-    for (const char *p = s; *p; p++) {
-        char c = *p;
-        if (c == '/' || c == '\\' || c == ':') return false;
-        if (c == '.' && p[1] == '.') return false;
-    }
-    return strlen(s) < 64;
 }
 
 static void do_read_file(const sess_req_t *req) {

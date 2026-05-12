@@ -126,6 +126,12 @@ app.post('/api/devices/:id/cmd', async (c) => {
 // All sessions endpoints require Bearer auth — they trigger SD work on the
 // device, so we don't want anonymous internet traffic spamming them.
 
+// Strict input validation for sessions.* — accept only the names the
+// firmware itself produces. Prevents path traversal at the relay layer
+// even before the firmware's own check runs.
+const SESSION_ID_RE       = /^session_[0-9]+$/
+const SESSION_FILENAME_RE = /^(session\.json|captures\.jsonl|[0-9]{6}_(vis|therm)\.jpg)$/
+
 interface PendingCmd {
   resolve: (data: unknown, msg: string) => void
   reject: (msg: string) => void
@@ -179,9 +185,11 @@ app.get('/api/devices/:id/sessions', async (c) => {
 
 app.get('/api/devices/:id/sessions/:sid', async (c) => {
   const auth = requireBearer(c); if (auth !== true) return auth
+  const sid = c.req.param('sid')
+  if (!SESSION_ID_RE.test(sid)) return c.json({ error: 'bad sessionId' }, 400)
   try {
     const data = await executeCmd(c.req.param('id'), 'sessions.get', {
-      sessionId: c.req.param('sid'),
+      sessionId: sid,
     })
     return c.json(data ?? {})
   } catch (msg) {
@@ -217,12 +225,18 @@ function cachePut(key: string, bytes: Uint8Array) {
   }
 }
 
-// Public (no Bearer): thumbnails need to load via plain <img src=>. Cache
-// makes repeat hits cheap; the per-file SD work is bounded.
+// Auth required — exposing captured images publicly would leak content
+// once an attacker enumerates device IDs (which /api/devices reveals)
+// and the small-integer session IDs. UI loads thumbnails via
+// fetch(..., {Authorization}) + URL.createObjectURL.
 app.get('/api/devices/:id/sessions/:sid/file/:filename', async (c) => {
+  const auth = requireBearer(c); if (auth !== true) return auth
   const deviceId = c.req.param('id')
   const sid = c.req.param('sid')
   const filename = c.req.param('filename')
+  if (!SESSION_ID_RE.test(sid)) return c.json({ error: 'bad sessionId' }, 400)
+  if (!SESSION_FILENAME_RE.test(filename))
+    return c.json({ error: 'bad filename' }, 400)
   const cacheKey = `${deviceId}:${sid}:${filename}`
   const cached = cacheGet(cacheKey)
   if (cached) {

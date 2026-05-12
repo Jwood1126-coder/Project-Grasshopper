@@ -1114,8 +1114,40 @@ export const USER_UI_HTML = `<!doctype html>
   let currentSessionId = null;     // when in detail view
   let detailCaptureList = [];      // for lightbox prev/next nav
   let lightboxIdx = -1;
+  // Track blob URLs created for authenticated thumbnail/lightbox loads
+  // so we can revoke them when the user leaves the view.
+  let activeBlobUrls = [];
+
+  function revokeBlobUrls() {
+    for (const u of activeBlobUrls) {
+      try { URL.revokeObjectURL(u); } catch {}
+    }
+    activeBlobUrls = [];
+  }
+
+  // Load an image with Authorization header and assign the resulting
+  // blob URL to <img>. Returns the blob URL (also tracked for cleanup).
+  // Falls back to onerror handler if the fetch fails.
+  async function loadAuthImg(img, url, onErr) {
+    try {
+      const r = await fetch(url, {
+        headers: { 'Authorization': 'Bearer ' + authToken },
+        cache: 'no-store',
+      });
+      if (!r.ok) { if (onErr) onErr(r.status); return null; }
+      const blob = await r.blob();
+      const u = URL.createObjectURL(blob);
+      activeBlobUrls.push(u);
+      img.src = u;
+      return u;
+    } catch (e) {
+      if (onErr) onErr(0);
+      return null;
+    }
+  }
 
   function setView(view, sid) {
+    revokeBlobUrls();
     currentView = view;
     currentSessionId = sid || null;
     document.querySelectorAll('.tab').forEach((t) => {
@@ -1202,11 +1234,14 @@ export const USER_UI_HTML = `<!doctype html>
     });
     const thumbWrap = el('div', { class: 'thumb-wrap' });
     if (thumbUrl) {
-      const img = el('img', { class: 'thumb', loading: 'lazy', src: thumbUrl });
-      img.onerror = () => {
-        thumbWrap.replaceChildren(el('div', { class: 'thumb-empty' }, 'no preview'));
-      };
+      const img = el('img', { class: 'thumb' });
       thumbWrap.appendChild(img);
+      // Auth-fetch the thumbnail. Browser <img loading=lazy> can't help
+      // here (no Authorization header), so fire fetch immediately. Cards
+      // render fast either way since the relay caches.
+      loadAuthImg(img, thumbUrl, () => {
+        thumbWrap.replaceChildren(el('div', { class: 'thumb-empty' }, 'no preview'));
+      });
     } else {
       thumbWrap.appendChild(el('div', { class: 'thumb-empty' }, 'no preview'));
     }
@@ -1288,10 +1323,12 @@ export const USER_UI_HTML = `<!doctype html>
         const tile = el('div', { class: 'capture-tile',
           onclick: () => openLightbox(idx) });
         if (c.visOk) {
-          tile.appendChild(el('img', { loading: 'lazy',
-            src: '/api/devices/' + encodeURIComponent(currentDeviceId) +
-                 '/sessions/' + encodeURIComponent(sid) +
-                 '/file/' + c.visFile }));
+          const img = el('img', {});
+          tile.appendChild(img);
+          loadAuthImg(img,
+            '/api/devices/' + encodeURIComponent(currentDeviceId) +
+            '/sessions/' + encodeURIComponent(sid) +
+            '/file/' + c.visFile);
         } else {
           tile.appendChild(el('div', { class: 'thumb-empty',
             style: 'display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted);font-size:11px' },
@@ -1335,9 +1372,11 @@ export const USER_UI_HTML = `<!doctype html>
     const c = detailCaptureList[lightboxIdx];
     if (!c) return;
     const img = document.getElementById('lb-img');
-    img.src = '/api/devices/' + encodeURIComponent(currentDeviceId) +
-              '/sessions/' + encodeURIComponent(c.sessionId) +
-              '/file/' + c.visFile;
+    img.removeAttribute('src');
+    loadAuthImg(img,
+      '/api/devices/' + encodeURIComponent(currentDeviceId) +
+      '/sessions/' + encodeURIComponent(c.sessionId) +
+      '/file/' + c.visFile);
     const info = document.getElementById('lb-info');
     info.replaceChildren(
       el('span', { class: 'seq' }, '#' + c.seq + ' / ' + detailCaptureList.length),
