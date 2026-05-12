@@ -25,7 +25,11 @@ static const char *TAG = "sessions";
 #define SESS_LIST_MAX          50      // cap session list response size
 #define SESS_CAPTURES_MAX      200     // cap captures.jsonl entries inline
 #define SESS_FILE_CHUNK_MAX    16384   // 16 KB binary -> ~22 KB base64
-#define SESS_QUEUE_LEN         4
+// Browsers parallelize HTTP requests per origin (Chrome: 6); each
+// thumbnail load + chunked file fetch can fire several at once.
+// Queue must be deep enough that a single detail-view open doesn't
+// drop sessions.get behind the read_file flurry.
+#define SESS_QUEUE_LEN         32
 
 typedef enum {
     SESS_REQ_LIST,
