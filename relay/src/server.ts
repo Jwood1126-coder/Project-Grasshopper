@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
 import type { ServerWebSocket } from 'bun'
 import { store, type PreviewFrame } from './store'
+import { USER_UI_HTML } from './user_ui'
 
 const app = new Hono()
 
@@ -102,8 +103,15 @@ app.post('/api/devices/:id/cmd', async (c) => {
   return c.json({ ok: true })
 })
 
-// Dashboard — small, framework-free HTML that polls /api/devices.
+// User-facing UI (Phase 1: Live View). The polished surface end-users see.
 app.get('/', (c) => {
+  c.header('Content-Type', 'text/html; charset=utf-8')
+  return c.body(USER_UI_HTML)
+})
+
+// Debug telescope — moved from /. Still here for agent debugging.
+// Framework-free HTML that polls /api/devices for state/logs/events.
+app.get('/debug', (c) => {
   c.header('Content-Type', 'text/html; charset=utf-8')
   return c.body(DASHBOARD_HTML)
 })
