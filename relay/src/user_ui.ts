@@ -859,6 +859,13 @@ export const USER_UI_HTML = `<!doctype html>
       if (!r.ok) return;
       const w = Number(r.headers.get('X-Frame-Width'))  || 160;
       const h = Number(r.headers.get('X-Frame-Height')) || 120;
+      // Per-frame TLinear scale — overrides the tick-cached value so
+      // hover temps stay correct even if AUTO_RESOLUTION flipped scale
+      // since our last tick (codex #3).
+      const resHdr = r.headers.get('X-Tlinear-Resolution');
+      if (resHdr != null) {
+        tempScaleX100 = (Number(resHdr) === 1) ? 1 : 10;
+      }
       const buf = await r.arrayBuffer();
       if (buf.byteLength !== w * h * 2) return;
       thermRaw = new Uint16Array(buf);

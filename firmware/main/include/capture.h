@@ -24,6 +24,17 @@
 extern "C" {
 #endif
 
+// Per-frame thermal stats. Codex called out the race where stats /
+// raw / encode happen across separate mutex acquires; the atomic
+// variant below populates all three from the same frame under one lock.
+typedef struct {
+    uint32_t min_raw;
+    uint32_t max_raw;
+    uint32_t center_raw;
+    uint16_t resolution;   // active TLinear scale: 0 = 0.1K, 1 = 0.01K
+    bool     valid;
+} therm_frame_stats_t;
+
 // Encode the latest committed thermal frame into a JPEG using the iron
 // palette with per-frame auto-ranging. Output goes into `dst`, capacity
 // `cap`. Returns the JPEG byte length, 0 on failure (no frame yet, or
@@ -33,6 +44,18 @@ extern "C" {
 // capture_get_last_thermal_temps_ck() — so calling this from preview
 // is what keeps the tick's "temp" block fresh.
 size_t capture_encode_thermal_jpeg(uint8_t *dst, size_t cap);
+
+// Atomic variant: encode + raw snapshot + stats all from the SAME
+// frame, under one mutex acquire. Use this whenever you'll later
+// derive temps or write a .raw16 sidecar — guarantees the JPEG and
+// the raw bytes describe the same Lepton commit.
+//
+// `stats_out`  — non-NULL: filled with min/max/center + resolution.
+// `raw_out`    — non-NULL (≥ 38400 B): copy of the pre-rotation raw frame.
+// Returns the JPEG byte length, 0 on failure (no frame yet, etc).
+size_t capture_encode_thermal_jpeg_atomic(uint8_t *dst, size_t dst_cap,
+                                           therm_frame_stats_t *stats_out,
+                                           uint16_t *raw_out, size_t raw_out_bytes);
 
 // Per-frame thermal temperature stats from the most recent encode.
 // Returns RAW Lepton counts; caller multiplies by the active TLinear

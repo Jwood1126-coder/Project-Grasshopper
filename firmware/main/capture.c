@@ -250,12 +250,16 @@ static void rotate_rgb565(const uint16_t *src, uint16_t *dst, uint8_t rot) {
     }
 }
 
-size_t capture_encode_thermal_jpeg(uint8_t *dst, size_t cap) {
+size_t capture_encode_thermal_jpeg_atomic(uint8_t *dst, size_t cap,
+                                           therm_frame_stats_t *stats_out,
+                                           uint16_t *raw_out, size_t raw_out_bytes) {
     ensure_therm_buffers();
     if (!s_therm_raw || !s_therm_rgb || !s_therm_enc_mutex) return 0;
+    if (stats_out) memset(stats_out, 0, sizeof(*stats_out));
 
     // Mutex protects the shared raw/rgb staging buffers across callers
-    // (preview task + capture command).
+    // (preview task + capture command). Held across encode + raw copy
+    // + stats fill so the three outputs all describe the same frame.
     if (xSemaphoreTake(s_therm_enc_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
         return 0;
     }
@@ -277,9 +281,10 @@ size_t capture_encode_thermal_jpeg(uint8_t *dst, size_t cap) {
 
     // Stash stats for tick payload. Center pixel is taken before any
     // rotation since rotation only affects the encoded output.
+    uint32_t ce = s_therm_raw[(LEP_H / 2) * LEP_W + (LEP_W / 2)];
     s_last_min_raw    = mn;
     s_last_max_raw    = mx;
-    s_last_center_raw = s_therm_raw[(LEP_H / 2) * LEP_W + (LEP_W / 2)];
+    s_last_center_raw = ce;
     s_last_temps_valid = true;
 
     // raw → palette index → RGB565 BE
@@ -318,9 +323,29 @@ size_t capture_encode_thermal_jpeg(uint8_t *dst, size_t cap) {
     free(jpg_out);
     out_len = jpg_len;
 
+    // Snapshot the raw frame + stats for the caller while we still
+    // hold the encoder mutex. After release another encode could
+    // overwrite s_therm_raw in microseconds.
+    if (raw_out && raw_out_bytes >= LEP_PIXELS * sizeof(uint16_t)) {
+        memcpy(raw_out, s_therm_raw, LEP_PIXELS * sizeof(uint16_t));
+    }
+    if (stats_out) {
+        bool tl_active = false, tl_auto = false; uint16_t res = 0;
+        lepton_cci_get_tlinear_state(&tl_active, &tl_auto, &res);
+        stats_out->min_raw    = mn;
+        stats_out->max_raw    = mx;
+        stats_out->center_raw = ce;
+        stats_out->resolution = res;
+        stats_out->valid      = (tl_active && mx > 0);
+    }
+
 done:
     xSemaphoreGive(s_therm_enc_mutex);
     return out_len;
+}
+
+size_t capture_encode_thermal_jpeg(uint8_t *dst, size_t cap) {
+    return capture_encode_thermal_jpeg_atomic(dst, cap, NULL, NULL, 0);
 }
 
 // ---- Single-shot capture session ----
@@ -403,29 +428,27 @@ esp_err_t capture_now(char *session_id_out, size_t session_id_cap,
         snprintf(msg_out, msg_cap, "OOM allocating thermal JPEG buffer");
         return ESP_ERR_NO_MEM;
     }
-    size_t therm_len = capture_encode_thermal_jpeg(therm_jpg, THERM_JPEG_MAX_BYTES);
+    // Atomic encode + raw snapshot + stats — same frame, one mutex
+    // acquire, no race with the preview task's parallel encodes.
+    therm_frame_stats_t fs = {0};
+    uint16_t *raw_snap = heap_caps_malloc(LEP_PIXELS * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+    size_t therm_len = capture_encode_thermal_jpeg_atomic(
+        therm_jpg, THERM_JPEG_MAX_BYTES, &fs,
+        raw_snap, raw_snap ? LEP_PIXELS * sizeof(uint16_t) : 0);
     bool therm_ok = therm_len > 0;
-    if (!therm_ok) {
-        ESP_LOGW(TAG, "thermal encode skipped — no frame yet");
-    }
-
-    // Snapshot temp stats + raw frame for sidecar writes (same frame as
-    // the JPEG encode above, before any subsequent encoder call).
     therm_stats_t ts = {0};
-    uint16_t *raw_snap = NULL;
     bool tl_active = false, tl_auto = false; uint16_t tl_res = 0;
     if (therm_ok) {
-        capture_get_last_thermal_temps_ck(&ts.min_raw, &ts.max_raw, &ts.center_raw);
+        ts.min_raw = fs.min_raw; ts.max_raw = fs.max_raw;
+        ts.center_raw = fs.center_raw; ts.resolution = fs.resolution;
+        ts.valid = fs.valid;
+        // For the sidecar JSON we still want the live tlinear state
+        // booleans (active/auto_res). Resolution comes from `fs`.
         lepton_cci_get_tlinear_state(&tl_active, &tl_auto, &tl_res);
-        ts.resolution = tl_res;
-        ts.valid = (tl_active && ts.max_raw > 0);
-        if (ts.valid) {
-            raw_snap = heap_caps_malloc(LEP_PIXELS * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
-            if (raw_snap && !capture_snapshot_thermal_raw(raw_snap, LEP_PIXELS * sizeof(uint16_t))) {
-                free(raw_snap); raw_snap = NULL;
-            }
-        }
+    } else {
+        ESP_LOGW(TAG, "thermal encode skipped — no frame yet");
     }
+    if (!ts.valid && raw_snap) { free(raw_snap); raw_snap = NULL; }
 
     // Now hold the SD lock while we mkdir + write all files atomically.
     if (!hal_storage_sd_lock(5000)) {
@@ -611,10 +634,13 @@ static volatile bool     s_tl_capture_therm = true;
 static volatile uint32_t s_tl_max_duration_sec = 0;
 // Per-session radiometric aggregates (raw Lepton counts).
 // minSession = min over all captures' minRaw; maxSession = max over
-// all captures' maxRaw; sumCenter / count → mean center temp.
-static volatile uint32_t s_tl_min_session    = 0xFFFFFFFFu;
-static volatile uint32_t s_tl_max_session    = 0;
-static volatile uint64_t s_tl_sum_center_raw = 0;
+// all captures' maxRaw; sumCenter / validThermCount → mean center temp.
+// validThermCount is a separate denominator so failed thermal captures
+// don't bias the average toward 0 (codex #4).
+static volatile uint32_t s_tl_min_session         = 0xFFFFFFFFu;
+static volatile uint32_t s_tl_max_session         = 0;
+static volatile uint64_t s_tl_sum_center_raw      = 0;
+static volatile uint32_t s_tl_valid_therm_count   = 0;
 
 static void ensure_tl_mutex(void) {
     if (!s_tl_mutex) s_tl_mutex = xSemaphoreCreateMutex();
@@ -760,23 +786,28 @@ static void tl_write_session_json(bool complete) {
         complete ? "true" : "false",
         (unsigned long long)elapsed_sec);
 
-    // Aggregated radiometric stats across the session, when we have any.
-    if (s_tl_capture_count > 0 && s_tl_max_session > 0 &&
+    // Aggregated radiometric stats across the session, when we have
+    // at least one valid radiometric thermal capture. Avg uses the
+    // valid count, not the raw capture count, so a partial-failure
+    // session doesn't bias the mean toward 0 (codex #4).
+    if (s_tl_valid_therm_count > 0 && s_tl_max_session > 0 &&
         s_tl_min_session != 0xFFFFFFFFu) {
         bool tl_active = false, tl_auto = false; uint16_t res = 0;
         lepton_cci_get_tlinear_state(&tl_active, &tl_auto, &res);
         int sx = tlinear_scale_x100(res);
-        uint64_t avg_ctr = s_tl_sum_center_raw / s_tl_capture_count;
+        uint64_t avg_ctr = s_tl_sum_center_raw / s_tl_valid_therm_count;
         int n = snprintf(meta + meta_len, sizeof(meta) - meta_len,
             ",\"tempStats\":{"
               "\"minRaw\":%lu,\"maxRaw\":%lu,\"avgCenterRaw\":%llu,"
               "\"tlinearResolution\":%u,"
+              "\"validThermCount\":%lu,"
               "\"minTempF\":%.2f,\"maxTempF\":%.2f,\"avgCenterTempF\":%.2f"
             "}",
             (unsigned long)s_tl_min_session,
             (unsigned long)s_tl_max_session,
             (unsigned long long)avg_ctr,
             (unsigned)res,
+            (unsigned long)s_tl_valid_therm_count,
             raw_to_F_with_scale(s_tl_min_session,    sx),
             raw_to_F_with_scale(s_tl_max_session,    sx),
             raw_to_F_with_scale((uint32_t)avg_ctr,   sx));
@@ -823,34 +854,36 @@ static void tl_capture_iteration(uint32_t seq) {
     }
     if (vis_grabbed) hal_camera_release();
 
-    // Encode thermal. Stash the raw frame + temp stats for sidecar
-    // writes before the next encode call from elsewhere can clobber.
+    // Encode thermal + snapshot raw + stats atomically (same frame,
+    // one mutex acquire). Eliminates the race where a preview encode
+    // between encode + snapshot could swap s_therm_raw underneath us.
     uint8_t *therm_jpg = NULL;
     size_t therm_len = 0;
     therm_stats_t ts = {0};
     uint16_t *raw_snap = NULL;
     if (s_tl_capture_therm) {
         therm_jpg = heap_caps_malloc(THERM_JPEG_MAX_BYTES, MALLOC_CAP_SPIRAM);
+        raw_snap  = heap_caps_malloc(LEP_PIXELS * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
         if (therm_jpg) {
-            therm_len = capture_encode_thermal_jpeg(therm_jpg, THERM_JPEG_MAX_BYTES);
+            therm_frame_stats_t fs = {0};
+            therm_len = capture_encode_thermal_jpeg_atomic(
+                therm_jpg, THERM_JPEG_MAX_BYTES, &fs,
+                raw_snap, raw_snap ? LEP_PIXELS * sizeof(uint16_t) : 0);
             if (therm_len == 0) { free(therm_jpg); therm_jpg = NULL; }
+            ts.min_raw = fs.min_raw; ts.max_raw = fs.max_raw;
+            ts.center_raw = fs.center_raw; ts.resolution = fs.resolution;
+            ts.valid = fs.valid;
         }
-        // Pull temps + raw immediately after encode (same frame).
-        capture_get_last_thermal_temps_ck(&ts.min_raw, &ts.max_raw, &ts.center_raw);
-        bool tl_active = false, tl_auto = false; uint16_t res = 0;
-        lepton_cci_get_tlinear_state(&tl_active, &tl_auto, &res);
-        ts.resolution = res;
-        ts.valid = (tl_active && ts.max_raw > 0);
-
-        if (ts.valid) {
-            raw_snap = heap_caps_malloc(LEP_PIXELS * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
-            if (raw_snap && !capture_snapshot_thermal_raw(raw_snap, LEP_PIXELS * sizeof(uint16_t))) {
-                free(raw_snap); raw_snap = NULL;
-            }
-            // Fold into session aggregates.
+        if (!ts.valid) {
+            if (raw_snap) { free(raw_snap); raw_snap = NULL; }
+        } else {
+            // Fold into session aggregates. validThermCount tracks the
+            // denominator separately so a partial-failure session
+            // doesn't bias avgCenterRaw down (codex #4).
             if (ts.min_raw < s_tl_min_session) s_tl_min_session = ts.min_raw;
             if (ts.max_raw > s_tl_max_session) s_tl_max_session = ts.max_raw;
-            s_tl_sum_center_raw += ts.center_raw;
+            s_tl_sum_center_raw  += ts.center_raw;
+            s_tl_valid_therm_count++;
         }
     }
 
@@ -1000,9 +1033,10 @@ esp_err_t timelapse_start(uint32_t interval_sec,
     s_tl_capture_therm = capture_therm;
     s_tl_capture_count = 0;
     // Reset radiometric aggregates for this session.
-    s_tl_min_session    = 0xFFFFFFFFu;
-    s_tl_max_session    = 0;
-    s_tl_sum_center_raw = 0;
+    s_tl_min_session       = 0xFFFFFFFFu;
+    s_tl_max_session       = 0;
+    s_tl_sum_center_raw    = 0;
+    s_tl_valid_therm_count = 0;
     tl_write_session_json(false);
     hal_storage_sd_unlock();
 

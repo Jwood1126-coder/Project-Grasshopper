@@ -114,20 +114,29 @@ app.get('/api/devices/:id/last-frame.jpg', (c) => {
 // UI fetches this alongside the JPEG so it can compute per-pixel
 // temperatures on hover. 404 if no v2 thermal frame has been
 // received yet (firmware older than the radiometric Phase 3 push).
+//
+// X-Tlinear-Resolution carries the device's current TLinear scale
+// (0 = 0.1 K/count, 1 = 0.01 K/count) so the UI can convert the raw
+// counts even if AUTO_RESOLUTION flipped scale since the tick that
+// the dashboard last cached. Sourced from the latest tick — best-
+// effort but matched to within a fraction of a second.
 app.get('/api/devices/:id/last-thermal.raw16', (c) => {
   const d = store.get(c.req.param('id'))
   if (!d) return c.text('unknown device', 404)
   const f = d.previewTherm
   if (!f || !f.raw16) return c.text('no raw frame yet', 404)
-  return new Response(f.raw16, {
-    headers: {
-      'Content-Type':   'application/octet-stream',
-      'Cache-Control':  'no-store',
-      'X-Frame-Width':  String(f.width),
-      'X-Frame-Height': String(f.height),
-      'X-Frame-Age-Ms': String(Date.now() - f.ts),
-    },
-  })
+  const rad = (d.tick as any)?.radiometric ?? null
+  const headers: Record<string, string> = {
+    'Content-Type':   'application/octet-stream',
+    'Cache-Control':  'no-store',
+    'X-Frame-Width':  String(f.width),
+    'X-Frame-Height': String(f.height),
+    'X-Frame-Age-Ms': String(Date.now() - f.ts),
+  }
+  if (rad && typeof rad.tlinearResolution === 'number') {
+    headers['X-Tlinear-Resolution'] = String(rad.tlinearResolution)
+  }
+  return new Response(f.raw16, { headers })
 })
 
 app.post('/api/devices/:id/cmd', async (c) => {
