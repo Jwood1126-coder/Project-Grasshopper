@@ -647,6 +647,19 @@ export const USER_UI_HTML = `<!doctype html>
   }
   .lightbox .lb-dl:hover { background: rgba(255,255,255,0.16); border-color: var(--border); }
 
+  /* Lightbox zoom buttons (sit below the close + download row) */
+  .lightbox .lb-zoom {
+    position: absolute; top: 60px; right: 16px;
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  .lightbox .lb-zb {
+    background: rgba(255,255,255,0.08); border: 1px solid transparent;
+    color: white; width: 38px; height: 38px; border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; font: 600 16px/1 system-ui;
+  }
+  .lightbox .lb-zb:hover { background: rgba(255,255,255,0.18); border-color: var(--border); }
+
   /* Lightbox */
   .lightbox {
     position: fixed; inset: 0; background: rgba(0,0,0,0.95);
@@ -763,6 +776,11 @@ export const USER_UI_HTML = `<!doctype html>
 <div class="lightbox" id="lightbox">
   <button class="lb-close" id="lb-close" aria-label="Close">×</button>
   <button class="lb-dl"    id="lb-dl"    aria-label="Download">⬇ Download</button>
+  <div class="lb-zoom" id="lb-zoom">
+    <button class="lb-zb" id="lb-zin"  aria-label="Zoom in">+</button>
+    <button class="lb-zb" id="lb-zout" aria-label="Zoom out">−</button>
+    <button class="lb-zb" id="lb-zrst" aria-label="Reset zoom">1×</button>
+  </div>
   <div class="lb-modality" id="lb-modality">
     <button class="mb vis active" id="lb-vis" data-mode="vis">Visible</button>
     <button class="mb therm"      id="lb-therm" data-mode="therm">Thermal</button>
@@ -956,13 +974,16 @@ export const USER_UI_HTML = `<!doctype html>
       if (state.ty < topBound)    state.ty = topBound;
     }
 
-    function zoomAt(deltaY, cx, cy) {
+    // Anchored zoom: keeps the (cx,cy) viewport point fixed under the
+    // cursor as scale changes. Used by the +/- buttons (anchored at
+    // panel center) and by ctrl-wheel (anchored at cursor).
+    function zoomAt(direction, cx, cy) {
       const rect = container.getBoundingClientRect();
       const px = cx - rect.left;
       const py = cy - rect.top;
       const ix = (px - state.tx) / state.scale;
       const iy = (py - state.ty) / state.scale;
-      const factor = deltaY < 0 ? 1.18 : 1 / 1.18;
+      const factor = direction > 0 ? 1.25 : 1 / 1.25;
       const next = Math.max(minScale, Math.min(maxScale, state.scale * factor));
       if (next === state.scale) return;
       state.scale = next;
@@ -970,17 +991,23 @@ export const USER_UI_HTML = `<!doctype html>
       state.ty = py - iy * state.scale;
       clamp(); apply();
     }
+    function zoomCenter(direction) {
+      const rect = container.getBoundingClientRect();
+      zoomAt(direction, rect.left + rect.width / 2, rect.top + rect.height / 2);
+    }
     function reset() {
       state.scale = 1; state.tx = 0; state.ty = 0;
       apply();
     }
 
+    // ctrl/meta + wheel still zooms (matches browser convention for
+    // page zoom and other image viewers). Plain wheel is left alone
+    // so the user can scroll the dashboard with the cursor over a
+    // panel.
     container.addEventListener('wheel', (e) => {
-      // Only zoom when ctrl/meta or always — for image panels, wheel
-      // alone is fine; on pages without scroll context this is the
-      // expected behavior. preventDefault stops page scroll.
+      if (!e.ctrlKey && !e.metaKey) return;
       e.preventDefault();
-      zoomAt(e.deltaY, e.clientX, e.clientY);
+      zoomAt(e.deltaY < 0 ? +1 : -1, e.clientX, e.clientY);
     }, { passive: false });
 
     let drag = null;
@@ -1001,6 +1028,8 @@ export const USER_UI_HTML = `<!doctype html>
     container.addEventListener('dblclick', reset);
 
     container.__zoomReset = reset;
+    container.__zoomIn    = () => zoomCenter(+1);
+    container.__zoomOut   = () => zoomCenter(-1);
     apply();
   }
 
@@ -1012,6 +1041,19 @@ export const USER_UI_HTML = `<!doctype html>
   function mkInfoButton(onClick) {
     return el('button', { class: 'pbtn', title: 'Hide chrome (clean image)',
                            'aria-label': 'Toggle chrome', onclick: onClick }, '⊟');
+  }
+  // Zoom controls: + / − / reset. wired to attachZoom's exposed
+  // helpers on the panel.
+  function mkZoomButtons(getContainer) {
+    return [
+      el('button', { class: 'pbtn', title: 'Zoom in', 'aria-label': 'Zoom in',
+        onclick: () => getContainer()?.__zoomIn?.() }, '+'),
+      el('button', { class: 'pbtn', title: 'Zoom out', 'aria-label': 'Zoom out',
+        onclick: () => getContainer()?.__zoomOut?.() }, '−'),
+      el('button', { class: 'pbtn', title: 'Reset zoom (or double-click image)',
+        'aria-label': 'Reset zoom',
+        onclick: () => getContainer()?.__zoomReset?.() }, '1×'),
+    ];
   }
 
   // Compact mode: hide the panel-bar above and the legend below so the
@@ -1324,13 +1366,15 @@ export const USER_UI_HTML = `<!doctype html>
       thermReadout, fields.thermalEmpty);
     setupThermPanelHover(fields.thermalPanel);
 
-    // Header bar above the image: title + meta + rotate/fullscreen/info btns.
+    // Header bar above the image: title + meta + zoom/rotate/info/fullscreen.
     fields.thermFs   = mkFsButton(() => toggleFullscreen('therm'));
     fields.thermInfo = mkInfoButton(() => toggleCompact('therm'));
+    const thermZoomBtns = mkZoomButtons(() => fields.thermalPanel);
     const thermBar = el('div', { class: 'panel-bar thermal' },
       el('span', { class: 'ptitle' }, 'Thermal'),
       el('div', { class: 'pmeta' }, fields.thermalMeta),
-      el('div', { class: 'pbtns' }, fields.thermRotBtn, fields.thermInfo, fields.thermFs));
+      el('div', { class: 'pbtns' },
+         ...thermZoomBtns, fields.thermRotBtn, fields.thermInfo, fields.thermFs));
 
     fields.legendMin = el('span', { class: 'lmin' }, '—');
     fields.legendMax = el('span', { class: 'lmax' }, '—');
@@ -1359,10 +1403,12 @@ export const USER_UI_HTML = `<!doctype html>
     fields.visFs   = mkFsButton(() => toggleFullscreen('vis'));
     fields.visInfo = mkInfoButton(() => toggleCompact('vis'));
     fields.visPanel = el('div', { class: 'panel visible' }, fields.visEmpty);
+    const visZoomBtns = mkZoomButtons(() => fields.visPanel);
     const visBar = el('div', { class: 'panel-bar' },
       el('span', { class: 'ptitle' }, 'Visible'),
       el('div', { class: 'pmeta' }, fields.visMeta),
-      el('div', { class: 'pbtns' }, fields.visRotBtn, fields.visInfo, fields.visFs));
+      el('div', { class: 'pbtns' },
+         ...visZoomBtns, fields.visRotBtn, fields.visInfo, fields.visFs));
     const visCornerToggle = el('button', { class: 'corner-toggle',
       title: 'Show chrome', 'aria-label': 'Show chrome',
       onclick: () => toggleCompact('vis') }, '⊞');
@@ -2476,11 +2522,13 @@ export const USER_UI_HTML = `<!doctype html>
     if (!c) return;
     openDownloadMenu(e.currentTarget, [c], c.sessionId);
   };
-  // Lightbox zoom: wheel + drag + dblclick reset on the lb-img inside
-  // the lightbox container. Reset on each navLightbox / setLbModality
-  // so a fresh image starts at 1x (handled inside renderLightbox).
-  attachZoom(document.getElementById('lightbox'),
-             document.getElementById('lb-img'), { maxScale: 12 });
+  // Lightbox zoom: explicit +/− buttons + ctrl-wheel + drag + dblclick.
+  // Reset on each image swap (handled inside renderLightbox).
+  const lightbox = document.getElementById('lightbox');
+  attachZoom(lightbox, document.getElementById('lb-img'), { maxScale: 12 });
+  document.getElementById('lb-zin').onclick  = () => lightbox.__zoomIn?.();
+  document.getElementById('lb-zout').onclick = () => lightbox.__zoomOut?.();
+  document.getElementById('lb-zrst').onclick = () => lightbox.__zoomReset?.();
   document.addEventListener('keydown', (e) => {
     const lb = document.getElementById('lightbox');
     if (!lb.classList.contains('show')) return;
