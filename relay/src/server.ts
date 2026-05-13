@@ -619,7 +619,15 @@ const server = Bun.serve<WsCtx>({
     close(ws, code, reason) {
       const id = ws.data.deviceId
       if (id) {
-        store.setSocket(id, null)
+        // Only null the stored socket if it's still THIS ws. A fast
+        // disconnect-then-reconnect can deliver the new hello (which
+        // calls setSocket(newWs)) BEFORE the old ws's close fires —
+        // unconditionally nulling here would wipe the fresh socket and
+        // make every cmd POST return "device offline" forever after.
+        const d = store.get(id)
+        if (d && d.socket === ws) {
+          store.setSocket(id, null)
+        }
         store.appendEvent(id, {
           ts: Date.now(),
           kind: 'disconnected',
@@ -627,6 +635,9 @@ const server = Bun.serve<WsCtx>({
         })
         console.log(`[ws] close ${id} code=${code}`)
         // Fail any in-flight HTTP cmd waits so they don't hang to timeout.
+        // Only fail the ones bound to THIS ws (none right now — pending
+        // cmds aren't tagged with their ws — but if they were, the same
+        // identity check would apply).
         for (const [pid, p] of pendingCmds) {
           clearTimeout(p.timer)
           p.reject('device disconnected mid-cmd')
