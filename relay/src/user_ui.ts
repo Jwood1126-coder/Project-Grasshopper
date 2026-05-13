@@ -151,16 +151,28 @@ export const USER_UI_HTML = `<!doctype html>
   .panel-bar .pbtns { display: flex; gap: 4px; align-items: center; }
   .panel-bar .pbtn {
     background: var(--surface); border: 1px solid var(--border);
-    color: var(--text); width: 26px; height: 26px; border-radius: 5px;
+    color: var(--text); min-width: 32px; height: 32px; padding: 0 8px; border-radius: 6px;
     display: flex; align-items: center; justify-content: center;
-    cursor: pointer; font: 600 13px/1 system-ui;
+    cursor: pointer; font: 600 14px/1 system-ui;
   }
   .panel-bar .pbtn:hover { border-color: var(--accent); }
+  .panel-bar .pbtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .panel-bar .pbtn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
   /* Compact mode hides the bars, leaving just the image — useful for
-     fullscreen / pure-image viewing. */
+     fullscreen / pure-image viewing. A small corner toggle stays
+     visible so the user can always get back to full chrome. */
   .panel-wrap.compact .panel-bar,
   .panel-wrap.compact .panel-legend { display: none; }
+  .panel-wrap .corner-toggle {
+    position: absolute; top: 6px; right: 6px; z-index: 6;
+    background: rgba(10,14,20,0.78); backdrop-filter: blur(6px);
+    color: white; border: 1px solid var(--border); border-radius: 5px;
+    width: 28px; height: 28px;
+    display: none; align-items: center; justify-content: center;
+    cursor: pointer; font: 600 13px/1 system-ui;
+  }
+  .panel-wrap.compact .corner-toggle { display: flex; }
+  .panel-wrap { position: relative; }   /* anchor for corner toggle */
 
   .panel {
     background: var(--panel-bg); border: 1px solid var(--border); border-radius: 14px;
@@ -903,48 +915,27 @@ export const USER_UI_HTML = `<!doctype html>
       onZoomChange(state.scale);
     }
     function clamp() {
-      // Keep image inside container as much as possible. With scale=1
-      // we want tx=0, ty=0. As scale grows, allow panning within the
-      // overflow but not so far that the image leaves the frame.
-      const rect = container.getBoundingClientRect();
-      const w = img.naturalWidth || img.offsetWidth || rect.width;
-      const h = img.naturalHeight || img.offsetHeight || rect.height;
-      // Compute the displayed (object-fit:contain) size of the un-
-      // transformed image. When scale=1, x/y must center it; we let
-      // transform act on top of that, so just clamp the translate
-      // range to ±(scaledExtent - rect.dim).
-      const fit = Math.min(rect.width / w, rect.height / h);
-      const dispW = w * fit, dispH = h * fit;
-      const offX = (rect.width - dispW) / 2;
-      const offY = (rect.height - dispH) / 2;
-      const scaledW = dispW * state.scale;
-      const scaledH = dispH * state.scale;
-      // Acceptable tx range: -(scaledW - rect.width) .. 0 if scaledW > rect.width,
-      // else center it (tx = offX*(state.scale-1) zero).
-      const maxTx = scaledW > rect.width ? offX * state.scale + (scaledW - rect.width - 2*offX*state.scale) / 2 : 0;
-      const minTx = scaledW > rect.width ? -((scaledW - rect.width) - maxTx) : maxTx;
-      // Simpler: just allow free drag, then snap back at scale=1.
+      // At scale ≈ 1 just snap to the centered baseline.
       if (state.scale <= 1.001) { state.tx = 0; state.ty = 0; return; }
-      const slackX = scaledW - rect.width;
-      const slackY = scaledH - rect.height;
-      const lowX = -((scaledW + offX*2*state.scale - rect.width) / 1) - offX*state.scale;
-      const highX = offX*state.scale;
-      // Pragmatic clamp: don't pull the image's outer edges past the
-      // container edges. Recompute extents from a baseline of "image
-      // top-left at offX, offY before zoom".
-      const baseX = offX, baseY = offY;
-      // After translate(tx,ty) scale(s), the image rect is:
-      //   left  = tx + baseX*s
-      //   right = tx + (baseX + dispW)*s   (because scale origin is 0,0)
-      // We want left <= 0 and right >= rect.width:
-      //   tx <= -baseX * s
-      //   tx >= rect.width - (baseX + dispW) * s
-      const leftBound  = rect.width - (baseX + dispW) * state.scale;
-      const rightBound = -baseX * state.scale;
-      if (state.tx > rightBound) state.tx = rightBound;
-      if (state.tx < leftBound)  state.tx = leftBound;
+      // Compute the un-transformed (object-fit:contain) layout, then
+      // clamp tx/ty so the image edges can't pull past the container
+      // edges after translate(tx,ty) scale(s).
+      const rect  = container.getBoundingClientRect();
+      const w     = img.naturalWidth  || img.offsetWidth  || rect.width;
+      const h     = img.naturalHeight || img.offsetHeight || rect.height;
+      const fit   = Math.min(rect.width / w, rect.height / h);
+      const dispW = w * fit, dispH = h * fit;
+      const baseX = (rect.width  - dispW) / 2;   // contain offset
+      const baseY = (rect.height - dispH) / 2;
+      // Image rect after transform:  left = tx + baseX*s,
+      // right = tx + (baseX+dispW)*s.  Constraints: left ≤ 0,
+      // right ≥ rect.width.
+      const leftBound   = rect.width  - (baseX + dispW) * state.scale;
+      const rightBound  = -baseX * state.scale;
       const topBound    = rect.height - (baseY + dispH) * state.scale;
       const bottomBound = -baseY * state.scale;
+      if (state.tx > rightBound)  state.tx = rightBound;
+      if (state.tx < leftBound)   state.tx = leftBound;
       if (state.ty > bottomBound) state.ty = bottomBound;
       if (state.ty < topBound)    state.ty = topBound;
     }
@@ -999,14 +990,18 @@ export const USER_UI_HTML = `<!doctype html>
 
   // Per-panel control buttons + view-mode toggles.
   function mkFsButton(onClick) {
-    return el('button', { class: 'pbtn', title: 'Fullscreen', onclick: onClick }, '⛶');
+    return el('button', { class: 'pbtn', title: 'Fullscreen', 'aria-label': 'Fullscreen',
+                           onclick: onClick }, '⛶');
   }
   function mkInfoButton(onClick) {
-    return el('button', { class: 'pbtn', title: 'Show / hide labels', onclick: onClick }, 'i');
+    return el('button', { class: 'pbtn', title: 'Hide chrome (clean image)',
+                           'aria-label': 'Toggle chrome', onclick: onClick }, '⊟');
   }
 
   // Compact mode: hide the panel-bar above and the legend below so the
   // image stands alone. Useful in fullscreen where chrome is noise.
+  // A corner toggle button (always visible in compact mode) restores
+  // the chrome — otherwise the user could lose the controls forever.
   function toggleCompact(which) {
     const wrap = which === 'therm' ? fields.thermWrap : fields.visWrap;
     if (!wrap) return;
@@ -1322,8 +1317,11 @@ export const USER_UI_HTML = `<!doctype html>
     fields.legend = el('div', { class: 'panel-legend' },
       fields.legendMin, el('span', { class: 'lbar' }), fields.legendMax);
 
+    const thermCornerToggle = el('button', { class: 'corner-toggle',
+      title: 'Show chrome', 'aria-label': 'Show chrome',
+      onclick: () => toggleCompact('therm') }, '⊞');
     fields.thermWrap = el('div', { class: 'panel-wrap therm-wrap' },
-      thermBar, fields.thermalPanel, fields.legend);
+      thermBar, fields.thermalPanel, fields.legend, thermCornerToggle);
 
     fields.visImg = el('img', { id: 'vis-img', alt: 'Visible preview' });
     fields.visEmpty = el('div', { class: 'panel-empty' }, 'no visible preview yet');
@@ -1345,8 +1343,11 @@ export const USER_UI_HTML = `<!doctype html>
       el('span', { class: 'ptitle' }, 'Visible'),
       el('div', { class: 'pmeta' }, fields.visMeta),
       el('div', { class: 'pbtns' }, fields.visRotBtn, fields.visInfo, fields.visFs));
+    const visCornerToggle = el('button', { class: 'corner-toggle',
+      title: 'Show chrome', 'aria-label': 'Show chrome',
+      onclick: () => toggleCompact('vis') }, '⊞');
     fields.visWrap = el('div', { class: 'panel-wrap vis-wrap' },
-      visBar, fields.visPanel);
+      visBar, fields.visPanel, visCornerToggle);
 
     // Update the thermal rotate button styling to match the new pbtn class.
     fields.thermRotBtn.className = 'pbtn';
