@@ -266,8 +266,8 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
 
 app.post('/api/devices/:id/firmware', async (c) => {
   const auth = requireBearer(c); if (auth !== true) return auth
-  const d = store.get(c.req.param('id'))
-  if (!d) return c.json({ error: 'unknown device' }, 404)
+  const id = c.req.param('id')
+  if (!store.get(id)) return c.json({ error: 'unknown device' }, 404)
   // Accept the body as raw bytes (browser will send the file blob
   // directly with Content-Type: application/octet-stream).
   const arr = new Uint8Array(await c.req.arrayBuffer())
@@ -279,7 +279,13 @@ app.post('/api/devices/:id/firmware', async (c) => {
     return c.json({ error: 'not an ESP32 app image (bad magic)' }, 400)
   }
   const sha256 = await sha256Hex(arr)
-  d.pendingFirmware = { bytes: arr, sha256, uploadedMs: Date.now() }
+  // Write through store.upsert() — the device record is replaced on
+  // every WS message (tick, preview, log), so a direct mutation of
+  // the reference we held BEFORE the await above silently lands on
+  // an orphaned object. Only the post-await upsert wins.
+  store.upsert(id, {
+    pendingFirmware: { bytes: arr, sha256, uploadedMs: Date.now() },
+  })
   return c.json({ ok: true, bytes: arr.byteLength, sha256 })
 })
 
