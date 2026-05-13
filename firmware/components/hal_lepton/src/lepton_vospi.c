@@ -247,7 +247,9 @@ static inline void vospi_abort_frame(uint16_t *frame,
 //
 // Examines inter-row absolute diffs at the three segment boundaries
 // (rows 30/60/90). Cross-broadcast splice → seam → boundary diff
-// >> baseline diff. ~960 abs-diffs per frame. Verbatim from Fox.
+// >> baseline diff. Was tuned for TLinear=0 (raw flux ~3000-7000);
+// now self-tunes the absolute floor against the frame's own row-
+// to-row variation so it works at either TLinear scale.
 static bool vospi_frame_has_splice(const uint16_t *frame) {
     static const int splice_rows[3] = {30, 60, 90};
     static const int baseline_y[3][2] = {
@@ -292,9 +294,19 @@ static bool vospi_frame_has_splice(const uint16_t *frame) {
         }
         int32_t baseline_avg = base_total / 2;
 
-        // boundary > 2.5 × baseline AND > 8000 absolute floor.
-        if (boundary_diff > 8000 &&
-            (int64_t)boundary_diff * 2 > (int64_t)baseline_avg * 5) {
+        // Splice if boundary diff is BOTH:
+        //   (a) substantially larger than the local baseline diff
+        //       (~3× catches a real seam without false-flagging busy
+        //        scenes), AND
+        //   (b) above an absolute floor — set to 4× the baseline so
+        //       it scales with the pixel range (TLinear=0 raw flux
+        //       and TLinear=1 centi-Kelvin both work without the
+        //       hardcoded 8000 false-flagging quiet uniform scenes
+        //       at TLinear=1).
+        int32_t floor = baseline_avg * 4;
+        if (floor < 8000) floor = 8000;
+        if (boundary_diff > floor &&
+            (int64_t)boundary_diff > (int64_t)baseline_avg * 3) {
             return true;
         }
     }
