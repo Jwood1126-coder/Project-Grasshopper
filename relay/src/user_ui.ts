@@ -115,19 +115,26 @@ export const USER_UI_HTML = `<!doctype html>
   .tl-banner .stop-btn:hover:not(:disabled) { background: #ff8a8c; }
   .tl-banner .stop-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
-  /* ─── View grid (mobile-first stack, desktop side-by-side) ─── */
+  /* ─── View grid: always two columns so both feeds fit on-screen
+     without scrolling on tablet, desktop, AND phone (Fox parity).
+     Panel height is capped to the viewport minus the chrome that sits
+     above + below the views, so the row never pushes content off
+     the visible area. ─── */
   .views {
-    display: grid; gap: 14px;
-    grid-template-columns: 1fr;
-    margin-bottom: 18px;
-  }
-  @media (min-width: 700px) {
-    .views { grid-template-columns: 1fr 1fr; gap: 16px; }
+    display: grid; gap: clamp(6px, 1.5vw, 16px);
+    grid-template-columns: 1fr 1fr;
+    margin-bottom: 14px;
   }
 
   .panel {
     background: var(--panel-bg); border: 1px solid var(--border); border-radius: 14px;
     overflow: hidden; position: relative; aspect-ratio: 4/3;
+    /* Cap so side-by-side panels never overflow the viewport. The 320 px
+       reservation covers header + chips + actions + diagnostics summary. */
+    max-height: calc(100vh - 320px);
+    min-height: 160px;
+    margin: 0 auto;       /* center if viewport is wider than the aspect-clamped width */
+    width: 100%;
     display: flex; flex-direction: column;
     transition: opacity 0.4s;
   }
@@ -163,6 +170,30 @@ export const USER_UI_HTML = `<!doctype html>
     color: var(--warn); padding: 6px 10px; border-radius: 5px;
     background: rgba(26, 22, 14, 0.85); backdrop-filter: blur(8px);
   }
+
+  /* Per-panel orientation controls (bottom-right overlay) */
+  .panel-ctrls {
+    position: absolute; bottom: 10px; right: 10px; z-index: 3;
+    display: flex; gap: 4px;
+  }
+  .panel-ctrls .pc {
+    background: rgba(10, 14, 20, 0.78); backdrop-filter: blur(8px);
+    border: 1px solid var(--border); color: var(--text);
+    width: 32px; height: 32px; border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; font: 600 13px/1 system-ui;
+  }
+  .panel-ctrls .pc:hover { border-color: var(--accent); }
+  .panel-ctrls .pc.active {
+    background: var(--accent); color: #fff; border-color: var(--accent);
+  }
+  .panel-ctrls .pc.rotate { font-size: 18px; line-height: 1; }
+  .panel.therm-rot-1 img { transform: rotate(90deg) scale(0.75); }
+  .panel.therm-rot-2 img { transform: rotate(180deg); }
+  .panel.therm-rot-3 img { transform: rotate(270deg) scale(0.75); }
+  .panel.vis-hmirror img { transform: scaleX(-1); }
+  .panel.vis-vflip   img { transform: scaleY(-1); }
+  .panel.vis-hmirror.vis-vflip img { transform: scale(-1, -1); }
 
   /* ─── Action buttons ─── */
   .actions {
@@ -574,6 +605,50 @@ export const USER_UI_HTML = `<!doctype html>
   }
   let authToken = loadToken();
 
+  // Current device-side orientation. Updated from tick.settings; mirrors
+  // are applied to the preview <img> via CSS so the user sees the change
+  // instantly (cmd round-trip is async). Defaults match firmware boot.
+  let currentSettings = { visHmirror: false, visVflip: false, thermRotation: 0 };
+
+  function applyPanelOrientationCss() {
+    const tp = fields.thermalPanel, vp = fields.visPanel;
+    if (tp) {
+      tp.classList.remove('therm-rot-1','therm-rot-2','therm-rot-3');
+      const r = currentSettings.thermRotation & 3;
+      if (r) tp.classList.add('therm-rot-' + r);
+    }
+    if (vp) {
+      vp.classList.toggle('vis-hmirror', !!currentSettings.visHmirror);
+      vp.classList.toggle('vis-vflip',   !!currentSettings.visVflip);
+    }
+    if (fields.thermRotBtn) {
+      fields.thermRotBtn.classList.toggle('active', currentSettings.thermRotation !== 0);
+      fields.thermRotBtn.title = 'Rotate thermal — currently ' +
+        (currentSettings.thermRotation * 90) + '°';
+    }
+    if (fields.visHBtn) fields.visHBtn.classList.toggle('active', !!currentSettings.visHmirror);
+    if (fields.visVBtn) fields.visVBtn.classList.toggle('active', !!currentSettings.visVflip);
+  }
+
+  function applySettingPreview(patch) {
+    Object.assign(currentSettings, patch);
+    applyPanelOrientationCss();
+  }
+
+  async function sendSettings(patch) {
+    if (!currentDeviceId) { toast('No device connected', 'err'); return; }
+    try {
+      await fetch('/api/devices/' + encodeURIComponent(currentDeviceId) + '/cmd', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + authToken,
+        },
+        body: JSON.stringify({ cmd: 'settings.update', id: 'set-' + Date.now(), ...patch }),
+      });
+    } catch (e) { toast('Settings save failed: ' + (e?.message || e), 'err'); }
+  }
+
   // ───── Formatters ─────
   const fmtPct = (u, t) => (t > 0) ? Math.round(100 * u / t) + '%' : '—';
   const fmtAge = (ms) => {
@@ -693,9 +768,20 @@ export const USER_UI_HTML = `<!doctype html>
       el('span', { id: 'therm-fps' }, '—'),
       el('span', {}, '·'),
       fields.thermalAge);
+    // Thermal rotate button: cycles 0→90→180→270→0 CW. Settings live
+    // on the device (NVS-backed) so live preview AND recordings rotate
+    // together. Label shows current degree value.
+    fields.thermRotBtn = el('button', { class: 'pc rotate', title: 'Rotate thermal (cycles 0/90/180/270)',
+      onclick: () => {
+        const next = (currentSettings.thermRotation + 1) & 3;
+        applySettingPreview({ thermRotation: next });
+        sendSettings({ thermRotation: next });
+      } }, '⟲');
+    const thermCtrls = el('div', { class: 'panel-ctrls' }, fields.thermRotBtn);
     fields.thermalPanel = el('div', { class: 'panel thermal' },
       el('div', { class: 'panel-label thermal' }, 'Thermal'),
       fields.thermalMeta,
+      thermCtrls,
       fields.thermalEmpty);
 
     fields.visImg = el('img', { id: 'vis-img', alt: 'Visible preview' });
@@ -705,9 +791,24 @@ export const USER_UI_HTML = `<!doctype html>
       el('span', { id: 'vis-res' }, '—'),
       el('span', {}, '·'),
       fields.visAge);
+    // Visible H/V flip toggles (OV2640 hardware flip — no CPU cost).
+    fields.visHBtn = el('button', { class: 'pc', title: 'Mirror horizontally',
+      onclick: () => {
+        const next = !currentSettings.visHmirror;
+        applySettingPreview({ visHmirror: next });
+        sendSettings({ visHmirror: next });
+      } }, '⇄');
+    fields.visVBtn = el('button', { class: 'pc', title: 'Flip vertically',
+      onclick: () => {
+        const next = !currentSettings.visVflip;
+        applySettingPreview({ visVflip: next });
+        sendSettings({ visVflip: next });
+      } }, '⇅');
+    const visCtrls = el('div', { class: 'panel-ctrls' }, fields.visHBtn, fields.visVBtn);
     fields.visPanel = el('div', { class: 'panel visible' },
       el('div', { class: 'panel-label' }, 'Visible'),
       fields.visMeta,
+      visCtrls,
       fields.visEmpty);
 
     const views = el('div', { class: 'views' }, fields.thermalPanel, fields.visPanel);
@@ -771,6 +872,19 @@ export const USER_UI_HTML = `<!doctype html>
     const therm = live.thermal;
     const vis = live.visible;
     const tl = live.timelapse;
+
+    // Sync orientation from device. Server is source of truth; user
+    // taps just optimistically update the local CSS while the cmd
+    // round-trips. Compares before assign so we don't churn DOM.
+    const s = live.settings;
+    if (s && (s.visHmirror !== currentSettings.visHmirror ||
+              s.visVflip   !== currentSettings.visVflip   ||
+              s.thermRotation !== currentSettings.thermRotation)) {
+      currentSettings.visHmirror   = !!s.visHmirror;
+      currentSettings.visVflip     = !!s.visVflip;
+      currentSettings.thermRotation = (s.thermRotation | 0) & 3;
+      applyPanelOrientationCss();
+    }
 
     if (therm && therm.frames > 0 && !fields.thermalImg.parentElement) {
       fields.thermalPanel.appendChild(fields.thermalImg);

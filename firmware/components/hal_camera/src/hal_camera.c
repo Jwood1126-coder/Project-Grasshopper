@@ -27,6 +27,8 @@ static camera_fb_t *s_held_fb = NULL;
 static hal_camera_stats_t s_stats = {0};
 static uint32_t s_last_frame_count = 0;
 static int64_t  s_last_fps_ms = 0;
+static bool     s_hmirror = false;
+static bool     s_vflip   = false;
 
 static framesize_t map_framesize(hal_cam_framesize_t fs) {
     switch (fs) {
@@ -171,6 +173,27 @@ void hal_camera_get_stats(hal_camera_stats_t *out) {
     if (!out) return;
     *out = s_stats;
 }
+
+esp_err_t hal_camera_set_hmirror(bool on) {
+    if (!s_ready) return ESP_ERR_INVALID_STATE;
+    sensor_t *s = esp_camera_sensor_get();
+    if (!s || !s->set_hmirror) return ESP_ERR_NOT_SUPPORTED;
+    if (s->set_hmirror(s, on ? 1 : 0) != 0) return ESP_FAIL;
+    s_hmirror = on;
+    return ESP_OK;
+}
+
+esp_err_t hal_camera_set_vflip(bool on) {
+    if (!s_ready) return ESP_ERR_INVALID_STATE;
+    sensor_t *s = esp_camera_sensor_get();
+    if (!s || !s->set_vflip) return ESP_ERR_NOT_SUPPORTED;
+    if (s->set_vflip(s, on ? 1 : 0) != 0) return ESP_FAIL;
+    s_vflip = on;
+    return ESP_OK;
+}
+
+bool hal_camera_get_hmirror(void) { return s_hmirror; }
+bool hal_camera_get_vflip(void)   { return s_vflip; }
 
 void hal_camera_tick_fps(void) {
     int64_t t = esp_timer_get_time() / 1000;

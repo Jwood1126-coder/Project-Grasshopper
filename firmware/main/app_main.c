@@ -19,6 +19,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "nvs.h"
 #include "nvs_flash.h"
 
 #include "hal_camera.h"
@@ -132,6 +133,61 @@ static void fill_thermal(Thermal_t *out) {
     out->state = hal_lepton_state_name(st.state);
 }
 
+// Splice extra fields (timelapse status + user settings) into a JSON
+// envelope produced by Init_to_json/Tick_to_json. Both fields live
+// outside the proto schema, so we hand-append them by trimming the
+// trailing `}` and writing `,"timelapse":{...},"settings":{...}}`.
+// Returns the new total length (or the original n if anything went wrong).
+static size_t splice_extras(char *buf, size_t n, size_t cap) {
+    if (n == 0 || n + 1 >= cap || buf[n - 1] != '}') return n;
+
+    timelapse_status_t tl = {0};
+    timelapse_get_status(&tl);
+
+    int extra;
+    if (tl.active) {
+        extra = snprintf(buf + n - 1, cap - (n - 1),
+            ",\"timelapse\":{"
+              "\"active\":true,"
+              "\"sessionId\":\"%s\","
+              "\"intervalSec\":%lu,"
+              "\"captureCount\":%lu,"
+              "\"startedMs\":%llu,"
+              "\"captureVis\":%s,"
+              "\"captureTherm\":%s"
+            "},"
+            "\"settings\":{"
+              "\"visHmirror\":%s,"
+              "\"visVflip\":%s,"
+              "\"thermRotation\":%u"
+            "}}",
+            tl.session_id,
+            (unsigned long)tl.interval_sec,
+            (unsigned long)tl.capture_count,
+            (unsigned long long)tl.started_ms,
+            tl.capture_vis ? "true" : "false",
+            tl.capture_therm ? "true" : "false",
+            hal_camera_get_hmirror() ? "true" : "false",
+            hal_camera_get_vflip()   ? "true" : "false",
+            (unsigned)capture_get_thermal_rotation());
+    } else {
+        extra = snprintf(buf + n - 1, cap - (n - 1),
+            ",\"timelapse\":{\"active\":false},"
+            "\"settings\":{"
+              "\"visHmirror\":%s,"
+              "\"visVflip\":%s,"
+              "\"thermRotation\":%u"
+            "}}",
+            hal_camera_get_hmirror() ? "true" : "false",
+            hal_camera_get_vflip()   ? "true" : "false",
+            (unsigned)capture_get_thermal_rotation());
+    }
+    if (extra > 0 && (size_t)(n - 1 + extra) < cap) {
+        return (size_t)(n - 1 + extra);
+    }
+    return n;
+}
+
 static void send_init(void) {
     Init_t init = {
         .type = "init",
@@ -152,38 +208,7 @@ static void send_init(void) {
 
     size_t n = Init_to_json(s_json_buf, sizeof(s_json_buf), &init);
     if (n > 0 && n < sizeof(s_json_buf)) {
-        // Inject timelapse status — proto schema doesn't have it yet.
-        timelapse_status_t tl = {0};
-        timelapse_get_status(&tl);
-        if (n > 1 && s_json_buf[n - 1] == '}') {
-            int extra;
-            if (tl.active) {
-                extra = snprintf(s_json_buf + n - 1,
-                    sizeof(s_json_buf) - (n - 1),
-                    ",\"timelapse\":{"
-                      "\"active\":true,"
-                      "\"sessionId\":\"%s\","
-                      "\"intervalSec\":%lu,"
-                      "\"captureCount\":%lu,"
-                      "\"startedMs\":%llu,"
-                      "\"captureVis\":%s,"
-                      "\"captureTherm\":%s"
-                    "}}",
-                    tl.session_id,
-                    (unsigned long)tl.interval_sec,
-                    (unsigned long)tl.capture_count,
-                    (unsigned long long)tl.started_ms,
-                    tl.capture_vis ? "true" : "false",
-                    tl.capture_therm ? "true" : "false");
-            } else {
-                extra = snprintf(s_json_buf + n - 1,
-                    sizeof(s_json_buf) - (n - 1),
-                    ",\"timelapse\":{\"active\":false}}");
-            }
-            if (extra > 0 && (size_t)(n - 1 + extra) < sizeof(s_json_buf)) {
-                n = (size_t)(n - 1 + extra);
-            }
-        }
+        n = splice_extras(s_json_buf, n, sizeof(s_json_buf));
         net_relay_send(s_json_buf, n);
         ESP_LOGI(TAG, "init sent (%u B)", (unsigned)n);
     } else {
@@ -258,41 +283,7 @@ static void tick_task(void *arg) {
 
         size_t n = Tick_to_json(s_json_buf, sizeof(s_json_buf), &tick);
         if (n > 0 && n < sizeof(s_json_buf)) {
-            // Inject timelapse status into the JSON before sending. The
-            // proto schema doesn't have a Timelapse_t yet (would require
-            // codegen changes), so we splice it in by hand: trim the
-            // trailing } and append ,"timelapse":{...}}.
-            timelapse_status_t tl = {0};
-            timelapse_get_status(&tl);
-            if (n > 1 && s_json_buf[n - 1] == '}') {
-                int extra;
-                if (tl.active) {
-                    extra = snprintf(s_json_buf + n - 1,
-                        sizeof(s_json_buf) - (n - 1),
-                        ",\"timelapse\":{"
-                          "\"active\":true,"
-                          "\"sessionId\":\"%s\","
-                          "\"intervalSec\":%lu,"
-                          "\"captureCount\":%lu,"
-                          "\"startedMs\":%llu,"
-                          "\"captureVis\":%s,"
-                          "\"captureTherm\":%s"
-                        "}}",
-                        tl.session_id,
-                        (unsigned long)tl.interval_sec,
-                        (unsigned long)tl.capture_count,
-                        (unsigned long long)tl.started_ms,
-                        tl.capture_vis ? "true" : "false",
-                        tl.capture_therm ? "true" : "false");
-                } else {
-                    extra = snprintf(s_json_buf + n - 1,
-                        sizeof(s_json_buf) - (n - 1),
-                        ",\"timelapse\":{\"active\":false}}");
-                }
-                if (extra > 0 && (size_t)(n - 1 + extra) < sizeof(s_json_buf)) {
-                    n = (size_t)(n - 1 + extra);
-                }
-            }
+            n = splice_extras(s_json_buf, n, sizeof(s_json_buf));
             net_relay_send(s_json_buf, n);
         } else {
             ESP_LOGE(TAG, "tick buffer too small (n=%u)", (unsigned)n);
@@ -473,6 +464,42 @@ static net_relay_cmd_status_t app_cmd_handler(const char *cmd, const char *id,
         return err == ESP_OK ? NET_RELAY_CMD_OK : NET_RELAY_CMD_FAIL;
     }
 
+    // settings.update: live-apply user orientation choices and persist
+    // to NVS so they survive reboot. Payload may include any subset of
+    // { visHmirror: bool, visVflip: bool, thermRotation: 0|1|2|3 }.
+    if (strcmp(cmd, "settings.update") == 0) {
+        nvs_handle_t h = 0;
+        bool nvs_ok = nvs_open("ghset", NVS_READWRITE, &h) == ESP_OK;
+        int applied = 0;
+        if (payload) {
+            const cJSON *vh = cJSON_GetObjectItemCaseSensitive(payload, "visHmirror");
+            const cJSON *vv = cJSON_GetObjectItemCaseSensitive(payload, "visVflip");
+            const cJSON *tr = cJSON_GetObjectItemCaseSensitive(payload, "thermRotation");
+            if (cJSON_IsBool(vh)) {
+                hal_camera_set_hmirror(cJSON_IsTrue(vh));
+                if (nvs_ok) nvs_set_u8(h, "vh", hal_camera_get_hmirror() ? 1 : 0);
+                applied++;
+            }
+            if (cJSON_IsBool(vv)) {
+                hal_camera_set_vflip(cJSON_IsTrue(vv));
+                if (nvs_ok) nvs_set_u8(h, "vv", hal_camera_get_vflip() ? 1 : 0);
+                applied++;
+            }
+            if (cJSON_IsNumber(tr)) {
+                uint8_t r = (uint8_t)tr->valueint & 3;
+                capture_set_thermal_rotation(r);
+                if (nvs_ok) nvs_set_u8(h, "tr", r);
+                applied++;
+            }
+        }
+        if (nvs_ok) { nvs_commit(h); nvs_close(h); }
+        snprintf(msg_out, msg_cap,
+                 "applied %d setting(s): vh=%d vv=%d tr=%d",
+                 applied, hal_camera_get_hmirror(), hal_camera_get_vflip(),
+                 capture_get_thermal_rotation());
+        return NET_RELAY_CMD_OK;
+    }
+
     // sessions.* — offload to worker so the WS task isn't blocked by SD.
     if (strcmp(cmd, "sessions.list") == 0) {
         if (sessions_enqueue_list(id) != ESP_OK) {
@@ -582,6 +609,25 @@ void app_main(void) {
         strncpy(s_sensor_name, "absent", sizeof(s_sensor_name) - 1);
     } else {
         ESP_LOGI(TAG, "camera ready (sensor=%s)", s_sensor_name);
+    }
+
+    // Load persisted user settings (vis flip, thermal rotation) and
+    // apply them to the just-initialised hal_camera + capture pipeline
+    // so live preview comes up with the user's last orientation.
+    {
+        nvs_handle_t h;
+        if (nvs_open("ghset", NVS_READONLY, &h) == ESP_OK) {
+            uint8_t v = 0;
+            if (nvs_get_u8(h, "vh", &v) == ESP_OK) hal_camera_set_hmirror(v != 0);
+            v = 0;
+            if (nvs_get_u8(h, "vv", &v) == ESP_OK) hal_camera_set_vflip(v != 0);
+            v = 0;
+            if (nvs_get_u8(h, "tr", &v) == ESP_OK) capture_set_thermal_rotation(v);
+            nvs_close(h);
+            ESP_LOGI(TAG, "settings loaded: hmirror=%d vflip=%d thermRot=%d",
+                     hal_camera_get_hmirror(), hal_camera_get_vflip(),
+                     capture_get_thermal_rotation());
+        }
     }
 
     // OLED — needs hal_lepton's I2C bus, so it goes after hal_lepton_boot.

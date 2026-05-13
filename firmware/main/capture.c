@@ -73,6 +73,13 @@ static void build_iron_lut(void) {
 static SemaphoreHandle_t s_therm_enc_mutex = NULL;
 static uint16_t *s_therm_raw = NULL;
 static uint8_t  *s_therm_rgb = NULL;
+static uint8_t  *s_therm_rot = NULL;   // dest for rotated RGB565 (90/180/270)
+
+// Rotation: 0/1/2/3 → 0/90/180/270 CW. Set via capture_set_thermal_rotation.
+static volatile uint8_t s_therm_rotation = 0;
+
+void capture_set_thermal_rotation(uint8_t r) { s_therm_rotation = (uint8_t)(r & 3); }
+uint8_t capture_get_thermal_rotation(void)   { return s_therm_rotation; }
 
 static void ensure_therm_buffers(void) {
     if (!s_therm_enc_mutex) s_therm_enc_mutex = xSemaphoreCreateMutex();
@@ -83,6 +90,30 @@ static void ensure_therm_buffers(void) {
     }
     if (!s_therm_rgb) {
         s_therm_rgb = heap_caps_malloc(LEP_PIXELS * 2, MALLOC_CAP_SPIRAM);
+    }
+    if (!s_therm_rot) {
+        s_therm_rot = heap_caps_malloc(LEP_PIXELS * 2, MALLOC_CAP_SPIRAM);
+    }
+}
+
+// Rotate an RGB565 buffer (LEP_W × LEP_H) by 90/180/270 CW into dst.
+// dst dimensions for 90/270 are LEP_H × LEP_W. Source untouched.
+static void rotate_rgb565(const uint16_t *src, uint16_t *dst, uint8_t rot) {
+    const int W = LEP_W, H = LEP_H;
+    if (rot == 1) {              // 90° CW
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                dst[x * H + (H - 1 - y)] = src[y * W + x];
+            }
+        }
+    } else if (rot == 2) {       // 180°
+        for (int i = 0; i < W * H; i++) dst[W * H - 1 - i] = src[i];
+    } else if (rot == 3) {       // 270° CW (= 90° CCW)
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                dst[(W - 1 - x) * H + y] = src[y * W + x];
+            }
+        }
     }
 }
 
@@ -122,9 +153,21 @@ size_t capture_encode_thermal_jpeg(uint8_t *dst, size_t cap) {
         out[i] = s_iron_lut[idx & 0xFF];
     }
 
+    // Apply rotation (0/90/180/270 CW) before JPEG encode so both
+    // preview AND recorded captures pick up the user's choice.
+    uint8_t  rot = s_therm_rotation & 3;
+    uint8_t *src_buf = s_therm_rgb;
+    int      enc_w = LEP_W, enc_h = LEP_H;
+    if (rot != 0 && s_therm_rot) {
+        rotate_rgb565((const uint16_t *)s_therm_rgb,
+                      (uint16_t *)s_therm_rot, rot);
+        src_buf = s_therm_rot;
+        if (rot == 1 || rot == 3) { enc_w = LEP_H; enc_h = LEP_W; }
+    }
+
     uint8_t *jpg_out = NULL;
     size_t   jpg_len = 0;
-    bool ok = fmt2jpg(s_therm_rgb, LEP_PIXELS * 2, LEP_W, LEP_H,
+    bool ok = fmt2jpg(src_buf, LEP_PIXELS * 2, enc_w, enc_h,
                        PIXFORMAT_RGB565, 80, &jpg_out, &jpg_len);
     if (!ok || !jpg_out) goto done;
     if (jpg_len > cap) {

@@ -61,6 +61,15 @@ void hal_camera_get_stats(hal_camera_stats_t *out);
 // Call from the tick task once per ~1.5 s to update the smoothed fps.
 void hal_camera_tick_fps(void);
 
+// Hardware H-mirror / V-flip via OV2640 sensor registers. Free
+// (no CPU cost) and applies to all subsequent JPEG frames — preview
+// and recordings alike. Combined H+V gives 180° rotation; OV2640
+// can't do 90/270, so those modalities aren't exposed here.
+esp_err_t hal_camera_set_hmirror(bool on);
+esp_err_t hal_camera_set_vflip(bool on);
+bool      hal_camera_get_hmirror(void);
+bool      hal_camera_get_vflip(void);
+
 #ifdef __cplusplus
 }
 #endif

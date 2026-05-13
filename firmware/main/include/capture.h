@@ -30,6 +30,11 @@ extern "C" {
 // out of memory). Thread-safe (uses internal lazy-allocated buffers).
 size_t capture_encode_thermal_jpeg(uint8_t *dst, size_t cap);
 
+// Thermal rotation applied during JPEG encode. Affects both preview
+// and recorded captures. Argument is 0/1/2/3 → 0/90/180/270 CW.
+void    capture_set_thermal_rotation(uint8_t r);
+uint8_t capture_get_thermal_rotation(void);
+
 // Single immediate capture — vis JPEG + thermal JPEG, written to a
 // new SD session directory. On success, copies the new session id
 // (e.g. "session_4517") into `session_id_out`.
