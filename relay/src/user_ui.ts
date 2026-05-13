@@ -459,6 +459,21 @@ export const USER_UI_HTML = `<!doctype html>
   .lightbox .lb-prev { left: 16px; }
   .lightbox .lb-next { right: 16px; }
   .lightbox .lb-nav:disabled { opacity: 0.3; cursor: default; }
+  /* Vis / Thermal modality toggle in the lightbox */
+  .lb-modality {
+    position: absolute; top: 16px; left: 24px;
+    display: flex; gap: 4px;
+  }
+  .lb-modality .mb {
+    background: rgba(255,255,255,0.08); border: 1px solid transparent;
+    color: white; padding: 6px 14px; border-radius: 6px;
+    cursor: pointer; font: 600 12px/1 system-ui;
+    text-transform: uppercase; letter-spacing: 0.05em;
+  }
+  .lb-modality .mb:hover { background: rgba(255,255,255,0.16); }
+  .lb-modality .mb.active.vis   { background: #1a3a5a; border-color: var(--accent); }
+  .lb-modality .mb.active.therm { background: #5a1a1a; border-color: var(--err); }
+  .lb-modality .mb:disabled { opacity: 0.35; cursor: not-allowed; }
 
   /* Toast */
   .toast {
@@ -525,6 +540,10 @@ export const USER_UI_HTML = `<!doctype html>
 <!-- Lightbox overlay -->
 <div class="lightbox" id="lightbox">
   <button class="lb-close" id="lb-close" aria-label="Close">×</button>
+  <div class="lb-modality" id="lb-modality">
+    <button class="mb vis active" id="lb-vis" data-mode="vis">Visible</button>
+    <button class="mb therm"      id="lb-therm" data-mode="therm">Thermal</button>
+  </div>
   <button class="lb-nav lb-prev" id="lb-prev" aria-label="Previous">‹</button>
   <img id="lb-img" alt="" />
   <button class="lb-nav lb-next" id="lb-next" aria-label="Next">›</button>
@@ -1355,6 +1374,8 @@ export const USER_UI_HTML = `<!doctype html>
   }
 
   // ───── Lightbox ─────
+  let lbModality = 'vis';   // 'vis' | 'therm', persists while lightbox is open
+
   function openLightbox(idx) {
     if (idx < 0 || idx >= detailCaptureList.length) return;
     lightboxIdx = idx;
@@ -1372,19 +1393,41 @@ export const USER_UI_HTML = `<!doctype html>
     lightboxIdx = next;
     renderLightbox();
   }
+  function setLbModality(m) {
+    lbModality = m;
+    document.getElementById('lb-vis').classList.toggle('active', m === 'vis');
+    document.getElementById('lb-therm').classList.toggle('active', m === 'therm');
+    renderLightbox();
+  }
   function renderLightbox() {
     const c = detailCaptureList[lightboxIdx];
     if (!c) return;
+    // Honor what's actually present for this capture. If the requested
+    // modality wasn't recorded, fall back to the other; if neither, show
+    // a placeholder + disable nav switches.
+    const visBtn   = document.getElementById('lb-vis');
+    const thermBtn = document.getElementById('lb-therm');
+    visBtn.disabled   = !c.visOk;
+    thermBtn.disabled = !c.thermOk;
+    let mode = lbModality;
+    if (mode === 'vis'   && !c.visOk   && c.thermOk) mode = 'therm';
+    if (mode === 'therm' && !c.thermOk && c.visOk)   mode = 'vis';
+    visBtn.classList.toggle('active', mode === 'vis');
+    thermBtn.classList.toggle('active', mode === 'therm');
+
     const img = document.getElementById('lb-img');
     img.removeAttribute('src');
-    loadAuthImg(img,
-      '/api/devices/' + encodeURIComponent(currentDeviceId) +
-      '/sessions/' + encodeURIComponent(c.sessionId) +
-      '/file/' + c.visFile);
+    const file = mode === 'therm' ? c.thermFile : c.visFile;
+    if ((mode === 'vis' && c.visOk) || (mode === 'therm' && c.thermOk)) {
+      loadAuthImg(img,
+        '/api/devices/' + encodeURIComponent(currentDeviceId) +
+        '/sessions/' + encodeURIComponent(c.sessionId) +
+        '/file/' + file);
+    }
     const info = document.getElementById('lb-info');
     info.replaceChildren(
       el('span', { class: 'seq' }, '#' + c.seq + ' / ' + detailCaptureList.length),
-      el('span', {}, ' · ' + c.visFile),
+      el('span', {}, ' · ' + file),
       c.timestamp ? el('span', {}, ' · ' + new Date(c.timestamp * 1000).toLocaleString()) : null,
     );
     document.getElementById('lb-prev').disabled = lightboxIdx === 0;
@@ -1393,12 +1436,16 @@ export const USER_UI_HTML = `<!doctype html>
   document.getElementById('lb-close').onclick = closeLightbox;
   document.getElementById('lb-prev').onclick = () => navLightbox(-1);
   document.getElementById('lb-next').onclick = () => navLightbox(1);
+  document.getElementById('lb-vis').onclick   = () => setLbModality('vis');
+  document.getElementById('lb-therm').onclick = () => setLbModality('therm');
   document.addEventListener('keydown', (e) => {
     const lb = document.getElementById('lightbox');
     if (!lb.classList.contains('show')) return;
     if (e.key === 'Escape') closeLightbox();
     else if (e.key === 'ArrowLeft') navLightbox(-1);
     else if (e.key === 'ArrowRight') navLightbox(1);
+    else if (e.key === 'v' || e.key === 'V') setLbModality('vis');
+    else if (e.key === 't' || e.key === 'T') setLbModality('therm');
   });
 
   // Tab clicks
