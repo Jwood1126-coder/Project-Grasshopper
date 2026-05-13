@@ -348,6 +348,117 @@ size_t capture_encode_thermal_jpeg(uint8_t *dst, size_t cap) {
     return capture_encode_thermal_jpeg_atomic(dst, cap, NULL, NULL, 0);
 }
 
+// ---- Capture engine ----
+//
+// Produces in-memory artifacts only. No SD, no journal, no aggregate
+// state. tl_capture_iteration and capture_now compose this with their
+// own session-store logic; the deep-sleep wake handler will too.
+
+void capture_artifacts_free(capture_artifacts_t *a) {
+    if (!a) return;
+    if (a->vis_jpg)   free(a->vis_jpg);
+    if (a->therm_jpg) free(a->therm_jpg);
+    if (a->therm_raw) free(a->therm_raw);
+    memset(a, 0, sizeof(*a));
+}
+
+esp_err_t capture_engine_take_one(bool want_visible,
+                                   bool want_thermal,
+                                   bool want_thermal_raw,
+                                   capture_artifacts_t *out) {
+    if (!out) return ESP_ERR_INVALID_ARG;
+    memset(out, 0, sizeof(*out));
+    if (!want_visible && !want_thermal) return ESP_ERR_INVALID_ARG;
+
+    // Snapshot capture-time settings so the sidecar JSON describes the
+    // exact frame, not whatever the live system rotated to by commit.
+    out->vis_rotation   = s_vis_rotation;
+    out->therm_rotation = s_therm_rotation;
+    out->agc_enabled    = hal_lepton_agc_enabled();
+    out->gain_mode      = hal_lepton_gain_mode();
+    {
+        bool ta = false, ar = false; uint16_t res = 0;
+        lepton_cci_get_tlinear_state(&ta, &ar, &res);
+        out->tlinear_active   = ta;
+        out->tlinear_auto_res = ar;
+    }
+
+    bool any = false;
+
+    // ---- Visible JPEG (with optional 90/270 SW rotation) ----
+    if (want_visible) {
+        uint64_t t0 = esp_timer_get_time();
+        if (hal_camera_ready()) {
+            const uint8_t *vis_fb = NULL;
+            size_t   vis_len_fb = 0;
+            uint32_t vis_w = 0, vis_h = 0;
+            if (hal_camera_grab_jpeg(&vis_fb, &vis_len_fb, &vis_w, &vis_h) == ESP_OK) {
+                uint8_t *rot_jpg = NULL; size_t rot_len = 0;
+                uint32_t rw = vis_w, rh = vis_h;
+                if (capture_rotate_visible_jpeg_if_needed(vis_fb, vis_len_fb,
+                                                           vis_w, vis_h,
+                                                           &rot_jpg, &rot_len,
+                                                           &rw, &rh)) {
+                    out->vis_jpg = rot_jpg;
+                    out->vis_len = rot_len;
+                    out->vis_w   = rw;
+                    out->vis_h   = rh;
+                } else {
+                    uint8_t *copy = heap_caps_malloc(vis_len_fb, MALLOC_CAP_SPIRAM);
+                    if (copy) {
+                        memcpy(copy, vis_fb, vis_len_fb);
+                        out->vis_jpg = copy;
+                        out->vis_len = vis_len_fb;
+                        out->vis_w   = vis_w;
+                        out->vis_h   = vis_h;
+                    }
+                }
+                hal_camera_release();
+                if (out->vis_jpg) any = true;
+            } else {
+                ESP_LOGW(TAG, "capture_engine: camera grab failed");
+            }
+        } else {
+            ESP_LOGW(TAG, "capture_engine: camera not ready");
+        }
+        out->visible_ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
+    }
+
+    // ---- Thermal JPEG + optional raw snapshot (atomic, single mutex) ----
+    if (want_thermal) {
+        uint64_t t0 = esp_timer_get_time();
+        uint8_t *therm_jpg = heap_caps_malloc(THERM_JPEG_MAX_BYTES, MALLOC_CAP_SPIRAM);
+        uint16_t *raw_snap = NULL;
+        if (want_thermal_raw) {
+            raw_snap = heap_caps_malloc(LEP_PIXELS * sizeof(uint16_t),
+                                         MALLOC_CAP_SPIRAM);
+        }
+        if (therm_jpg) {
+            therm_frame_stats_t fs = {0};
+            size_t therm_len = capture_encode_thermal_jpeg_atomic(
+                therm_jpg, THERM_JPEG_MAX_BYTES, &fs,
+                raw_snap, raw_snap ? LEP_PIXELS * sizeof(uint16_t) : 0);
+            if (therm_len > 0) {
+                out->therm_jpg   = therm_jpg;
+                out->therm_len   = therm_len;
+                out->therm_stats = fs;
+                if (fs.valid && raw_snap) {
+                    out->therm_raw = raw_snap;
+                    raw_snap = NULL;
+                }
+                any = true;
+            } else {
+                free(therm_jpg);
+                ESP_LOGW(TAG, "capture_engine: thermal encode skipped (no frame yet)");
+            }
+        }
+        if (raw_snap) free(raw_snap);
+        out->thermal_ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
+    }
+
+    return any ? ESP_OK : ESP_FAIL;
+}
+
 // ---- Single-shot capture session ----
 
 // Generate a 5-digit pseudo-random session id. Matches Fox's pattern
@@ -385,75 +496,35 @@ esp_err_t capture_now(char *session_id_out, size_t session_id_cap,
         return ESP_ERR_INVALID_STATE;
     }
 
-    // Capture vis JPEG FIRST (out of SD lock, since hal_camera grabs
-    // its own frame buffer lock). Hold the FB lock for as short a time
-    // as possible — copy the bytes out and release.
-    const uint8_t *vis_jpg = NULL;
-    size_t vis_len = 0;
-    uint32_t vis_w = 0, vis_h = 0;
-    esp_err_t err = hal_camera_grab_jpeg(&vis_jpg, &vis_len, &vis_w, &vis_h);
-    if (err != ESP_OK) {
-        snprintf(msg_out, msg_cap, "camera grab failed: %s", esp_err_to_name(err));
-        return err;
+    // Produce vis + therm artifacts in memory (engine is shared with
+    // the live timelapse path, and eventually the deep-sleep handler).
+    capture_artifacts_t art = {0};
+    esp_err_t cap_err = capture_engine_take_one(/*want_visible*/ true,
+                                                  /*want_thermal*/ true,
+                                                  /*want_thermal_raw*/ true,
+                                                  &art);
+    if (cap_err != ESP_OK || !art.vis_jpg) {
+        capture_artifacts_free(&art);
+        snprintf(msg_out, msg_cap, "camera grab failed");
+        return ESP_FAIL;
     }
-
-    // For 90/270 visible rotation, decode → rotate → re-encode here so
-    // recordings save in the chosen orientation.
-    uint8_t *vis_copy = NULL;
-    {
-        uint8_t *rot_jpg = NULL; size_t rot_len = 0;
-        uint32_t rw = vis_w, rh = vis_h;
-        if (capture_rotate_visible_jpeg_if_needed(vis_jpg, vis_len, vis_w, vis_h,
-                                                   &rot_jpg, &rot_len, &rw, &rh)) {
-            vis_copy = rot_jpg;     // already heap-allocated; we own it
-            vis_len  = rot_len;
-            vis_w    = rw;
-            vis_h    = rh;
-        } else {
-            vis_copy = heap_caps_malloc(vis_len, MALLOC_CAP_SPIRAM);
-            if (!vis_copy) {
-                hal_camera_release();
-                snprintf(msg_out, msg_cap, "OOM copying vis JPEG (%u B)", (unsigned)vis_len);
-                return ESP_ERR_NO_MEM;
-            }
-            memcpy(vis_copy, vis_jpg, vis_len);
-        }
-    }
-    hal_camera_release();
-
-    // Encode thermal next (also outside SD lock — it has its own mutex).
-    uint8_t *therm_jpg = heap_caps_malloc(THERM_JPEG_MAX_BYTES, MALLOC_CAP_SPIRAM);
-    if (!therm_jpg) {
-        free(vis_copy);
-        snprintf(msg_out, msg_cap, "OOM allocating thermal JPEG buffer");
-        return ESP_ERR_NO_MEM;
-    }
-    // Atomic encode + raw snapshot + stats — same frame, one mutex
-    // acquire, no race with the preview task's parallel encodes.
-    therm_frame_stats_t fs = {0};
-    uint16_t *raw_snap = heap_caps_malloc(LEP_PIXELS * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
-    size_t therm_len = capture_encode_thermal_jpeg_atomic(
-        therm_jpg, THERM_JPEG_MAX_BYTES, &fs,
-        raw_snap, raw_snap ? LEP_PIXELS * sizeof(uint16_t) : 0);
-    bool therm_ok = therm_len > 0;
-    therm_stats_t ts = {0};
-    bool tl_active = false, tl_auto = false; uint16_t tl_res = 0;
-    if (therm_ok) {
-        ts.min_raw = fs.min_raw; ts.max_raw = fs.max_raw;
-        ts.center_raw = fs.center_raw; ts.resolution = fs.resolution;
-        ts.valid = fs.valid;
-        // For the sidecar JSON we still want the live tlinear state
-        // booleans (active/auto_res). Resolution comes from `fs`.
-        lepton_cci_get_tlinear_state(&tl_active, &tl_auto, &tl_res);
-    } else {
+    bool   therm_ok = (art.therm_jpg != NULL);
+    size_t vis_len  = art.vis_len;
+    size_t therm_len = art.therm_len;
+    therm_stats_t ts = {
+        .valid      = art.therm_stats.valid,
+        .min_raw    = art.therm_stats.min_raw,
+        .max_raw    = art.therm_stats.max_raw,
+        .center_raw = art.therm_stats.center_raw,
+        .resolution = art.therm_stats.resolution,
+    };
+    if (!therm_ok) {
         ESP_LOGW(TAG, "thermal encode skipped — no frame yet");
     }
-    if (!ts.valid && raw_snap) { free(raw_snap); raw_snap = NULL; }
 
     // Now hold the SD lock while we mkdir + write all files atomically.
     if (!hal_storage_sd_lock(5000)) {
-        free(vis_copy);
-        free(therm_jpg);
+        capture_artifacts_free(&art);
         snprintf(msg_out, msg_cap, "SD lock timeout");
         return ESP_ERR_TIMEOUT;
     }
@@ -474,8 +545,7 @@ esp_err_t capture_now(char *session_id_out, size_t session_id_cap,
         } else {
             ESP_LOGE(TAG, "SD root write probe FAILED: errno=%d", errno);
             hal_storage_sd_unlock();
-            free(vis_copy);
-            free(therm_jpg);
+            capture_artifacts_free(&art);
             snprintf(msg_out, msg_cap, "SD root write failed errno=%d", errno);
             return ESP_FAIL;
         }
@@ -483,8 +553,7 @@ esp_err_t capture_now(char *session_id_out, size_t session_id_cap,
 
     if (hal_storage_sd_mkdir_p(session_dir) != ESP_OK) {
         hal_storage_sd_unlock();
-        free(vis_copy);
-        free(therm_jpg);
+        capture_artifacts_free(&art);
         snprintf(msg_out, msg_cap, "mkdir %s failed", session_dir);
         return ESP_FAIL;
     }
@@ -494,21 +563,20 @@ esp_err_t capture_now(char *session_id_out, size_t session_id_cap,
     esp_err_t therm_write_err = ESP_OK;
 
     snprintf(path, sizeof(path), "%s/000001_vis.jpg", session_dir);
-    vis_write_err = write_file_sd_locked(path, vis_copy, vis_len);
+    vis_write_err = write_file_sd_locked(path, art.vis_jpg, vis_len);
 
     if (therm_ok) {
         snprintf(path, sizeof(path), "%s/000001_therm.jpg", session_dir);
-        therm_write_err = write_file_sd_locked(path, therm_jpg, therm_len);
+        therm_write_err = write_file_sd_locked(path, art.therm_jpg, therm_len);
     }
 
     // Sidecars: .raw16 + .json — only when thermal succeeded + radiometric on.
     if (therm_ok && ts.valid) {
-        write_thermal_sidecars(session_dir, /*seq*/ 1, raw_snap, &ts,
-                                tl_active, tl_auto,
-                                capture_get_thermal_rotation(),
+        write_thermal_sidecars(session_dir, /*seq*/ 1, art.therm_raw, &ts,
+                                art.tlinear_active, art.tlinear_auto_res,
+                                art.therm_rotation,
                                 /*last_ffc_ms*/ 0,
-                                hal_lepton_agc_enabled(),
-                                hal_lepton_gain_mode());
+                                art.agc_enabled, art.gain_mode);
     }
 
     {
@@ -589,9 +657,7 @@ esp_err_t capture_now(char *session_id_out, size_t session_id_cap,
     }
 
     hal_storage_sd_unlock();
-    free(vis_copy);
-    free(therm_jpg);
-    if (raw_snap) free(raw_snap);
+    capture_artifacts_free(&art);
 
     if (session_id_out && session_id_cap > 0) {
         snprintf(session_id_out, session_id_cap, "session_%lu", (unsigned long)sid);
@@ -824,74 +890,36 @@ static void tl_write_session_json(bool complete) {
 }
 
 // One capture iteration: vis + therm to the active timelapse session.
-// Mirrors capture_now's logic but writes into the existing session_dir
-// with a sequence number instead of creating a new session.
+// Composes capture_engine_take_one (in-memory artifacts) with this
+// session's SD-write logic + aggregate folding. The split lets the
+// deep-sleep wake handler share the same artifact-production path
+// without inheriting the live-task globals.
 static void tl_capture_iteration(uint32_t seq) {
-    if (!hal_camera_ready()) {
-        ESP_LOGW(TAG, "tl seq %lu: camera not ready, skipping", (unsigned long)seq);
+    capture_artifacts_t art = {0};
+    esp_err_t cap_err = capture_engine_take_one(
+        s_tl_capture_vis, s_tl_capture_therm,
+        /*want_thermal_raw*/ s_tl_capture_therm,
+        &art);
+    if (cap_err != ESP_OK) {
+        ESP_LOGW(TAG, "tl seq %lu: nothing produced (%s)",
+                 (unsigned long)seq, esp_err_to_name(cap_err));
+        capture_artifacts_free(&art);
         return;
     }
 
-    // Grab vis JPEG into a PSRAM copy so we can release the camera FB.
-    // SW rotation (90°/270°) happens here so each timelapse capture is
-    // saved in the user-selected orientation.
-    const uint8_t *vis_jpg = NULL;
-    size_t vis_len = 0;
-    uint32_t vis_w = 0, vis_h = 0;
-    bool vis_grabbed = (hal_camera_grab_jpeg(&vis_jpg, &vis_len, &vis_w, &vis_h) == ESP_OK);
-    uint8_t *vis_copy = NULL;
-    if (vis_grabbed && s_tl_capture_vis) {
-        uint8_t *rot_jpg = NULL; size_t rot_len = 0;
-        uint32_t rw = vis_w, rh = vis_h;
-        if (capture_rotate_visible_jpeg_if_needed(vis_jpg, vis_len, vis_w, vis_h,
-                                                   &rot_jpg, &rot_len, &rw, &rh)) {
-            vis_copy = rot_jpg;
-            vis_len  = rot_len;
-        } else {
-            vis_copy = heap_caps_malloc(vis_len, MALLOC_CAP_SPIRAM);
-            if (vis_copy) memcpy(vis_copy, vis_jpg, vis_len);
-        }
-    }
-    if (vis_grabbed) hal_camera_release();
-
-    // Encode thermal + snapshot raw + stats atomically (same frame,
-    // one mutex acquire). Eliminates the race where a preview encode
-    // between encode + snapshot could swap s_therm_raw underneath us.
-    uint8_t *therm_jpg = NULL;
-    size_t therm_len = 0;
-    therm_stats_t ts = {0};
-    uint16_t *raw_snap = NULL;
-    if (s_tl_capture_therm) {
-        therm_jpg = heap_caps_malloc(THERM_JPEG_MAX_BYTES, MALLOC_CAP_SPIRAM);
-        raw_snap  = heap_caps_malloc(LEP_PIXELS * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
-        if (therm_jpg) {
-            therm_frame_stats_t fs = {0};
-            therm_len = capture_encode_thermal_jpeg_atomic(
-                therm_jpg, THERM_JPEG_MAX_BYTES, &fs,
-                raw_snap, raw_snap ? LEP_PIXELS * sizeof(uint16_t) : 0);
-            if (therm_len == 0) { free(therm_jpg); therm_jpg = NULL; }
-            ts.min_raw = fs.min_raw; ts.max_raw = fs.max_raw;
-            ts.center_raw = fs.center_raw; ts.resolution = fs.resolution;
-            ts.valid = fs.valid;
-        }
-        if (!ts.valid) {
-            if (raw_snap) { free(raw_snap); raw_snap = NULL; }
-        } else {
-            // Fold into session aggregates. validThermCount tracks the
-            // denominator separately so a partial-failure session
-            // doesn't bias avgCenterRaw down (codex #4).
-            if (ts.min_raw < s_tl_min_session) s_tl_min_session = ts.min_raw;
-            if (ts.max_raw > s_tl_max_session) s_tl_max_session = ts.max_raw;
-            s_tl_sum_center_raw  += ts.center_raw;
-            s_tl_valid_therm_count++;
-        }
+    // Fold per-capture stats into per-session aggregates. validThermCount
+    // is its own denominator so failed thermal captures don't bias
+    // avgCenterRaw toward 0 (codex #4).
+    if (art.therm_stats.valid) {
+        if (art.therm_stats.min_raw < s_tl_min_session) s_tl_min_session = art.therm_stats.min_raw;
+        if (art.therm_stats.max_raw > s_tl_max_session) s_tl_max_session = art.therm_stats.max_raw;
+        s_tl_sum_center_raw  += art.therm_stats.center_raw;
+        s_tl_valid_therm_count++;
     }
 
     if (!hal_storage_sd_lock(5000)) {
         ESP_LOGW(TAG, "tl seq %lu: SD lock timeout", (unsigned long)seq);
-        if (vis_copy) free(vis_copy);
-        if (therm_jpg) free(therm_jpg);
-        if (raw_snap) free(raw_snap);
+        capture_artifacts_free(&art);
         return;
     }
 
@@ -899,44 +927,47 @@ static void tl_capture_iteration(uint32_t seq) {
     bool vis_written = false, therm_written = false;
     size_t vis_bytes = 0, therm_bytes = 0;
 
-    if (vis_copy && s_tl_capture_vis) {
+    if (art.vis_jpg && s_tl_capture_vis) {
         snprintf(path, sizeof(path), "%s/%06lu_vis.jpg",
                  s_tl_session_dir, (unsigned long)seq);
-        if (write_file_sd_locked(path, vis_copy, vis_len) == ESP_OK) {
+        if (write_file_sd_locked(path, art.vis_jpg, art.vis_len) == ESP_OK) {
             vis_written = true;
-            vis_bytes = vis_len;
+            vis_bytes = art.vis_len;
         }
     }
-    if (therm_jpg && s_tl_capture_therm) {
+    if (art.therm_jpg && s_tl_capture_therm) {
         snprintf(path, sizeof(path), "%s/%06lu_therm.jpg",
                  s_tl_session_dir, (unsigned long)seq);
-        if (write_file_sd_locked(path, therm_jpg, therm_len) == ESP_OK) {
+        if (write_file_sd_locked(path, art.therm_jpg, art.therm_len) == ESP_OK) {
             therm_written = true;
-            therm_bytes = therm_len;
+            therm_bytes = art.therm_len;
         }
     }
 
+    therm_stats_t ts_compat = {
+        .valid      = art.therm_stats.valid,
+        .min_raw    = art.therm_stats.min_raw,
+        .max_raw    = art.therm_stats.max_raw,
+        .center_raw = art.therm_stats.center_raw,
+        .resolution = art.therm_stats.resolution,
+    };
+
     // Per-capture sidecars (.raw16 + .json) — only when thermal was
     // actually requested + radiometric is on. Caller already holds lock.
-    if (s_tl_capture_therm && ts.valid) {
-        bool tl_active = false, tl_auto = false; uint16_t res = 0;
-        lepton_cci_get_tlinear_state(&tl_active, &tl_auto, &res);
-        write_thermal_sidecars(s_tl_session_dir, seq, raw_snap, &ts,
-                                tl_active, tl_auto,
-                                capture_get_thermal_rotation(),
-                                /*last_ffc_ms*/ 0,    // tracked by hal_lepton stats; not exposed yet
-                                hal_lepton_agc_enabled(),
-                                hal_lepton_gain_mode());
+    if (s_tl_capture_therm && ts_compat.valid) {
+        write_thermal_sidecars(s_tl_session_dir, seq, art.therm_raw, &ts_compat,
+                                art.tlinear_active, art.tlinear_auto_res,
+                                art.therm_rotation,
+                                /*last_ffc_ms*/ 0,
+                                art.agc_enabled, art.gain_mode);
     }
     tl_append_capture_log(seq, vis_written, vis_bytes, therm_written, therm_bytes,
-                           ts.valid ? &ts : NULL);
+                           ts_compat.valid ? &ts_compat : NULL);
     s_tl_capture_count = seq;
     tl_write_session_json(false);   // running, not complete
     hal_storage_sd_unlock();
 
-    if (vis_copy) free(vis_copy);
-    if (therm_jpg) free(therm_jpg);
-    if (raw_snap)  free(raw_snap);
+    capture_artifacts_free(&art);
 
     ESP_LOGI(TAG, "tl seq %lu: vis=%u therm=%u",
              (unsigned long)seq, (unsigned)vis_bytes, (unsigned)therm_bytes);

@@ -31,6 +31,51 @@ extern "C" {
 //   ESP_FAIL                  — buffer allocation or driver init failed
 esp_err_t hal_lepton_boot(void);
 
+// ---------- Composable boot phases ----------
+//
+// hal_lepton_boot() is the all-in-one entry point. The phase functions
+// below give finer control — needed by deep-sleep wake cycles where we
+// want to skip the diagnostic dumps, skip FFC every wake, use bounded
+// waits, and measure each phase. Cold-start order is exact:
+//
+//   power_on → cci_bus_init → cci_apply_config → vospi_bring_up
+//   → wait_first_frame → run_initial_ffc (optional)
+//
+// hal_lepton_boot() composes these in sequence with the historical
+// defaults (8s power-up wait, 30s first-frame wait). Each phase is
+// idempotent within its layer.
+
+// Drive the MOSFET LOW for 1s then HIGH, and wait `boot_wait_ms` for
+// the Lepton firmware to come up (Lepton 3.5 needs ~5–8s before it
+// will respond to I2C). Pass 0 to skip the wait.
+esp_err_t hal_lepton_power_on(uint32_t boot_wait_ms);
+
+// Drive the MOSFET LOW. Caller is responsible for first stopping the
+// VoSPI reader (otherwise it'll keep retrying on dead lines). Used by
+// power_manager / deep-sleep prep.
+esp_err_t hal_lepton_power_off(void);
+
+// I2C + SPI bus init + I2C address probe. Safe to call multiple times.
+esp_err_t hal_lepton_cci_bus_init(void);
+
+// Apply the full CCI configuration (radiometry, TLinear, AGC, VSYNC).
+// Must follow cci_bus_init. Does NOT run FFC. Logs CCI state before
+// and after for diagnostics; deep-sleep wake paths can call the
+// underlying lepton_cci_configure() directly to skip the dumps if
+// they want a quieter boot.
+esp_err_t hal_lepton_cci_apply_config(void);
+
+// Init VoSPI driver + spawn the reader task pinned to core 1.
+esp_err_t hal_lepton_vospi_bring_up(void);
+
+// Block until the first committed frame appears, or `timeout_ms`
+// elapses. Polls at 250ms.
+esp_err_t hal_lepton_wait_first_frame(uint32_t timeout_ms);
+
+// Run a single FFC. Updates the cached lep_last_ffc_ms timestamp.
+// Per Fox: do NOT call this until after the first frame is committed.
+esp_err_t hal_lepton_run_initial_ffc(void);
+
 // ---------- Frame access ----------
 
 // Copy the latest committed frame into `dst` (must be at least

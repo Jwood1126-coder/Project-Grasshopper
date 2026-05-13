@@ -27,6 +27,7 @@ extern SemaphoreHandle_t lep_wire_mutex;
 
 // CCI subsystem.
 esp_err_t lepton_cci_init(void);
+bool      lepton_cci_probe_i2c(void);   // ACK-only probe at 0x2A
 esp_err_t lepton_cci_oem_reboot(void);
 esp_err_t lepton_cci_configure(void);
 void      lepton_cci_dump_state(void);

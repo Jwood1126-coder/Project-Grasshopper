@@ -106,6 +106,66 @@ bool capture_rotate_visible_jpeg_if_needed(const uint8_t *in_jpg, size_t in_len,
 esp_err_t capture_now(char *session_id_out, size_t session_id_cap,
                       char *msg_out, size_t msg_cap);
 
+// ---- Capture engine ----
+//
+// Synchronous "take one" producing in-memory artifacts only. Does NOT
+// touch SD, does NOT update any session aggregates, does NOT depend
+// on which scheduler called it. Live timelapse, single-shot capture,
+// and (eventually) the deep-sleep wake handler all use this.
+//
+// On success at least one of vis_jpg / therm_jpg is non-NULL; check
+// the per-artifact pointers and the `*_ms` timing to decide what to
+// commit. Caller MUST call capture_artifacts_free() when done.
+typedef struct {
+    // JPEG buffers (heap-allocated in PSRAM, caller frees via free()).
+    uint8_t *vis_jpg;
+    size_t   vis_len;
+    uint32_t vis_w;
+    uint32_t vis_h;
+
+    uint8_t *therm_jpg;
+    size_t   therm_len;
+
+    // Raw 160×120 uint16 thermal frame (76800 bytes is the buffer cap;
+    // 38400 are the meaningful pixels). Pre-rotation, native sensor
+    // orientation. Heap-allocated in PSRAM; NULL if not requested or
+    // thermal failed.
+    uint16_t *therm_raw;
+
+    therm_frame_stats_t therm_stats;
+
+    // Capture-time settings snapshot — needed by the sidecar JSON
+    // writers so the file describes the exact frame, not whatever
+    // state the live system is in by the time we commit to SD.
+    bool     tlinear_active;
+    bool     tlinear_auto_res;
+    uint8_t  therm_rotation;
+    uint8_t  vis_rotation;
+    bool     agc_enabled;
+    int      gain_mode;
+
+    // Phase timing (ms) — useful for deep-sleep journal records.
+    uint32_t visible_ms;
+    uint32_t thermal_ms;
+} capture_artifacts_t;
+
+// Free any heap-allocated buffers inside `a` and zero the struct.
+// Safe to call on a zero-initialized struct.
+void capture_artifacts_free(capture_artifacts_t *a);
+
+// Produce capture artifacts for one frame. Reads the current rotation
+// + AGC + gain settings as the snapshot for this capture. Returns
+// ESP_OK if at least one requested artifact was produced; otherwise
+// the appropriate ESP_ERR_*.
+//
+// `want_thermal_raw` only matters when `want_thermal` is true; setting
+// it allocates the raw buffer alongside the JPEG so callers that want
+// the .raw16 sidecar don't need a second snapshot call.
+esp_err_t capture_engine_take_one(bool want_visible,
+                                   bool want_thermal,
+                                   bool want_thermal_raw,
+                                   capture_artifacts_t *out);
+
 // ---- Timelapse ----
 //
 // Periodic capture loop. Creates a session directory at start, fires

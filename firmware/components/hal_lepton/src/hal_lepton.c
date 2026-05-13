@@ -14,8 +14,11 @@
 
 static const char *TAG = "hal_lepton";
 
-static void power_cycle(void) {
-    if (LEP_POWER_PIN < 0) return;
+// MOSFET pin config — applied once on the first power_on/power_off call.
+static bool s_mosfet_configured = false;
+
+static void mosfet_configure_once(void) {
+    if (s_mosfet_configured || LEP_POWER_PIN < 0) return;
     gpio_config_t cfg = {
         .pin_bit_mask = 1ULL << LEP_POWER_PIN,
         .mode = GPIO_MODE_OUTPUT,
@@ -24,6 +27,16 @@ static void power_cycle(void) {
         .intr_type = GPIO_INTR_DISABLE,
     };
     gpio_config(&cfg);
+    s_mosfet_configured = true;
+}
+
+esp_err_t hal_lepton_power_on(uint32_t boot_wait_ms) {
+    if (LEP_POWER_PIN < 0) {
+        // No MOSFET wired — board is hard-powered, just honour the wait.
+        if (boot_wait_ms) vTaskDelay(pdMS_TO_TICKS(boot_wait_ms));
+        return ESP_OK;
+    }
+    mosfet_configure_once();
     // Force a real off → on cycle. ESP32 resets don't clear the MOSFET
     // state, so the Lepton may be stuck in a bad mode (only emitting
     // 4-byte headers) from a previous boot. Drive LOW for 1 s so the
@@ -33,69 +46,102 @@ static void power_cycle(void) {
     vTaskDelay(pdMS_TO_TICKS(1000));
     gpio_set_level(LEP_POWER_PIN, 1);
     ESP_LOGI(TAG, "MOSFET on");
+    if (boot_wait_ms) {
+        ESP_LOGI(TAG, "waiting %lums for Lepton boot...", (unsigned long)boot_wait_ms);
+        vTaskDelay(pdMS_TO_TICKS(boot_wait_ms));
+    }
+    return ESP_OK;
 }
 
-esp_err_t hal_lepton_boot(void) {
-    power_cycle();
-    // Fox uses 5s here. New Lepton 3.5 units sometimes need longer
-    // before responding to I2C; bump to 8s for safety.
-    ESP_LOGI(TAG, "waiting 8s for Lepton boot...");
-    vTaskDelay(pdMS_TO_TICKS(8000));
+esp_err_t hal_lepton_power_off(void) {
+    if (LEP_POWER_PIN < 0) return ESP_OK;
+    mosfet_configure_once();
+    gpio_set_level(LEP_POWER_PIN, 0);
+    ESP_LOGI(TAG, "MOSFET off (gpio %d)", LEP_POWER_PIN);
+    return ESP_OK;
+}
 
+esp_err_t hal_lepton_cci_bus_init(void) {
     esp_err_t err = lepton_cci_init();
     if (err != ESP_OK) return err;
-
     // I2C address probe: confirm Lepton is on the bus before asking it
     // anything. If this NACKs, the bus is silent — no point running
     // CCI ops, the issue is physical (seating, wiring, power).
-    extern bool lepton_cci_probe_i2c(void);
     if (!lepton_cci_probe_i2c()) {
         ESP_LOGE(TAG, "Lepton I2C probe FAILED — check seating, SDA/SCL/VIN, MOSFET");
         return ESP_ERR_NOT_FOUND;
     }
+    return ESP_OK;
+}
 
+esp_err_t hal_lepton_cci_apply_config(void) {
     lepton_cci_dump_state();
-
-    err = lepton_cci_configure();
+    esp_err_t err = lepton_cci_configure();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "CCI configure failed");
         return err;
     }
     lepton_cci_dump_state();
+    return ESP_OK;
+}
+
+esp_err_t hal_lepton_vospi_bring_up(void) {
+    esp_err_t err = lepton_vospi_init();
+    if (err != ESP_OK) return err;
+    lepton_vospi_start();
+    return ESP_OK;
+}
+
+esp_err_t hal_lepton_wait_first_frame(uint32_t timeout_ms) {
+    uint32_t waited = 0;
+    while (lepton_vospi_frame_count() == 0 && waited < timeout_ms) {
+        vTaskDelay(pdMS_TO_TICKS(250));
+        waited += 250;
+    }
+    if (lepton_vospi_frame_count() == 0) {
+        ESP_LOGE(TAG, "no frame after %lu ms", (unsigned long)waited);
+        return ESP_ERR_TIMEOUT;
+    }
+    ESP_LOGI(TAG, "first frame received after %lu ms", (unsigned long)waited);
+    return ESP_OK;
+}
+
+esp_err_t hal_lepton_run_initial_ffc(void) {
+    esp_err_t err = lepton_cci_run_ffc();
+    if (err == ESP_OK) {
+        lep_last_ffc_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        ESP_LOGI(TAG, "initial FFC done");
+    } else {
+        ESP_LOGW(TAG, "initial FFC failed");
+    }
+    return err;
+}
+
+esp_err_t hal_lepton_boot(void) {
+    // Fox uses 5s here. New Lepton 3.5 units sometimes need longer
+    // before responding to I2C; bump to 8s for safety.
+    esp_err_t err = hal_lepton_power_on(8000);
+    if (err != ESP_OK) return err;
+
+    err = hal_lepton_cci_bus_init();
+    if (err != ESP_OK) return err;
+
+    err = hal_lepton_cci_apply_config();
+    if (err != ESP_OK) return err;
 
     // NOTE: FFC at boot was an experiment that turned out to be
     // counterproductive. After FFC, the Lepton emits duplicate frames
     // (seg=0 on line 20) for several seconds while recalibrating,
     // which our VoSPI assembler treats as a sync failure and bails.
     // Fox runs FFC AFTER the first frame, and that's what we do too.
-    // Use lepton_cci_ffc_probe() manually (e.g., from a debug endpoint)
-    // when you want to verify FFC controller health.
 
-    err = lepton_vospi_init();
+    err = hal_lepton_vospi_bring_up();
     if (err != ESP_OK) return err;
 
-    lepton_vospi_start();
+    err = hal_lepton_wait_first_frame(30000);
+    if (err != ESP_OK) return err;
 
-    // Wait up to 30s for first frame.
-    int waited = 0;
-    while (lepton_vospi_frame_count() == 0 && waited < 30000) {
-        vTaskDelay(pdMS_TO_TICKS(250));
-        waited += 250;
-    }
-    if (lepton_vospi_frame_count() == 0) {
-        ESP_LOGE(TAG, "no frame after %d ms", waited);
-        return ESP_ERR_TIMEOUT;
-    }
-    ESP_LOGI(TAG, "first frame received after %d ms", waited);
-
-    // Initial FFC — Fox does this once after first frame.
-    if (lepton_cci_run_ffc() == ESP_OK) {
-        lep_last_ffc_ms = (uint32_t)(esp_timer_get_time() / 1000);
-        ESP_LOGI(TAG, "initial FFC done");
-    } else {
-        ESP_LOGW(TAG, "initial FFC failed");
-    }
-
+    hal_lepton_run_initial_ffc();   // non-fatal
     return ESP_OK;
 }
 
