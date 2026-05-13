@@ -385,6 +385,24 @@ export const USER_UI_HTML = `<!doctype html>
     border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px;
     font: 13px ui-monospace, monospace;
   }
+  .fw-row {
+    display: flex; gap: 8px; align-items: center; margin-top: 8px;
+    padding: 10px 12px; background: var(--panel-bg);
+    border: 1px solid var(--border); border-radius: 8px;
+    flex-wrap: wrap;
+  }
+  .fw-row label { font-size: 12px; color: var(--muted); flex-shrink: 0; }
+  .fw-row input[type=file] {
+    flex: 1; min-width: 200px; color: var(--text);
+    font: 12px ui-sans-serif;
+  }
+  .fw-row .btn { height: 36px; padding: 0 14px; }
+  .fw-status {
+    margin-top: 6px; padding: 6px 12px; font: 12px ui-monospace, monospace;
+    color: var(--muted); min-height: 18px;
+  }
+  .fw-status.err { color: var(--err); }
+  .fw-status.ok  { color: var(--ok); }
 
   /* ─── Footer ─── */
   footer {
@@ -1476,9 +1494,19 @@ export const USER_UI_HTML = `<!doctype html>
     const tokenRow = el('div', { class: 'token-row' },
       el('label', {}, 'Token:'), tokenInput);
 
+    // ─── OTA firmware update ───
+    fields.fwInput  = el('input', { type: 'file', accept: '.bin,application/octet-stream',
+                                     id: 'fw-file' });
+    fields.fwStatus = el('div', { class: 'fw-status', id: 'fw-status' }, '');
+    fields.fwBtn    = el('button', { class: 'btn', onclick: () => uploadAndUpdateFirmware() },
+      el('span', { class: 'icon' }, '⬆'),
+      el('span', { class: 'btn-label' }, 'Update Firmware'));
+    const fwRow = el('div', { class: 'fw-row' },
+      el('label', {}, 'Firmware:'), fields.fwInput, fields.fwBtn);
+
     const diagnostics = el('details', {},
       el('summary', {}, 'Diagnostics & device state'),
-      el('div', { class: 'body' }, fields.statBlock, tokenRow));
+      el('div', { class: 'body' }, fields.statBlock, tokenRow, fwRow, fields.fwStatus));
 
     // (Legend lives inside the thermal wrap now; no longer rendered separately here.)
     return el('div', {}, fields.tlBannerSlot, views, fields.actions, fields.actionsSec, diagnostics);
@@ -1802,6 +1830,17 @@ export const USER_UI_HTML = `<!doctype html>
             (e.ok ? '✓ ' : '✗ ') + pending.type + ': ' + (e.msg || ''),
             e.ok ? 'ok' : 'err'
           );
+        }
+        // Surface OTA progress / completion in the firmware status
+        // row regardless of pendingCmds — multiple cmd.result events
+        // with the same id stream during a single update.
+        if (e.kind === 'cmd.result' && e.cmd === 'firmware.update') {
+          let pct = '';
+          if (e.data && typeof e.data === 'object' && typeof e.data.pct === 'number') {
+            pct = ' (' + e.data.pct + '%)';
+          }
+          setFwStatus((e.ok ? '' : '✗ ') + (e.msg || '') + pct,
+                       e.ok ? '' : 'err');
         }
       }
     } catch {}
@@ -2325,6 +2364,55 @@ export const USER_UI_HTML = `<!doctype html>
     v.appendChild(meta);
     v.appendChild(grid);
     return v;
+  }
+
+  // ─── OTA: upload .bin then fire firmware.update on the device ───
+  async function uploadAndUpdateFirmware() {
+    if (!currentDeviceId) { setFwStatus('No device connected', 'err'); return; }
+    const file = fields.fwInput?.files?.[0];
+    if (!file) { setFwStatus('Pick a grasshopper.bin file first', 'err'); return; }
+    if (file.size < 32 * 1024 || file.size > 4 * 1024 * 1024) {
+      setFwStatus('Bad file size: ' + file.size + ' B', 'err'); return;
+    }
+    setFwStatus('Uploading ' + (file.size / 1024 | 0) + ' KB to relay…');
+    try {
+      const upR = await fetch(
+        '/api/devices/' + encodeURIComponent(currentDeviceId) + '/firmware',
+        { method: 'POST',
+          headers: {
+            'Authorization': 'Bearer ' + authToken,
+            'Content-Type': 'application/octet-stream',
+          },
+          body: file });
+      if (!upR.ok) {
+        const err = await upR.json().catch(() => ({}));
+        setFwStatus('Upload failed: ' + (err.error || ('HTTP ' + upR.status)), 'err');
+        return;
+      }
+      const upJ = await upR.json();
+      setFwStatus('Uploaded (sha ' + upJ.sha256.slice(0, 12) + '…). Telling device to fetch…');
+      // Now trigger the device-side OTA. URL is the public per-device
+      // endpoint we just populated. The device fetches via HTTPS and
+      // emits cmd.result events with progress; we render those below.
+      const url = location.origin + '/firmware/' +
+                  encodeURIComponent(currentDeviceId) + '/latest.bin';
+      await fetch(
+        '/api/devices/' + encodeURIComponent(currentDeviceId) + '/cmd',
+        { method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + authToken,
+          },
+          body: JSON.stringify({ cmd: 'firmware.update', id: 'fwup-' + Date.now(), url }) });
+      setFwStatus('Update started — watch progress below…');
+    } catch (e) {
+      setFwStatus('Network error: ' + (e?.message || e), 'err');
+    }
+  }
+  function setFwStatus(text, kind) {
+    if (!fields.fwStatus) return;
+    fields.fwStatus.textContent = text;
+    fields.fwStatus.className = 'fw-status ' + (kind || '');
   }
 
   // Confirms then issues DELETE /sessions/:sid. On success, navigates

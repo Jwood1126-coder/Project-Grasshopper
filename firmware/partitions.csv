@@ -1,7 +1,17 @@
-# ESP32-S3, 8MB flash. Phase 2 layout: factory app + nvs + littlefs.
-# OTA + signed images land in phase 8.
+# ESP32-S3, 8MB flash. OTA layout: two interchangeable app slots
+# (ota_0 / ota_1) toggled by otadata. Bootloader picks whichever
+# otadata says is active, with optional rollback to the previous
+# slot when the new image fails to mark itself valid in time
+# (CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE).
+#
+# Replacing the old factory-only layout requires ONE flash over USB
+# to lay this down; everything after that can be done OTA via the
+# dashboard's Update Firmware button.
+#
 # Name,     Type, SubType,  Offset,    Size,     Flags
 nvs,        data, nvs,      0x9000,    0x6000,
-phy_init,   data, phy,      0xf000,    0x1000,
-factory,    app,  factory,  0x10000,   3M,
+otadata,    data, ota,      ,          0x2000,
+phy_init,   data, phy,      ,          0x1000,
+ota_0,      app,  ota_0,    0x20000,   3M,
+ota_1,      app,  ota_1,    ,          3M,
 littlefs,   data, spiffs,   ,          512K,

@@ -239,6 +239,65 @@ app.get('/api/devices/:id/sessions/:sid', async (c) => {
   }
 })
 
+// ---- OTA firmware ----------------------------------------------------
+//
+// Two-step flow:
+//   1. UI POSTs the .bin to /api/devices/:id/firmware  (Bearer required)
+//      → relay holds it in memory + computes sha256
+//   2. UI then POSTs cmd 'firmware.update' with url pointing to
+//      /firmware/:id/latest.bin  (no Bearer — device fetches via HTTPS)
+//   3. Device's OTA worker streams it down, writes to inactive slot,
+//      reboots, and (per ota_pending_verify_arm) marks the new image
+//      valid only once the relay has reconnected for ~15 s.
+//
+// Stays in memory only — survives until the next deploy (Bun restarts)
+// or until another upload replaces it. That's fine: the OTA download
+// completes in <1 min on a working WiFi link.
+
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  // Copy into a fresh ArrayBuffer so crypto.subtle's BufferSource
+  // overload accepts it (lib.dom now distinguishes ArrayBuffer vs
+  // SharedArrayBuffer; bytes.buffer can be either).
+  const ab = new ArrayBuffer(bytes.byteLength)
+  new Uint8Array(ab).set(bytes)
+  const buf = await crypto.subtle.digest('SHA-256', ab)
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+app.post('/api/devices/:id/firmware', async (c) => {
+  const auth = requireBearer(c); if (auth !== true) return auth
+  const d = store.get(c.req.param('id'))
+  if (!d) return c.json({ error: 'unknown device' }, 404)
+  // Accept the body as raw bytes (browser will send the file blob
+  // directly with Content-Type: application/octet-stream).
+  const arr = new Uint8Array(await c.req.arrayBuffer())
+  if (arr.byteLength < 32 * 1024 || arr.byteLength > 4 * 1024 * 1024) {
+    return c.json({ error: `bad firmware size (${arr.byteLength} B)` }, 400)
+  }
+  // ESP32 image header: magic 0xE9 at offset 0.
+  if (arr[0] !== 0xE9) {
+    return c.json({ error: 'not an ESP32 app image (bad magic)' }, 400)
+  }
+  const sha256 = await sha256Hex(arr)
+  d.pendingFirmware = { bytes: arr, sha256, uploadedMs: Date.now() }
+  return c.json({ ok: true, bytes: arr.byteLength, sha256 })
+})
+
+// Public so the device can fetch over HTTPS without managing the
+// Bearer token in firmware. Each binary is per-device + ephemeral.
+app.get('/firmware/:id/latest.bin', (c) => {
+  const d = store.get(c.req.param('id'))
+  if (!d || !d.pendingFirmware) return c.text('no pending firmware', 404)
+  return new Response(d.pendingFirmware.bytes, {
+    headers: {
+      'Content-Type':   'application/octet-stream',
+      'Cache-Control':  'no-store',
+      'X-FW-SHA256':    d.pendingFirmware.sha256,
+      'X-FW-Bytes':     String(d.pendingFirmware.bytes.byteLength),
+    },
+  })
+})
+
 // DELETE — recursively removes a session directory on the device's SD.
 // Idempotent: returns success if the session no longer exists.
 // Refuses if a timelapse is currently writing into this session.

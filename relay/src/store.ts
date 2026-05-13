@@ -29,6 +29,9 @@ export interface DeviceRecord {
   events: EventEntry[]
   previewVis?: PreviewFrame
   previewTherm?: PreviewFrame
+  // Latest uploaded firmware blob — held in memory only so it survives
+  // until the OTA worker on the device finishes pulling it. Big (~1.5 MB).
+  pendingFirmware?: { bytes: Uint8Array; sha256: string; uploadedMs: number }
 }
 
 export interface LogEntry {

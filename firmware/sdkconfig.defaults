@@ -52,6 +52,15 @@ CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
 
+# OTA: rollback safety. The new image boots in pending-verify state;
+# our app calls esp_ota_mark_app_valid_cancel_rollback() once it has
+# proven itself (relay reconnected). If we never call it, the
+# bootloader rolls back to the previous slot on the next boot.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+# Boot-anti-rollback would block downgrades by version; leave OFF
+# until we're signing builds.
+# CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK is not set
+
 # Logging
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_LOG_MAXIMUM_LEVEL_INFO=y

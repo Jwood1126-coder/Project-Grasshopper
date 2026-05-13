@@ -34,6 +34,7 @@
 
 #include "capture.h"
 #include "sessions.h"
+#include "ota.h"
 #include "cJSON.h"
 
 // Lepton frame geometry — 160x120 raw uint16.
@@ -599,6 +600,27 @@ static net_relay_cmd_status_t app_cmd_handler(const char *cmd, const char *id,
         snprintf(msg_out, msg_cap, "queued");
         return NET_RELAY_CMD_DEFERRED;
     }
+    if (strcmp(cmd, "firmware.update") == 0) {
+        // Payload: { url: "https://…/grasshopper.bin" }. Spawns an
+        // OTA worker that streams the binary into the inactive slot,
+        // verifies, and reboots. cmd.result events report progress
+        // and final outcome.
+        const char *url = NULL;
+        if (payload) {
+            const cJSON *u = cJSON_GetObjectItemCaseSensitive(payload, "url");
+            if (cJSON_IsString(u)) url = u->valuestring;
+        }
+        if (!url || !*url) {
+            snprintf(msg_out, msg_cap, "missing url");
+            return NET_RELAY_CMD_FAIL;
+        }
+        if (ota_start_https(id, url) != ESP_OK) {
+            snprintf(msg_out, msg_cap, "ota start failed");
+            return NET_RELAY_CMD_FAIL;
+        }
+        snprintf(msg_out, msg_cap, "ota started");
+        return NET_RELAY_CMD_DEFERRED;
+    }
     if (strcmp(cmd, "sessions.delete") == 0) {
         const char *sid = NULL;
         if (payload) {
@@ -677,6 +699,12 @@ void app_main(void) {
     ESP_LOGI(TAG, "starting relay → %s", CONFIG_GRASSHOPPER_RELAY_URL);
     net_relay_register_cmd_handler(app_cmd_handler);
     ESP_ERROR_CHECK(net_relay_start());
+    // OTA pending-verify watchdog: if this image is awaiting validation
+    // (just booted from a fresh OTA), wait until the relay has been
+    // connected for ~15 s before marking the image as known-good.
+    // Anything that crashes / blocks the relay before then triggers
+    // a rollback to the previous slot on next boot.
+    ota_pending_verify_arm(15000);
 #else
     ESP_LOGI(TAG, "relay disabled (CONFIG_GRASSHOPPER_RELAY_ENABLED=n)");
 #endif
