@@ -2285,9 +2285,9 @@ export const USER_UI_HTML = `<!doctype html>
   // back to Library and triggers a reload so the deleted card vanishes.
   async function deleteSession(sid) {
     if (!currentDeviceId) { toast('No device connected', 'err'); return; }
-    // \\n becomes \n in the served JS — a bare \n in this template
-    // literal would be interpreted as a real newline by the outer
-    // backtick string and break the inner JavaScript string literal.
+    // The doubled backslash is intentional: any backslash-n inside
+    // this template literal would otherwise become a real newline in
+    // the served JS and split the inner string literal in two.
     if (!confirm('Delete ' + sid + ' from the device?\\nThis removes all of its files and cannot be undone.')) {
       return;
     }
