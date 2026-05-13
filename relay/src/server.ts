@@ -227,6 +227,23 @@ app.get('/api/devices/:id/sessions/:sid', async (c) => {
   }
 })
 
+// DELETE — recursively removes a session directory on the device's SD.
+// Idempotent: returns success if the session no longer exists.
+// Refuses if a timelapse is currently writing into this session.
+app.delete('/api/devices/:id/sessions/:sid', async (c) => {
+  const auth = requireBearer(c); if (auth !== true) return auth
+  const sid = c.req.param('sid')
+  if (!SESSION_ID_RE.test(sid)) return c.json({ error: 'bad sessionId' }, 400)
+  try {
+    const data = await executeCmd(c.req.param('id'), 'sessions.delete', {
+      sessionId: sid,
+    }, 15000)
+    return c.json({ ok: true, data: data ?? {} })
+  } catch (msg) {
+    return c.json({ error: String(msg) }, 502)
+  }
+})
+
 // File fetch — loops session.read_file chunks until eof, decodes base64,
 // returns binary. Small in-memory LRU cache so repeated thumbnail loads
 // don't hit the device every time. Cache is byte-bounded; entries are

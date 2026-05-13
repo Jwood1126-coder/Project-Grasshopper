@@ -565,12 +565,15 @@ export const USER_UI_HTML = `<!doctype html>
     display: flex; align-items: center; gap: 12px; margin-bottom: 16px;
     flex-wrap: wrap;
   }
-  .detail-header .back {
+  .detail-header .back, .detail-header .dh-btn {
     background: var(--surface-2); border: 1px solid var(--border);
     color: var(--text); padding: 6px 12px; border-radius: 6px;
     cursor: pointer; font-size: 13px;
   }
-  .detail-header .back:hover { border-color: var(--accent); }
+  .detail-header .back:hover, .detail-header .dh-btn:hover { border-color: var(--accent); }
+  .detail-header .dh-btn.danger { color: var(--err); }
+  .detail-header .dh-btn.danger:hover { border-color: var(--err); background: rgba(255, 80, 80, 0.06); }
+  .detail-header .dh-spacer { flex: 1; }
   .detail-header h2 {
     margin: 0; font: 600 16px/1 ui-monospace, monospace;
   }
@@ -1848,14 +1851,71 @@ export const USER_UI_HTML = `<!doctype html>
     }
   }
 
+  // Trigger many downloads sequentially with a small delay so the
+  // browser doesn't rate-limit / drop. Toasts progress.
+  async function bulkDownload(items) {
+    let ok = 0, fail = 0;
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      try {
+        await authDownload(it.url, it.filename);
+        ok++;
+      } catch { fail++; }
+      // 200 ms gap is enough for Chrome/Firefox not to throttle.
+      if (i < items.length - 1) {
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      if ((ok + fail) % 5 === 0 || (ok + fail) === items.length) {
+        toast('Downloading… ' + (ok + fail) + '/' + items.length, 'ok');
+      }
+    }
+  }
+
   // Show a small menu of file-download options anchored near a button.
-  // closes on outside click + Esc.
+  // When multiple captures are passed, prepends "All …" entries that
+  // bulk-download each modality across every capture in the list.
+  // Closes on outside click + Esc.
   function openDownloadMenu(anchor, captures, sessionId) {
     closeDownloadMenu();
     const baseUrl = (file) => '/api/devices/' + encodeURIComponent(currentDeviceId) +
                               '/sessions/' + encodeURIComponent(sessionId) +
                               '/file/' + file;
+
+    const visAll   = captures.filter((c) => c.visOk).map((c) => ({
+      url: baseUrl(c.visFile),                          filename: sessionId + '_' + c.visFile,
+    }));
+    const thermAll = captures.filter((c) => c.thermOk).map((c) => ({
+      url: baseUrl(c.thermFile),                        filename: sessionId + '_' + c.thermFile,
+    }));
+    const rawAll   = captures.filter((c) => c.thermOk).map((c) => ({
+      url: baseUrl(pad6(c.seq) + '_therm.raw16'),       filename: sessionId + '_' + pad6(c.seq) + '_therm.raw16',
+    }));
+    const sideAll  = captures.filter((c) => c.thermOk).map((c) => ({
+      url: baseUrl(pad6(c.seq) + '_therm.json'),        filename: sessionId + '_' + pad6(c.seq) + '_therm.json',
+    }));
+
     const items = [];
+    // Session-level metadata always available.
+    items.push({
+      label: 'session.json', sub: 'session-level metadata',
+      url: baseUrl('session.json'), filename: sessionId + '_session.json',
+    });
+    items.push({
+      label: 'captures.jsonl', sub: 'per-capture log',
+      url: baseUrl('captures.jsonl'), filename: sessionId + '_captures.jsonl',
+    });
+
+    if (captures.length > 1) {
+      if (visAll.length)   items.push({ bulk: visAll,
+        label: 'All visible JPEGs',  sub: visAll.length + ' files' });
+      if (thermAll.length) items.push({ bulk: thermAll,
+        label: 'All thermal JPEGs',  sub: thermAll.length + ' files' });
+      if (rawAll.length)   items.push({ bulk: rawAll,
+        label: 'All thermal raw16',  sub: rawAll.length + ' lossless frames' });
+      if (sideAll.length)  items.push({ bulk: sideAll,
+        label: 'All thermal sidecars', sub: sideAll.length + ' JSON files' });
+    }
+
     for (const c of captures) {
       const tag = '#' + c.seq + ' ';
       if (c.visOk) items.push({
@@ -1884,7 +1944,11 @@ export const USER_UI_HTML = `<!doctype html>
     for (const it of items) {
       menu.appendChild(el('button', {
         class: 'dl-item',
-        onclick: () => { closeDownloadMenu(); authDownload(it.url, it.filename); },
+        onclick: () => {
+          closeDownloadMenu();
+          if (it.bulk) bulkDownload(it.bulk);
+          else         authDownload(it.url, it.filename);
+        },
       }, it.label, el('span', { class: 'dl-sub' }, it.sub)));
     }
     document.body.appendChild(menu);
@@ -2165,9 +2229,23 @@ export const USER_UI_HTML = `<!doctype html>
 
   function buildDetailView(sid) {
     const v = el('div', {});
+    const dlBtn = el('button', { class: 'dh-btn',
+      title: 'Download files for any capture in this session',
+      onclick: (e) => {
+        if (detailCaptureList.length === 0) return;
+        // Open the download menu over ALL captures so the user can grab
+        // any individual file. Saves a click vs visiting each tile.
+        openDownloadMenu(e.currentTarget, detailCaptureList, sid);
+      } }, '⬇ Files');
+    const delBtn = el('button', { class: 'dh-btn danger',
+      title: 'Delete this session from the device SD',
+      onclick: () => deleteSession(sid) }, '🗑 Delete');
     const header = el('div', { class: 'detail-header' },
       el('button', { class: 'back', onclick: () => setView('library') }, '← Library'),
-      el('h2', {}, sid));
+      el('h2', {}, sid),
+      el('div', { class: 'dh-spacer' }),
+      dlBtn,
+      delBtn);
     const meta = el('div', { class: 'detail-meta', id: 'detail-meta' });
     const grid = el('div', { class: 'capture-grid', id: 'capture-grid' });
     grid.appendChild(el('div', { class: 'empty-library' }, 'Loading…'));
@@ -2175,6 +2253,38 @@ export const USER_UI_HTML = `<!doctype html>
     v.appendChild(meta);
     v.appendChild(grid);
     return v;
+  }
+
+  // Confirms then issues DELETE /sessions/:sid. On success, navigates
+  // back to Library and triggers a reload so the deleted card vanishes.
+  async function deleteSession(sid) {
+    if (!currentDeviceId) { toast('No device connected', 'err'); return; }
+    if (!confirm('Delete ' + sid + ' from the device?\nThis removes all of its files and cannot be undone.')) {
+      return;
+    }
+    try {
+      const r = await fetch(
+        '/api/devices/' + encodeURIComponent(currentDeviceId) +
+        '/sessions/' + encodeURIComponent(sid),
+        { method: 'DELETE',
+          headers: { 'Authorization': 'Bearer ' + authToken } }
+      );
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        toast('Delete failed: ' + (err.error || ('HTTP ' + r.status)), 'err');
+        return;
+      }
+      toast(sid + ' deleted', 'ok');
+      // Drop the cached entry so an immediate library nav doesn't
+      // briefly re-show the dead session.
+      lastSessions = lastSessions.filter((s) => s.sessionId !== sid);
+      setView('library');
+      // Force a refresh from device too, in case multiple sessions
+      // were affected (shouldn't happen in v1, but cheap).
+      loadLibrary();
+    } catch (e) {
+      toast('Network error during delete: ' + (e?.message || e), 'err');
+    }
   }
 
   async function loadDetail(sid) {

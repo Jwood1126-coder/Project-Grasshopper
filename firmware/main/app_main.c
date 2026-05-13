@@ -599,6 +599,23 @@ static net_relay_cmd_status_t app_cmd_handler(const char *cmd, const char *id,
         snprintf(msg_out, msg_cap, "queued");
         return NET_RELAY_CMD_DEFERRED;
     }
+    if (strcmp(cmd, "sessions.delete") == 0) {
+        const char *sid = NULL;
+        if (payload) {
+            const cJSON *s = cJSON_GetObjectItemCaseSensitive(payload, "sessionId");
+            if (cJSON_IsString(s)) sid = s->valuestring;
+        }
+        if (!sid) {
+            snprintf(msg_out, msg_cap, "missing sessionId");
+            return NET_RELAY_CMD_FAIL;
+        }
+        if (sessions_enqueue_delete(id, sid) != ESP_OK) {
+            snprintf(msg_out, msg_cap, "sessions queue full");
+            return NET_RELAY_CMD_FAIL;
+        }
+        snprintf(msg_out, msg_cap, "queued");
+        return NET_RELAY_CMD_DEFERRED;
+    }
     if (strcmp(cmd, "session.read_file") == 0) {
         const char *sid = NULL, *fn = NULL;
         uint32_t off = 0, mlen = 0;

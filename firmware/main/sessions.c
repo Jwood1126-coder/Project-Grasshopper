@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>     // unlink, rmdir
 
 #include "cJSON.h"
 #include "esp_heap_caps.h"
@@ -16,6 +17,7 @@
 #include "freertos/task.h"
 #include "mbedtls/base64.h"
 
+#include "capture.h"
 #include "hal_storage.h"
 #include "net_relay.h"
 
@@ -35,6 +37,7 @@ typedef enum {
     SESS_REQ_LIST,
     SESS_REQ_GET,
     SESS_REQ_READ_FILE,
+    SESS_REQ_DELETE,
 } sess_req_type_t;
 
 typedef struct {
@@ -58,6 +61,7 @@ static const char *req_cmd_name(sess_req_type_t t) {
         case SESS_REQ_LIST:      return "sessions.list";
         case SESS_REQ_GET:       return "sessions.get";
         case SESS_REQ_READ_FILE: return "session.read_file";
+        case SESS_REQ_DELETE:    return "sessions.delete";
     }
     return "sessions.?";
 }
@@ -407,6 +411,74 @@ static void do_read_file(const sess_req_t *req) {
     free(json);
 }
 
+static void do_delete(const sess_req_t *req) {
+    if (!safe_name(req->session_id)) {
+        net_relay_emit_cmd_result(req_cmd_name(req->type), req->cmd_id,
+                                   false, "bad sessionId", NULL);
+        return;
+    }
+    // Refuse if a timelapse is currently writing into this session.
+    timelapse_status_t tl = {0};
+    timelapse_get_status(&tl);
+    if (tl.active && strcmp(tl.session_id, req->session_id) == 0) {
+        net_relay_emit_cmd_result(req_cmd_name(req->type), req->cmd_id,
+                                   false, "session is currently being recorded — stop timelapse first",
+                                   NULL);
+        return;
+    }
+    if (!hal_storage_sd_present()) {
+        net_relay_emit_cmd_result(req_cmd_name(req->type), req->cmd_id,
+                                   false, "SD not mounted", NULL);
+        return;
+    }
+    if (!hal_storage_sd_lock(5000)) {
+        net_relay_emit_cmd_result(req_cmd_name(req->type), req->cmd_id,
+                                   false, "SD lock timeout", NULL);
+        return;
+    }
+
+    char dir[200];
+    snprintf(dir, sizeof(dir), "%s/%s", SESSIONS_BASE_DIR, req->session_id);
+
+    // Iterate the directory, unlink every entry. Sessions hold only
+    // flat files (no nested dirs in our schema), so a single pass is
+    // enough. Tolerate a missing directory — return success in that
+    // case so callers can be idempotent.
+    DIR *d = opendir(dir);
+    uint32_t removed = 0, failed = 0;
+    if (d) {
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            if (ent->d_name[0] == '.' &&
+                (ent->d_name[1] == 0 ||
+                 (ent->d_name[1] == '.' && ent->d_name[2] == 0))) continue;
+            char path[480];
+            snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
+            if (unlink(path) == 0) removed++;
+            else                   failed++;
+        }
+        closedir(d);
+    }
+    int rmrc = rmdir(dir);
+    int rmerr = errno;
+    hal_storage_sd_unlock();
+
+    char msg[140];
+    if (rmrc == 0 || (!d && rmrc != 0 && rmerr == ENOENT)) {
+        snprintf(msg, sizeof(msg), "%s deleted (%lu files)",
+                 req->session_id, (unsigned long)removed);
+        net_relay_emit_cmd_result(req_cmd_name(req->type), req->cmd_id,
+                                   true, msg, NULL);
+    } else {
+        snprintf(msg, sizeof(msg),
+                 "%s rmdir failed (errno=%d, %lu files removed, %lu failed)",
+                 req->session_id, rmerr,
+                 (unsigned long)removed, (unsigned long)failed);
+        net_relay_emit_cmd_result(req_cmd_name(req->type), req->cmd_id,
+                                   false, msg, NULL);
+    }
+}
+
 // ───────────── worker task ─────────────
 
 static void worker_task(void *arg) {
@@ -419,6 +491,7 @@ static void worker_task(void *arg) {
             case SESS_REQ_LIST:      do_list(&req); break;
             case SESS_REQ_GET:       do_get(&req); break;
             case SESS_REQ_READ_FILE: do_read_file(&req); break;
+            case SESS_REQ_DELETE:    do_delete(&req); break;
         }
     }
 }
@@ -470,5 +543,12 @@ esp_err_t sessions_enqueue_read_file(const char *cmd_id,
     if (cmd_id)     snprintf(r.cmd_id,     sizeof(r.cmd_id),     "%s", cmd_id);
     if (session_id) snprintf(r.session_id, sizeof(r.session_id), "%s", session_id);
     if (filename)   snprintf(r.filename,   sizeof(r.filename),   "%s", filename);
+    return enqueue(&r);
+}
+
+esp_err_t sessions_enqueue_delete(const char *cmd_id, const char *session_id) {
+    sess_req_t r = { .type = SESS_REQ_DELETE };
+    if (cmd_id)     snprintf(r.cmd_id,    sizeof(r.cmd_id),    "%s", cmd_id);
+    if (session_id) snprintf(r.session_id, sizeof(r.session_id), "%s", session_id);
     return enqueue(&r);
 }

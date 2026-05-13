@@ -36,6 +36,11 @@ esp_err_t sessions_enqueue_read_file(const char *cmd_id,
                                       const char *filename,
                                       uint32_t offset, uint32_t max_len);
 
+// Enqueue a sessions.delete request. Recursively removes the session
+// directory (including .raw16/.json sidecars). Refuses to delete a
+// session that's currently being written to by an active timelapse.
+esp_err_t sessions_enqueue_delete(const char *cmd_id, const char *session_id);
+
 #ifdef __cplusplus
 }
 #endif
