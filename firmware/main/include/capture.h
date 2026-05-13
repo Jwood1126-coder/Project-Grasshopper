@@ -35,14 +35,20 @@ extern "C" {
 size_t capture_encode_thermal_jpeg(uint8_t *dst, size_t cap);
 
 // Per-frame thermal temperature stats from the most recent encode.
-// Values are in centi-Kelvin (raw Lepton TLinear=1 output assuming
-// 0.01K resolution — the default; we don't yet handle the auto-switch
-// to 0.1K when the scene exceeds 16-bit dynamic range). Caller can
-// pass NULL for any field it doesn't want.
+// Returns RAW Lepton counts; caller multiplies by the active TLinear
+// resolution scale (queried via lepton_cci_get_tlinear_state) to get
+// centi-Kelvin. With resolution=1 (default) raw counts ARE centi-K.
 //   centi-K to °C: ck / 100 - 273.15
 //   centi-K to °F: (ck/100 - 273.15) * 9/5 + 32
 void capture_get_last_thermal_temps_ck(uint32_t *min_ck, uint32_t *max_ck,
                                         uint32_t *center_ck);
+
+// Snapshot the most recent committed thermal frame as raw uint16
+// pixels (always 160 × 120, pre-rotation, the Lepton's native
+// orientation). dst_bytes must be ≥ 38400. Returns false if no frame
+// has been encoded yet. Used by timelapse/single-capture to save a
+// .raw16 sidecar for offline reprocessing.
+bool capture_snapshot_thermal_raw(uint16_t *dst, size_t dst_bytes);
 
 // Thermal rotation applied during JPEG encode. Affects both preview
 // and recorded captures. Argument is 0/1/2/3 → 0/90/180/270 CW.

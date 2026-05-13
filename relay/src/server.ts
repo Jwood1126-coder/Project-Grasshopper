@@ -130,7 +130,7 @@ app.post('/api/devices/:id/cmd', async (c) => {
 // firmware itself produces. Prevents path traversal at the relay layer
 // even before the firmware's own check runs.
 const SESSION_ID_RE       = /^session_[0-9]+$/
-const SESSION_FILENAME_RE = /^(session\.json|captures\.jsonl|[0-9]{6}_(vis|therm)\.jpg)$/
+const SESSION_FILENAME_RE = /^(session\.json|captures\.jsonl|[0-9]{6}_(vis|therm)\.jpg|[0-9]{6}_therm\.(raw16|json))$/
 
 interface PendingCmd {
   resolve: (data: unknown, msg: string) => void

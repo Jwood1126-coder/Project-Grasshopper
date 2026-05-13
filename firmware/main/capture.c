@@ -29,6 +29,34 @@
 #include "hal_lepton.h"
 #include "hal_storage.h"
 
+// Forward decl: scale used to convert raw counts → centi-Kelvin given
+// the active TLinear resolution. resolution=0 → 10 cK/count (0.1K),
+// resolution=1 → 1 cK/count (0.01K).
+static inline int tlinear_scale_x100(uint16_t res) { return (res == 1) ? 1 : 10; }
+static inline double raw_to_F_with_scale(uint32_t raw, int scale_x100) {
+    double cK = (double)raw * (double)scale_x100;
+    double C  = cK / 100.0 - 273.15;
+    return C * 9.0 / 5.0 + 32.0;
+}
+
+// Forward decls — capture_now (single-shot) appears earlier in this
+// file than the timelapse helpers it shares.
+typedef struct {
+    bool     valid;
+    uint32_t min_raw;
+    uint32_t max_raw;
+    uint32_t center_raw;
+    uint16_t resolution;
+} therm_stats_t;
+
+static void write_thermal_sidecars(const char *session_dir, uint32_t seq,
+                                    const uint16_t *raw_frame,
+                                    const therm_stats_t *ts,
+                                    bool tlinear_active, bool tlinear_auto_res,
+                                    uint8_t therm_rotation,
+                                    uint32_t last_ffc_ms,
+                                    bool agc_enabled, int gain_mode);
+
 static const char *TAG = "capture";
 
 #define LEP_W       160
@@ -96,6 +124,16 @@ void capture_get_last_thermal_temps_ck(uint32_t *min_ck, uint32_t *max_ck,
     if (min_ck)    *min_ck    = s_last_temps_valid ? s_last_min_raw    : 0;
     if (max_ck)    *max_ck    = s_last_temps_valid ? s_last_max_raw    : 0;
     if (center_ck) *center_ck = s_last_temps_valid ? s_last_center_raw : 0;
+}
+
+bool capture_snapshot_thermal_raw(uint16_t *dst, size_t dst_bytes) {
+    if (!dst || dst_bytes < (size_t)(LEP_PIXELS * sizeof(uint16_t))) return false;
+    if (!s_therm_raw || !s_therm_enc_mutex) return false;
+    if (!s_last_temps_valid) return false;
+    if (xSemaphoreTake(s_therm_enc_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) return false;
+    memcpy(dst, s_therm_raw, LEP_PIXELS * sizeof(uint16_t));
+    xSemaphoreGive(s_therm_enc_mutex);
+    return true;
 }
 
 void capture_set_thermal_rotation(uint8_t r) { s_therm_rotation = (uint8_t)(r & 3); }
@@ -371,6 +409,24 @@ esp_err_t capture_now(char *session_id_out, size_t session_id_cap,
         ESP_LOGW(TAG, "thermal encode skipped — no frame yet");
     }
 
+    // Snapshot temp stats + raw frame for sidecar writes (same frame as
+    // the JPEG encode above, before any subsequent encoder call).
+    therm_stats_t ts = {0};
+    uint16_t *raw_snap = NULL;
+    bool tl_active = false, tl_auto = false; uint16_t tl_res = 0;
+    if (therm_ok) {
+        capture_get_last_thermal_temps_ck(&ts.min_raw, &ts.max_raw, &ts.center_raw);
+        lepton_cci_get_tlinear_state(&tl_active, &tl_auto, &tl_res);
+        ts.resolution = tl_res;
+        ts.valid = (tl_active && ts.max_raw > 0);
+        if (ts.valid) {
+            raw_snap = heap_caps_malloc(LEP_PIXELS * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+            if (raw_snap && !capture_snapshot_thermal_raw(raw_snap, LEP_PIXELS * sizeof(uint16_t))) {
+                free(raw_snap); raw_snap = NULL;
+            }
+        }
+    }
+
     // Now hold the SD lock while we mkdir + write all files atomically.
     if (!hal_storage_sd_lock(5000)) {
         free(vis_copy);
@@ -422,8 +478,18 @@ esp_err_t capture_now(char *session_id_out, size_t session_id_cap,
         therm_write_err = write_file_sd_locked(path, therm_jpg, therm_len);
     }
 
+    // Sidecars: .raw16 + .json — only when thermal succeeded + radiometric on.
+    if (therm_ok && ts.valid) {
+        write_thermal_sidecars(session_dir, /*seq*/ 1, raw_snap, &ts,
+                                tl_active, tl_auto,
+                                capture_get_thermal_rotation(),
+                                /*last_ffc_ms*/ 0,
+                                hal_lepton_agc_enabled(),
+                                hal_lepton_gain_mode());
+    }
+
     {
-        char meta[512];
+        char meta[768];
         int meta_len = snprintf(meta, sizeof(meta),
             "{\"sessionId\":\"session_%lu\","
              "\"intervalSec\":0,"
@@ -433,13 +499,35 @@ esp_err_t capture_now(char *session_id_out, size_t session_id_cap,
              "\"captureTherm\":%s,"
              "\"mode\":\"single\","
              "\"complete\":true,"
-             "\"durationSec\":0}",
+             "\"durationSec\":0",
             (unsigned long)sid, (unsigned long)time(NULL),
             therm_ok ? "true" : "false");
+        if (ts.valid) {
+            int sx = tlinear_scale_x100(ts.resolution);
+            int n = snprintf(meta + meta_len, sizeof(meta) - meta_len,
+                ",\"tempStats\":{"
+                  "\"minRaw\":%lu,\"maxRaw\":%lu,\"avgCenterRaw\":%lu,"
+                  "\"tlinearResolution\":%u,"
+                  "\"minTempF\":%.2f,\"maxTempF\":%.2f,\"avgCenterTempF\":%.2f"
+                "}",
+                (unsigned long)ts.min_raw,
+                (unsigned long)ts.max_raw,
+                (unsigned long)ts.center_raw,
+                (unsigned)ts.resolution,
+                raw_to_F_with_scale(ts.min_raw,    sx),
+                raw_to_F_with_scale(ts.max_raw,    sx),
+                raw_to_F_with_scale(ts.center_raw, sx));
+            if (n > 0 && meta_len + n < (int)sizeof(meta)) meta_len += n;
+        }
+        if (meta_len + 2 < (int)sizeof(meta)) {
+            meta[meta_len++] = '}';
+            meta[meta_len]   = '\0';
+        }
         snprintf(path, sizeof(path), "%s/session.json", session_dir);
         hal_storage_sd_atomic_write(path, meta, (size_t)meta_len);
 
-        char cap_log[256];
+        // captures.jsonl: hand-build a row with the new temp fields.
+        char cap_log[384];
         int cap_log_len = snprintf(cap_log, sizeof(cap_log),
             "{\"seq\":1,"
              "\"sessionMs\":0,"
@@ -447,12 +535,32 @@ esp_err_t capture_now(char *session_id_out, size_t session_id_cap,
              "\"thermOk\":%s,"
              "\"visBytes\":%u,"
              "\"thermBytes\":%u,"
-             "\"timestamp\":%lu}\n",
+             "\"timestamp\":%lu",
             vis_write_err == ESP_OK ? "true" : "false",
             therm_write_err == ESP_OK && therm_ok ? "true" : "false",
             (unsigned)vis_len,
             (unsigned)(therm_ok ? therm_len : 0),
             (unsigned long)time(NULL));
+        if (ts.valid) {
+            int sx = tlinear_scale_x100(ts.resolution);
+            int n = snprintf(cap_log + cap_log_len, sizeof(cap_log) - cap_log_len,
+                ",\"minRaw\":%lu,\"maxRaw\":%lu,\"centerRaw\":%lu,"
+                "\"tlinearResolution\":%u,"
+                "\"minTempF\":%.2f,\"maxTempF\":%.2f,\"centerTempF\":%.2f",
+                (unsigned long)ts.min_raw,
+                (unsigned long)ts.max_raw,
+                (unsigned long)ts.center_raw,
+                (unsigned)ts.resolution,
+                raw_to_F_with_scale(ts.min_raw,    sx),
+                raw_to_F_with_scale(ts.max_raw,    sx),
+                raw_to_F_with_scale(ts.center_raw, sx));
+            if (n > 0 && cap_log_len + n < (int)sizeof(cap_log)) cap_log_len += n;
+        }
+        if (cap_log_len + 3 < (int)sizeof(cap_log)) {
+            cap_log[cap_log_len++] = '}';
+            cap_log[cap_log_len++] = '\n';
+            cap_log[cap_log_len]   = '\0';
+        }
         snprintf(path, sizeof(path), "%s/captures.jsonl", session_dir);
         write_file_sd_locked(path, cap_log, (size_t)cap_log_len);
     }
@@ -460,6 +568,7 @@ esp_err_t capture_now(char *session_id_out, size_t session_id_cap,
     hal_storage_sd_unlock();
     free(vis_copy);
     free(therm_jpg);
+    if (raw_snap) free(raw_snap);
 
     if (session_id_out && session_id_cap > 0) {
         snprintf(session_id_out, session_id_cap, "session_%lu", (unsigned long)sid);
@@ -500,14 +609,24 @@ static volatile bool     s_tl_capture_therm = true;
 // 0 = run until manually stopped. Otherwise the loop exits cleanly
 // (writing complete=true to session.json) once elapsed crosses this.
 static volatile uint32_t s_tl_max_duration_sec = 0;
+// Per-session radiometric aggregates (raw Lepton counts).
+// minSession = min over all captures' minRaw; maxSession = max over
+// all captures' maxRaw; sumCenter / count → mean center temp.
+static volatile uint32_t s_tl_min_session    = 0xFFFFFFFFu;
+static volatile uint32_t s_tl_max_session    = 0;
+static volatile uint64_t s_tl_sum_center_raw = 0;
 
 static void ensure_tl_mutex(void) {
     if (!s_tl_mutex) s_tl_mutex = xSemaphoreCreateMutex();
 }
 
 // Append to captures.jsonl; caller must hold sd_lock.
+// therm_stats_t is forward-declared near the top of this file so
+// capture_now (which precedes the timelapse helpers) can reference it.
+
 static void tl_append_capture_log(uint32_t seq, bool vis_ok, size_t vis_len,
-                                   bool therm_ok, size_t therm_len) {
+                                   bool therm_ok, size_t therm_len,
+                                   const therm_stats_t *ts) {
     char path[160];
     snprintf(path, sizeof(path), "%s/captures.jsonl", s_tl_session_dir);
     FILE *f = fopen(path, "a");
@@ -519,7 +638,7 @@ static void tl_append_capture_log(uint32_t seq, bool vis_ok, size_t vis_len,
          "\"thermOk\":%s,"
          "\"visBytes\":%u,"
          "\"thermBytes\":%u,"
-         "\"timestamp\":%lu}\n",
+         "\"timestamp\":%lu",
         (unsigned long)seq,
         (unsigned long long)((esp_timer_get_time() / 1000) - s_tl_started_ms),
         vis_ok    ? "true" : "false",
@@ -527,6 +646,85 @@ static void tl_append_capture_log(uint32_t seq, bool vis_ok, size_t vis_len,
         (unsigned)vis_len,
         (unsigned)therm_len,
         (unsigned long)time(NULL));
+    if (ts && ts->valid) {
+        int sx = tlinear_scale_x100(ts->resolution);
+        fprintf(f,
+            ",\"minRaw\":%lu,\"maxRaw\":%lu,\"centerRaw\":%lu,"
+            "\"tlinearResolution\":%u,"
+            "\"minTempF\":%.2f,\"maxTempF\":%.2f,\"centerTempF\":%.2f",
+            (unsigned long)ts->min_raw,
+            (unsigned long)ts->max_raw,
+            (unsigned long)ts->center_raw,
+            (unsigned)ts->resolution,
+            raw_to_F_with_scale(ts->min_raw,    sx),
+            raw_to_F_with_scale(ts->max_raw,    sx),
+            raw_to_F_with_scale(ts->center_raw, sx));
+    }
+    fputs("}\n", f);
+    fclose(f);
+}
+
+// Write the .raw16 and .json sidecars for one thermal capture.
+// .raw16 is 38400 bytes of pre-rotation native-orientation pixels —
+// this is the scientifically useful artifact, lossless and complete
+// (the .jpg loses bits to palette mapping + rotation + JPEG quant).
+// .json captures the metadata needed to interpret the .raw16 later.
+// Caller holds sd_lock.
+static void write_thermal_sidecars(const char *session_dir, uint32_t seq,
+                                    const uint16_t *raw_frame,
+                                    const therm_stats_t *ts,
+                                    bool tlinear_active, bool tlinear_auto_res,
+                                    uint8_t therm_rotation,
+                                    uint32_t last_ffc_ms,
+                                    bool agc_enabled, int gain_mode) {
+    char path[200];
+    if (raw_frame) {
+        snprintf(path, sizeof(path), "%s/%06lu_therm.raw16",
+                 session_dir, (unsigned long)seq);
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            fwrite(raw_frame, sizeof(uint16_t), LEP_PIXELS, f);
+            fclose(f);
+        }
+    }
+    snprintf(path, sizeof(path), "%s/%06lu_therm.json",
+             session_dir, (unsigned long)seq);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    int sx = ts ? tlinear_scale_x100(ts->resolution) : 1;
+    fprintf(f,
+        "{\"seq\":%lu,"
+         "\"timestamp\":%lu,"
+         "\"rawDims\":{\"w\":%d,\"h\":%d},"
+         "\"thermRotation\":%u,"
+         "\"tlinearActive\":%s,"
+         "\"tlinearAutoRes\":%s,"
+         "\"tlinearResolution\":%u,"
+         "\"agcEnabled\":%s,"
+         "\"gainMode\":%d,"
+         "\"lastFFCMs\":%lu",
+        (unsigned long)seq,
+        (unsigned long)time(NULL),
+        LEP_W, LEP_H,
+        (unsigned)therm_rotation,
+        tlinear_active   ? "true" : "false",
+        tlinear_auto_res ? "true" : "false",
+        ts ? (unsigned)ts->resolution : 0u,
+        agc_enabled ? "true" : "false",
+        gain_mode,
+        (unsigned long)last_ffc_ms);
+    if (ts && ts->valid) {
+        fprintf(f,
+            ",\"minRaw\":%lu,\"maxRaw\":%lu,\"centerRaw\":%lu,"
+            "\"minTempF\":%.2f,\"maxTempF\":%.2f,\"centerTempF\":%.2f",
+            (unsigned long)ts->min_raw,
+            (unsigned long)ts->max_raw,
+            (unsigned long)ts->center_raw,
+            raw_to_F_with_scale(ts->min_raw,    sx),
+            raw_to_F_with_scale(ts->max_raw,    sx),
+            raw_to_F_with_scale(ts->center_raw, sx));
+    }
+    fputs("}\n", f);
     fclose(f);
 }
 
@@ -542,7 +740,7 @@ static void tl_write_session_json(bool complete) {
     uint64_t elapsed_sec  = ((esp_timer_get_time() / 1000) - s_tl_started_ms) / 1000;
     uint64_t start_epoch  = now_epoch > elapsed_sec ? now_epoch - elapsed_sec : now_epoch;
 
-    char meta[512];
+    char meta[768];
     int meta_len = snprintf(meta, sizeof(meta),
         "{\"sessionId\":\"%s\","
          "\"intervalSec\":%lu,"
@@ -552,7 +750,7 @@ static void tl_write_session_json(bool complete) {
          "\"captureTherm\":%s,"
          "\"mode\":\"timelapse\","
          "\"complete\":%s,"
-         "\"durationSec\":%llu}",
+         "\"durationSec\":%llu",
         s_tl_session_id,
         (unsigned long)s_tl_interval_sec,
         (unsigned long)s_tl_capture_count,
@@ -561,6 +759,34 @@ static void tl_write_session_json(bool complete) {
         s_tl_capture_therm ? "true" : "false",
         complete ? "true" : "false",
         (unsigned long long)elapsed_sec);
+
+    // Aggregated radiometric stats across the session, when we have any.
+    if (s_tl_capture_count > 0 && s_tl_max_session > 0 &&
+        s_tl_min_session != 0xFFFFFFFFu) {
+        bool tl_active = false, tl_auto = false; uint16_t res = 0;
+        lepton_cci_get_tlinear_state(&tl_active, &tl_auto, &res);
+        int sx = tlinear_scale_x100(res);
+        uint64_t avg_ctr = s_tl_sum_center_raw / s_tl_capture_count;
+        int n = snprintf(meta + meta_len, sizeof(meta) - meta_len,
+            ",\"tempStats\":{"
+              "\"minRaw\":%lu,\"maxRaw\":%lu,\"avgCenterRaw\":%llu,"
+              "\"tlinearResolution\":%u,"
+              "\"minTempF\":%.2f,\"maxTempF\":%.2f,\"avgCenterTempF\":%.2f"
+            "}",
+            (unsigned long)s_tl_min_session,
+            (unsigned long)s_tl_max_session,
+            (unsigned long long)avg_ctr,
+            (unsigned)res,
+            raw_to_F_with_scale(s_tl_min_session,    sx),
+            raw_to_F_with_scale(s_tl_max_session,    sx),
+            raw_to_F_with_scale((uint32_t)avg_ctr,   sx));
+        if (n > 0 && meta_len + n < (int)sizeof(meta)) meta_len += n;
+    }
+    if (meta_len + 2 < (int)sizeof(meta)) {
+        meta[meta_len++] = '}';
+        meta[meta_len]   = '\0';
+    }
+
     char path[160];
     snprintf(path, sizeof(path), "%s/session.json", s_tl_session_dir);
     hal_storage_sd_atomic_write(path, meta, (size_t)meta_len);
@@ -597,14 +823,34 @@ static void tl_capture_iteration(uint32_t seq) {
     }
     if (vis_grabbed) hal_camera_release();
 
-    // Encode thermal.
+    // Encode thermal. Stash the raw frame + temp stats for sidecar
+    // writes before the next encode call from elsewhere can clobber.
     uint8_t *therm_jpg = NULL;
     size_t therm_len = 0;
+    therm_stats_t ts = {0};
+    uint16_t *raw_snap = NULL;
     if (s_tl_capture_therm) {
         therm_jpg = heap_caps_malloc(THERM_JPEG_MAX_BYTES, MALLOC_CAP_SPIRAM);
         if (therm_jpg) {
             therm_len = capture_encode_thermal_jpeg(therm_jpg, THERM_JPEG_MAX_BYTES);
             if (therm_len == 0) { free(therm_jpg); therm_jpg = NULL; }
+        }
+        // Pull temps + raw immediately after encode (same frame).
+        capture_get_last_thermal_temps_ck(&ts.min_raw, &ts.max_raw, &ts.center_raw);
+        bool tl_active = false, tl_auto = false; uint16_t res = 0;
+        lepton_cci_get_tlinear_state(&tl_active, &tl_auto, &res);
+        ts.resolution = res;
+        ts.valid = (tl_active && ts.max_raw > 0);
+
+        if (ts.valid) {
+            raw_snap = heap_caps_malloc(LEP_PIXELS * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+            if (raw_snap && !capture_snapshot_thermal_raw(raw_snap, LEP_PIXELS * sizeof(uint16_t))) {
+                free(raw_snap); raw_snap = NULL;
+            }
+            // Fold into session aggregates.
+            if (ts.min_raw < s_tl_min_session) s_tl_min_session = ts.min_raw;
+            if (ts.max_raw > s_tl_max_session) s_tl_max_session = ts.max_raw;
+            s_tl_sum_center_raw += ts.center_raw;
         }
     }
 
@@ -612,6 +858,7 @@ static void tl_capture_iteration(uint32_t seq) {
         ESP_LOGW(TAG, "tl seq %lu: SD lock timeout", (unsigned long)seq);
         if (vis_copy) free(vis_copy);
         if (therm_jpg) free(therm_jpg);
+        if (raw_snap) free(raw_snap);
         return;
     }
 
@@ -635,13 +882,28 @@ static void tl_capture_iteration(uint32_t seq) {
             therm_bytes = therm_len;
         }
     }
-    tl_append_capture_log(seq, vis_written, vis_bytes, therm_written, therm_bytes);
+
+    // Per-capture sidecars (.raw16 + .json) — only when thermal was
+    // actually requested + radiometric is on. Caller already holds lock.
+    if (s_tl_capture_therm && ts.valid) {
+        bool tl_active = false, tl_auto = false; uint16_t res = 0;
+        lepton_cci_get_tlinear_state(&tl_active, &tl_auto, &res);
+        write_thermal_sidecars(s_tl_session_dir, seq, raw_snap, &ts,
+                                tl_active, tl_auto,
+                                capture_get_thermal_rotation(),
+                                /*last_ffc_ms*/ 0,    // tracked by hal_lepton stats; not exposed yet
+                                hal_lepton_agc_enabled(),
+                                hal_lepton_gain_mode());
+    }
+    tl_append_capture_log(seq, vis_written, vis_bytes, therm_written, therm_bytes,
+                           ts.valid ? &ts : NULL);
     s_tl_capture_count = seq;
     tl_write_session_json(false);   // running, not complete
     hal_storage_sd_unlock();
 
     if (vis_copy) free(vis_copy);
     if (therm_jpg) free(therm_jpg);
+    if (raw_snap)  free(raw_snap);
 
     ESP_LOGI(TAG, "tl seq %lu: vis=%u therm=%u",
              (unsigned long)seq, (unsigned)vis_bytes, (unsigned)therm_bytes);
@@ -737,6 +999,10 @@ esp_err_t timelapse_start(uint32_t interval_sec,
     s_tl_capture_vis = capture_vis;
     s_tl_capture_therm = capture_therm;
     s_tl_capture_count = 0;
+    // Reset radiometric aggregates for this session.
+    s_tl_min_session    = 0xFFFFFFFFu;
+    s_tl_max_session    = 0;
+    s_tl_sum_center_raw = 0;
     tl_write_session_json(false);
     hal_storage_sd_unlock();
 
