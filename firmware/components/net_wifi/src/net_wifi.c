@@ -75,6 +75,17 @@ esp_err_t net_wifi_connect_blocking(const char *ssid, const char *password) {
         pdMS_TO_TICKS(30000));
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "connected to %s", ssid);
+        // iPhone hotspots are hostile to STA clients in modem-sleep
+        // mode (the AP deauths devices that don't respond promptly to
+        // its tight beacon cadence). Symptom: WS connection thrashes
+        // with code=1006 every 5-15 s, preview fps drops to 0. Costs
+        // ~80 mA extra current — fine for USB / external battery.
+        esp_err_t pserr = esp_wifi_set_ps(WIFI_PS_NONE);
+        if (pserr != ESP_OK) {
+            ESP_LOGW(TAG, "esp_wifi_set_ps(NONE) -> %s", esp_err_to_name(pserr));
+        } else {
+            ESP_LOGI(TAG, "WiFi power save: NONE (always-on)");
+        }
         return ESP_OK;
     }
     ESP_LOGE(TAG, "failed to connect to %s", ssid);
