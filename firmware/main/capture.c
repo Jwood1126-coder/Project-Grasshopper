@@ -381,6 +381,9 @@ static volatile uint32_t s_tl_capture_count = 0;
 static volatile uint64_t s_tl_started_ms = 0;
 static volatile bool     s_tl_capture_vis = true;
 static volatile bool     s_tl_capture_therm = true;
+// 0 = run until manually stopped. Otherwise the loop exits cleanly
+// (writing complete=true to session.json) once elapsed crosses this.
+static volatile uint32_t s_tl_max_duration_sec = 0;
 
 static void ensure_tl_mutex(void) {
     if (!s_tl_mutex) s_tl_mutex = xSemaphoreCreateMutex();
@@ -525,6 +528,17 @@ static void tl_task(void *arg) {
     while (!s_tl_stop) {
         tl_capture_iteration(seq);
         seq++;
+        // Self-stop on duration cap. Computed AFTER the iteration so the
+        // last capture lands inside the window rather than just outside.
+        if (s_tl_max_duration_sec > 0) {
+            uint64_t elapsed_sec = ((esp_timer_get_time() / 1000) -
+                                     s_tl_started_ms) / 1000;
+            if (elapsed_sec >= s_tl_max_duration_sec) {
+                ESP_LOGI(TAG, "timelapse hit duration cap (%lus) — stopping",
+                         (unsigned long)s_tl_max_duration_sec);
+                break;
+            }
+        }
         // Wait in 200 ms slices so stop signal is responsive.
         uint32_t waited_ms = 0;
         uint32_t target_ms = s_tl_interval_sec * 1000;
@@ -548,6 +562,7 @@ static void tl_task(void *arg) {
 
 esp_err_t timelapse_start(uint32_t interval_sec,
                           bool capture_vis, bool capture_therm,
+                          uint32_t max_duration_sec,
                           char *session_id_out, size_t session_id_cap,
                           char *msg_out, size_t msg_cap) {
     ensure_tl_mutex();
@@ -562,6 +577,7 @@ esp_err_t timelapse_start(uint32_t interval_sec,
     }
     if (interval_sec < 1) interval_sec = 1;
     if (interval_sec > 3600) interval_sec = 3600;
+    s_tl_max_duration_sec = max_duration_sec;   // 0 = unlimited
     if (!capture_vis && !capture_therm) {
         xSemaphoreGive(s_tl_mutex);
         snprintf(msg_out, msg_cap, "must enable at least one of vis/therm");

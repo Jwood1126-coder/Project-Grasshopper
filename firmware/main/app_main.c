@@ -441,8 +441,8 @@ static net_relay_cmd_status_t app_cmd_handler(const char *cmd, const char *id,
     }
 
     if (strcmp(cmd, "timelapse.start") == 0) {
-        // Payload: { intervalSec: number, captureVis: bool, captureTherm: bool }
-        uint32_t interval = 30;
+        // Payload: { intervalSec, captureVis, captureTherm, maxDurationSec? }
+        uint32_t interval = 30, max_dur = 0;
         bool capture_vis = true, capture_therm = true;
         if (payload) {
             const cJSON *iv = cJSON_GetObjectItemCaseSensitive(payload, "intervalSec");
@@ -451,9 +451,12 @@ static net_relay_cmd_status_t app_cmd_handler(const char *cmd, const char *id,
             if (cJSON_IsBool(cv)) capture_vis = cJSON_IsTrue(cv);
             const cJSON *ct = cJSON_GetObjectItemCaseSensitive(payload, "captureTherm");
             if (cJSON_IsBool(ct)) capture_therm = cJSON_IsTrue(ct);
+            const cJSON *md = cJSON_GetObjectItemCaseSensitive(payload, "maxDurationSec");
+            if (cJSON_IsNumber(md) && md->valueint > 0) max_dur = (uint32_t)md->valueint;
         }
         char session_id[64];
         esp_err_t err = timelapse_start(interval, capture_vis, capture_therm,
+                                         max_dur,
                                          session_id, sizeof(session_id),
                                          msg_out, msg_cap);
         return err == ESP_OK ? NET_RELAY_CMD_OK : NET_RELAY_CMD_FAIL;

@@ -188,12 +188,11 @@ export const USER_UI_HTML = `<!doctype html>
     background: var(--accent); color: #fff; border-color: var(--accent);
   }
   .panel-ctrls .pc.rotate { font-size: 18px; line-height: 1; }
-  .panel.therm-rot-1 img { transform: rotate(90deg) scale(0.75); }
-  .panel.therm-rot-2 img { transform: rotate(180deg); }
-  .panel.therm-rot-3 img { transform: rotate(270deg) scale(0.75); }
-  .panel.vis-hmirror img { transform: scaleX(-1); }
-  .panel.vis-vflip   img { transform: scaleY(-1); }
-  .panel.vis-hmirror.vis-vflip img { transform: scale(-1, -1); }
+  /* Firmware does the actual rotation/flip in the JPEG it sends, so
+     no CSS transform here — that would double-rotate. We just track
+     orientation classes so the panel can adapt its aspect-ratio when
+     thermal goes portrait (90° / 270°). */
+  .panel.thermal.portrait { aspect-ratio: 3/4; }
 
   /* ─── Action buttons ─── */
   .actions {
@@ -373,14 +372,51 @@ export const USER_UI_HTML = `<!doctype html>
   .library-view { padding-top: 4px; }
   .library-header {
     display: flex; align-items: center; justify-content: space-between;
-    margin-bottom: 16px;
+    gap: 12px; margin-bottom: 16px; flex-wrap: wrap;
   }
   .library-header h2 { margin: 0; font-size: 18px; font-weight: 600; }
   .library-header .meta { color: var(--muted); font-size: 13px; }
+  .lib-toolbar {
+    display: flex; gap: 16px; align-items: center; margin-bottom: 14px;
+    flex-wrap: wrap; padding: 10px 12px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  }
+  .lib-toolbar .group { display: flex; gap: 4px; align-items: center; }
+  .lib-toolbar .group-label {
+    font: 600 11px/1 system-ui; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.05em; margin-right: 6px;
+  }
+  .lib-toolbar .pill {
+    background: var(--surface-2); border: 1px solid var(--border);
+    color: var(--text); padding: 6px 12px; border-radius: 6px;
+    cursor: pointer; font: 500 12px/1 system-ui;
+  }
+  .lib-toolbar .pill:hover { border-color: var(--accent); }
+  .lib-toolbar .pill.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .lib-toolbar select {
+    background: var(--surface-2); border: 1px solid var(--border);
+    color: var(--text); padding: 6px 10px; border-radius: 6px;
+    font: 500 12px/1 system-ui; cursor: pointer;
+  }
   .session-grid {
     display: grid; gap: 14px;
-    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));  /* default: medium */
   }
+  .session-grid.size-small  { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; }
+  .session-grid.size-large  { grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 18px; }
+  .session-grid.list { grid-template-columns: 1fr; gap: 6px; }
+  .session-grid.list .session-card {
+    flex-direction: row; align-items: stretch;
+  }
+  .session-grid.list .session-card .thumb-wrap {
+    width: 120px; height: 90px; aspect-ratio: auto; flex-shrink: 0;
+  }
+  .session-grid.list .session-card.both .thumb-wrap { width: 220px; }
+  .session-grid.list .session-card .info { flex: 1; }
+
+  /* Card modality variants */
+  .session-card .thumb-wrap.both { display: flex; gap: 0; }
+  .session-card .thumb-wrap.both .thumb { width: 50%; }
   .session-card {
     background: var(--surface); border: 1px solid var(--border);
     border-radius: 10px; overflow: hidden; cursor: pointer;
@@ -561,6 +597,10 @@ export const USER_UI_HTML = `<!doctype html>
         <div class="tog on" id="tog-therm"><span class="check">●</span> Thermal</div>
       </div>
     </div>
+    <div class="modal-row">
+      <label>Stop after</label>
+      <div class="interval-grid" id="dur-grid"></div>
+    </div>
     <div class="modal-actions">
       <button class="btn" onclick="closeTlModal()">Cancel</button>
       <button class="btn primary" id="tl-confirm">Start</button>
@@ -611,16 +651,16 @@ export const USER_UI_HTML = `<!doctype html>
   let currentSettings = { visHmirror: false, visVflip: false, thermRotation: 0 };
 
   function applyPanelOrientationCss() {
-    const tp = fields.thermalPanel, vp = fields.visPanel;
+    const tp = fields.thermalPanel;
     if (tp) {
-      tp.classList.remove('therm-rot-1','therm-rot-2','therm-rot-3');
+      // 90° and 270° produce a portrait JPEG; swap panel aspect so it
+      // fits without letterboxing. 0/180 stays landscape.
       const r = currentSettings.thermRotation & 3;
-      if (r) tp.classList.add('therm-rot-' + r);
+      tp.classList.toggle('portrait', r === 1 || r === 3);
     }
-    if (vp) {
-      vp.classList.toggle('vis-hmirror', !!currentSettings.visHmirror);
-      vp.classList.toggle('vis-vflip',   !!currentSettings.visVflip);
-    }
+    // Visible flip: state classes only (no CSS transform — the OV2640
+    // hardware-flips the JPEG itself, applying a CSS scaleX/Y on top
+    // would un-flip it on every refreshed frame).
     if (fields.thermRotBtn) {
       fields.thermRotBtn.classList.toggle('active', currentSettings.thermRotation !== 0);
       fields.thermRotBtn.title = 'Rotate thermal — currently ' +
@@ -715,6 +755,31 @@ export const USER_UI_HTML = `<!doctype html>
   let tlSelectedInterval = 30;
   let tlCaptureVis = true;
   let tlCaptureTherm = true;
+  // 0 = run until manually stopped. Sent as maxDurationSec to the
+  // firmware; the timelapse task self-stops when elapsed >= this.
+  const TL_DURATIONS = [
+    { label: 'No limit', sec: 0 },
+    { label: '1 min',    sec: 60 },
+    { label: '5 min',    sec: 300 },
+    { label: '15 min',   sec: 900 },
+    { label: '30 min',   sec: 1800 },
+    { label: '1 hr',     sec: 3600 },
+    { label: '2 hr',     sec: 7200 },
+  ];
+  let tlSelectedDuration = 0;
+
+  function buildDurGrid() {
+    const grid = document.getElementById('dur-grid');
+    if (!grid) return;
+    grid.innerHTML = '';
+    TL_DURATIONS.forEach(opt => {
+      const e = el('div', {
+        class: 'iv' + (opt.sec === tlSelectedDuration ? ' active' : ''),
+        onclick: () => { tlSelectedDuration = opt.sec; buildDurGrid(); },
+      }, opt.label);
+      grid.appendChild(e);
+    });
+  }
 
   function buildIvGrid() {
     const grid = document.getElementById('iv-grid');
@@ -742,6 +807,7 @@ export const USER_UI_HTML = `<!doctype html>
 
   function openTlModal() {
     buildIvGrid();
+    buildDurGrid();
     setupModalToggles();
     document.getElementById('tl-modal').classList.add('show');
   }
@@ -755,7 +821,8 @@ export const USER_UI_HTML = `<!doctype html>
     }
     closeTlModal();
     sendCmd('timelapse.start',
-      { intervalSec: tlSelectedInterval, captureVis: tlCaptureVis, captureTherm: tlCaptureTherm },
+      { intervalSec: tlSelectedInterval, captureVis: tlCaptureVis, captureTherm: tlCaptureTherm,
+        maxDurationSec: tlSelectedDuration },
       null, 'Start Timelapse');
   };
 
@@ -1303,15 +1370,115 @@ export const USER_UI_HTML = `<!doctype html>
     }
   }
 
+  // Library display preferences. Persisted in localStorage so the user's
+  // last layout sticks across reloads.
+  const libDefaults = { modality: 'vis', layout: 'medium', sort: 'newest' };
+  function loadLibPrefs() {
+    try {
+      const s = JSON.parse(localStorage.getItem('gh_lib') || 'null');
+      return { ...libDefaults, ...(s || {}) };
+    } catch { return { ...libDefaults }; }
+  }
+  function saveLibPrefs() {
+    try { localStorage.setItem('gh_lib', JSON.stringify(libPrefs)); } catch {}
+  }
+  let libPrefs = loadLibPrefs();
+  let lastSessions = [];
+
   function buildLibraryView() {
     const v = el('div', { class: 'library-view' });
     const header = el('div', { class: 'library-header' },
       el('h2', {}, 'Sessions'),
       el('div', { class: 'meta', id: 'lib-meta' }, 'Loading…'));
+    const toolbar = buildLibToolbar();
     const grid = el('div', { class: 'session-grid', id: 'session-grid' });
+    applyGridLayoutClass(grid);
     v.appendChild(header);
+    v.appendChild(toolbar);
     v.appendChild(grid);
     return v;
+  }
+
+  function applyGridLayoutClass(grid) {
+    grid.classList.remove('size-small','size-large','list');
+    if (libPrefs.layout === 'small') grid.classList.add('size-small');
+    else if (libPrefs.layout === 'large') grid.classList.add('size-large');
+    else if (libPrefs.layout === 'list') grid.classList.add('list');
+  }
+
+  function buildLibToolbar() {
+    const tb = el('div', { class: 'lib-toolbar' });
+
+    const showOpts = [['vis','Visible'], ['therm','Thermal'], ['both','Both']];
+    const showGroup = el('div', { class: 'group' },
+      el('span', { class: 'group-label' }, 'Show'));
+    for (const [k, label] of showOpts) {
+      const p = el('div', {
+        class: 'pill' + (libPrefs.modality === k ? ' active' : ''),
+        onclick: () => { libPrefs.modality = k; saveLibPrefs(); rerenderLibrary(); },
+      }, label);
+      showGroup.appendChild(p);
+    }
+    tb.appendChild(showGroup);
+
+    const layoutOpts = [['small','S'], ['medium','M'], ['large','L'], ['list','List']];
+    const layoutGroup = el('div', { class: 'group' },
+      el('span', { class: 'group-label' }, 'Layout'));
+    for (const [k, label] of layoutOpts) {
+      const p = el('div', {
+        class: 'pill' + (libPrefs.layout === k ? ' active' : ''),
+        onclick: () => { libPrefs.layout = k; saveLibPrefs(); rerenderLibrary(); },
+      }, label);
+      layoutGroup.appendChild(p);
+    }
+    tb.appendChild(layoutGroup);
+
+    const sortGroup = el('div', { class: 'group' },
+      el('span', { class: 'group-label' }, 'Sort'));
+    const sel = document.createElement('select');
+    [
+      ['newest', 'Newest first'],
+      ['oldest', 'Oldest first'],
+      ['most',   'Most captures'],
+      ['fewest', 'Fewest captures'],
+      ['longest','Longest duration'],
+      ['shortest','Shortest duration'],
+    ].forEach(([v, label]) => {
+      const o = document.createElement('option');
+      o.value = v; o.textContent = label;
+      if (libPrefs.sort === v) o.selected = true;
+      sel.appendChild(o);
+    });
+    sel.onchange = () => { libPrefs.sort = sel.value; saveLibPrefs(); rerenderLibrary(); };
+    sortGroup.appendChild(sel);
+    tb.appendChild(sortGroup);
+
+    return tb;
+  }
+
+  function rerenderLibrary() {
+    const grid = document.getElementById('session-grid');
+    if (!grid) return;
+    applyGridLayoutClass(grid);
+    if (lastSessions.length === 0) return;
+    const sorted = sortSessions(lastSessions, libPrefs.sort);
+    grid.replaceChildren(...sorted.map(renderSessionCard));
+  }
+
+  function sortSessions(arr, key) {
+    const copy = arr.slice();
+    const num = (s, k, dflt) => (typeof s[k] === 'number' ? s[k] : dflt);
+    const newest = (a,b) => num(b,'timestamp',0) - num(a,'timestamp',0);
+    const cmps = {
+      newest,
+      oldest:   (a,b) => num(a,'timestamp',0) - num(b,'timestamp',0),
+      most:     (a,b) => num(b,'captureCount',0) - num(a,'captureCount',0),
+      fewest:   (a,b) => num(a,'captureCount',0) - num(b,'captureCount',0),
+      longest:  (a,b) => num(b,'durationSec',0) - num(a,'durationSec',0),
+      shortest: (a,b) => num(a,'durationSec',0) - num(b,'durationSec',0),
+    };
+    copy.sort(cmps[key] || newest);
+    return copy;
   }
 
   async function loadLibrary() {
@@ -1333,6 +1500,7 @@ export const USER_UI_HTML = `<!doctype html>
       }
       const j = await r.json();
       const list = j.sessions || [];
+      lastSessions = list;
       meta.textContent = (j.total ?? list.length) + ' sessions' +
                          (j.truncated ? ' (showing newest ' + j.listed + ')' : '');
       if (list.length === 0) {
@@ -1342,7 +1510,8 @@ export const USER_UI_HTML = `<!doctype html>
             'Press Capture or Start Timelapse on the Live View to record one.')));
         return;
       }
-      grid.replaceChildren(...list.map(renderSessionCard));
+      const sorted = sortSessions(list, libPrefs.sort);
+      grid.replaceChildren(...sorted.map(renderSessionCard));
     } catch (e) {
       meta.textContent = 'Network error';
     }
@@ -1350,9 +1519,9 @@ export const USER_UI_HTML = `<!doctype html>
 
   function renderSessionCard(s) {
     const sid = s.sessionId || 'session_?';
-    const thumbUrl = currentDeviceId
+    const fileUrl = (name) => currentDeviceId
       ? '/api/devices/' + encodeURIComponent(currentDeviceId) +
-        '/sessions/' + encodeURIComponent(sid) + '/file/000001_vis.jpg'
+        '/sessions/' + encodeURIComponent(sid) + '/file/' + name
       : '';
     const isTl = s.mode === 'timelapse';
     const incomplete = isTl && s.complete === false;
@@ -1361,21 +1530,29 @@ export const USER_UI_HTML = `<!doctype html>
     const ts = s.timestamp ? new Date(s.timestamp * 1000) : null;
     const tsTxt = ts ? ts.toLocaleString() : '';
 
+    const modality = libPrefs.modality;
+    const wantVis   = modality === 'vis'   || modality === 'both';
+    const wantTherm = modality === 'therm' || modality === 'both';
+
     const card = el('div', {
-      class: 'session-card',
+      class: 'session-card' + (modality === 'both' ? ' both' : ''),
       onclick: () => setView('detail', sid),
     });
-    const thumbWrap = el('div', { class: 'thumb-wrap' });
-    if (thumbUrl) {
+    const thumbWrap = el('div', { class: 'thumb-wrap' + (modality === 'both' ? ' both' : '') });
+
+    function makeThumb(name) {
       const img = el('img', { class: 'thumb' });
-      thumbWrap.appendChild(img);
-      // Auth-fetch the thumbnail. Browser <img loading=lazy> can't help
-      // here (no Authorization header), so fire fetch immediately. Cards
-      // render fast either way since the relay caches.
-      loadAuthImg(img, thumbUrl, () => {
-        thumbWrap.replaceChildren(el('div', { class: 'thumb-empty' }, 'no preview'));
+      loadAuthImg(img, fileUrl(name), () => {
+        // Fall back to a "no preview" placeholder for this slot.
+        const ph = el('div', { class: 'thumb-empty', style: 'flex:1;display:flex;align-items:center;justify-content:center' }, 'no preview');
+        img.replaceWith(ph);
       });
-    } else {
+      return img;
+    }
+
+    if (s.captureVis !== false && wantVis)   thumbWrap.appendChild(makeThumb('000001_vis.jpg'));
+    if (s.captureTherm !== false && wantTherm) thumbWrap.appendChild(makeThumb('000001_therm.jpg'));
+    if (!thumbWrap.children.length) {
       thumbWrap.appendChild(el('div', { class: 'thumb-empty' }, 'no preview'));
     }
     const info = el('div', { class: 'info' },

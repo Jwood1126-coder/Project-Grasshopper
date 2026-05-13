@@ -63,8 +63,12 @@ typedef struct {
     bool capture_therm;
 } timelapse_status_t;
 
+// max_duration_sec=0 ⇒ run until manually stopped. Anything else makes
+// the loop self-stop after that many wall-clock seconds (final
+// session.json gets complete=true regardless of stop reason).
 esp_err_t timelapse_start(uint32_t interval_sec,
                           bool capture_vis, bool capture_therm,
+                          uint32_t max_duration_sec,
                           char *session_id_out, size_t session_id_cap,
                           char *msg_out, size_t msg_cap);
 
