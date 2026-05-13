@@ -24,6 +24,16 @@ app.get('/health', (c) =>
   })
 )
 
+// online = WS open OR fresh data in the last 8 s. The OR catches the
+// case where a frame just arrived but the relay's socket-readyState
+// poll briefly reads !=1 (Bun's WS readyState lags slightly behind
+// frame delivery on flaky connections like the iPhone hotspot).
+const ONLINE_FRESHNESS_MS = 8000
+function deviceOnline(d: { socket: { readyState: number } | null; lastSeenMs: number }) {
+  if (d.socket?.readyState === 1) return true
+  return Date.now() - d.lastSeenMs < ONLINE_FRESHNESS_MS
+}
+
 app.get('/api/devices', (c) =>
   c.json({
     devices: store.list().map((d) => ({
@@ -33,7 +43,7 @@ app.get('/api/devices', (c) =>
       state: d.state,
       ip: d.ip,
       lastSeenMs: d.lastSeenMs,
-      online: d.socket?.readyState === 1,
+      online: deviceOnline(d),
       logCount: d.logs.length,
       eventCount: d.events.length,
     })),
@@ -50,7 +60,7 @@ app.get('/api/devices/:id/state', (c) => {
     state: d.state,
     ip: d.ip,
     lastSeenMs: d.lastSeenMs,
-    online: d.socket?.readyState === 1,
+    online: deviceOnline(d),
     init: d.init,
     tick: d.tick,
   })

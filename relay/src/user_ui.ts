@@ -126,33 +126,70 @@ export const USER_UI_HTML = `<!doctype html>
     margin-bottom: 14px;
   }
 
+  /* Each modality is wrapped: header (label + stats above the image),
+     panel (image + interactive overlays), footer (legend etc). The
+     image stays clean — no text or controls on top of it by default.
+     Header and footer can be collapsed by toggling .compact on the wrap. */
+  .panel-wrap {
+    display: flex; flex-direction: column; gap: 6px;
+    min-width: 0;
+  }
+  .panel-bar {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 8px; padding: 0 4px;
+    font: 12px/1.2 ui-sans-serif; color: var(--muted);
+  }
+  .panel-bar .ptitle {
+    font: 600 11px/1 ui-sans-serif; letter-spacing: 0.08em;
+    text-transform: uppercase; color: var(--text);
+  }
+  .panel-bar.thermal .ptitle { color: var(--accent-warm); }
+  .panel-bar .pmeta {
+    font: 500 11px/1.4 ui-monospace, monospace;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  .panel-bar .pbtns { display: flex; gap: 4px; align-items: center; }
+  .panel-bar .pbtn {
+    background: var(--surface); border: 1px solid var(--border);
+    color: var(--text); width: 26px; height: 26px; border-radius: 5px;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; font: 600 13px/1 system-ui;
+  }
+  .panel-bar .pbtn:hover { border-color: var(--accent); }
+  .panel-bar .pbtn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  /* Compact mode hides the bars, leaving just the image — useful for
+     fullscreen / pure-image viewing. */
+  .panel-wrap.compact .panel-bar,
+  .panel-wrap.compact .panel-legend { display: none; }
+
   .panel {
     background: var(--panel-bg); border: 1px solid var(--border); border-radius: 14px;
     overflow: hidden; position: relative; aspect-ratio: 4/3;
-    /* Cap so side-by-side panels never overflow the viewport. The 320 px
-       reservation covers header + chips + actions + diagnostics summary. */
-    max-height: calc(100vh - 320px);
+    /* Cap so side-by-side panels never overflow the viewport. The 380 px
+       reservation covers header + chips + bars + actions + diagnostics. */
+    max-height: calc(100vh - 380px);
     min-height: 160px;
-    margin: 0 auto;       /* center if viewport is wider than the aspect-clamped width */
+    margin: 0 auto;
     width: 100%;
     display: flex; flex-direction: column;
     transition: opacity 0.4s;
   }
+  /* Fullscreen takes the panel out of the grid and fills the viewport. */
+  .panel-wrap.fullscreen {
+    position: fixed; inset: 0; z-index: 300;
+    background: #000;
+    display: flex; flex-direction: column;
+    padding: 12px;
+  }
+  .panel-wrap.fullscreen .panel {
+    flex: 1; max-height: none; aspect-ratio: auto;
+    border: none; border-radius: 8px;
+  }
   .panel.stale img { opacity: 0.55; filter: saturate(0.5) brightness(0.85); }
-  .panel-label {
-    position: absolute; top: 12px; left: 14px; z-index: 2;
-    font: 600 10px/1 ui-sans-serif; letter-spacing: 0.08em; text-transform: uppercase;
-    color: var(--text); padding: 6px 10px; border-radius: 5px;
-    background: rgba(10, 14, 20, 0.75); backdrop-filter: blur(8px);
-  }
-  .panel-label.thermal { color: var(--accent-warm); }
-  .panel-meta {
-    position: absolute; top: 12px; right: 14px; z-index: 2;
-    font: 500 11px/1 ui-monospace, monospace; color: var(--muted);
-    padding: 6px 10px; border-radius: 5px;
-    background: rgba(10, 14, 20, 0.75); backdrop-filter: blur(8px);
-    display: flex; gap: 6px; align-items: center;
-  }
+  /* Old in-image overlays kept for compatibility with detail/lightbox
+     code, but hidden inside live-view panels (info now lives in the
+     panel-bar above the image). */
+  .panel-label, .panel-meta { display: none; }
   .panel-meta .age.warn { color: var(--warn); }
   .panel-meta .age.err  { color: var(--err); }
   .panel img {
@@ -194,6 +231,21 @@ export const USER_UI_HTML = `<!doctype html>
      either modality goes portrait (90° / 270°). */
   .panel.portrait { aspect-ratio: 3/4; }
 
+  /* Zoom transforms applied via inline style; CSS just makes the img
+     respect the parent's clip and stay performant during transforms. */
+  .panel img, .lightbox img { transform-origin: 0 0; will-change: transform; }
+  .panel.zoomed { cursor: grab; }
+  .panel.zoomed.dragging { cursor: grabbing; }
+  .lightbox.zoomed img { cursor: grab; }
+  .lightbox.zoomed.dragging img { cursor: grabbing; }
+  .zoom-badge {
+    position: absolute; bottom: 10px; left: 10px; z-index: 5;
+    background: rgba(10,14,20,0.78); backdrop-filter: blur(6px);
+    color: #fff; font: 600 11px/1 ui-monospace, monospace;
+    padding: 4px 8px; border-radius: 4px; border: 1px solid var(--border);
+    pointer-events: none;
+  }
+
   /* Thermal crosshair + per-pixel readout (Phase 3 radiometric) */
   .panel.thermal .therm-readout {
     position: absolute; pointer-events: none;
@@ -214,6 +266,10 @@ export const USER_UI_HTML = `<!doctype html>
     padding: 4px 8px; border-radius: 4px; border: 1px solid var(--border);
     pointer-events: none; white-space: nowrap;
   }
+  /* When the cursor is near the top of the panel, flip the tooltip
+     to sit BELOW the cursor so it doesn't get clipped by the panel
+     edge. JS toggles .below based on pointer Y. */
+  .panel.thermal .therm-tip.below { transform: translate(-50%, 130%); }
 
   /* Temperature legend bar (under each thermal panel) */
   .panel-legend {
@@ -531,6 +587,44 @@ export const USER_UI_HTML = `<!doctype html>
     font: 11px/1 ui-monospace, monospace; padding: 2px 5px; border-radius: 3px;
   }
   .capture-tile:hover { border-color: var(--accent); }
+  .capture-tile .dl {
+    position: absolute; top: 4px; right: 4px;
+    background: rgba(10,14,20,0.78); backdrop-filter: blur(6px);
+    color: white; border: 1px solid var(--border); border-radius: 4px;
+    width: 24px; height: 24px;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; font: 600 12px/1 system-ui;
+    opacity: 0; transition: opacity 0.15s;
+  }
+  .capture-tile:hover .dl { opacity: 1; }
+  .capture-tile .dl:hover { border-color: var(--accent); }
+
+  /* Download menu — small popover anchored to a button */
+  .dl-menu {
+    position: absolute; z-index: 350;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px;
+    display: flex; flex-direction: column; gap: 2px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.6);
+    font: 13px/1 system-ui; min-width: 180px;
+  }
+  .dl-menu .dl-item {
+    background: transparent; border: none; color: var(--text);
+    text-align: left; padding: 8px 12px; border-radius: 4px;
+    cursor: pointer;
+  }
+  .dl-menu .dl-item:hover { background: var(--surface-2); }
+  .dl-menu .dl-item:disabled { opacity: 0.4; cursor: not-allowed; }
+  .dl-menu .dl-item .dl-sub { color: var(--muted); font-size: 11px; display: block; margin-top: 2px; }
+  /* Lightbox download button */
+  .lightbox .lb-dl {
+    position: absolute; top: 16px; right: 72px;
+    background: rgba(255,255,255,0.08); border: 1px solid transparent;
+    color: white; padding: 6px 14px; border-radius: 6px;
+    cursor: pointer; font: 600 12px/1 system-ui;
+    text-transform: uppercase; letter-spacing: 0.05em;
+  }
+  .lightbox .lb-dl:hover { background: rgba(255,255,255,0.16); border-color: var(--border); }
 
   /* Lightbox */
   .lightbox {
@@ -647,6 +741,7 @@ export const USER_UI_HTML = `<!doctype html>
 <!-- Lightbox overlay -->
 <div class="lightbox" id="lightbox">
   <button class="lb-close" id="lb-close" aria-label="Close">×</button>
+  <button class="lb-dl"    id="lb-dl"    aria-label="Download">⬇ Download</button>
   <div class="lb-modality" id="lb-modality">
     <button class="mb vis active" id="lb-vis" data-mode="vis">Visible</button>
     <button class="mb therm"      id="lb-therm" data-mode="therm">Thermal</button>
@@ -788,6 +883,170 @@ export const USER_UI_HTML = `<!doctype html>
     return { idx: ry * thermRawW + rx, panelX: px, panelY: py };
   }
 
+  // ───── Zoom + pan helper ─────
+  //
+  // Attaches mouse wheel zoom (anchored at cursor), drag-pan when
+  // zoomed, and double-click reset to a container element + image.
+  // State is stored on the container element via .__zoom for live
+  // panels (img.src changes don't reset zoom — transform stays).
+  function attachZoom(container, img, opts) {
+    opts = opts || {};
+    const minScale = opts.minScale ?? 1;
+    const maxScale = opts.maxScale ?? 8;
+    const onZoomChange = opts.onZoomChange || (() => {});
+    const state = container.__zoom = { scale: 1, tx: 0, ty: 0 };
+
+    function apply() {
+      img.style.transform =
+        'translate(' + state.tx + 'px,' + state.ty + 'px) scale(' + state.scale + ')';
+      container.classList.toggle('zoomed', state.scale > 1.001);
+      onZoomChange(state.scale);
+    }
+    function clamp() {
+      // Keep image inside container as much as possible. With scale=1
+      // we want tx=0, ty=0. As scale grows, allow panning within the
+      // overflow but not so far that the image leaves the frame.
+      const rect = container.getBoundingClientRect();
+      const w = img.naturalWidth || img.offsetWidth || rect.width;
+      const h = img.naturalHeight || img.offsetHeight || rect.height;
+      // Compute the displayed (object-fit:contain) size of the un-
+      // transformed image. When scale=1, x/y must center it; we let
+      // transform act on top of that, so just clamp the translate
+      // range to ±(scaledExtent - rect.dim).
+      const fit = Math.min(rect.width / w, rect.height / h);
+      const dispW = w * fit, dispH = h * fit;
+      const offX = (rect.width - dispW) / 2;
+      const offY = (rect.height - dispH) / 2;
+      const scaledW = dispW * state.scale;
+      const scaledH = dispH * state.scale;
+      // Acceptable tx range: -(scaledW - rect.width) .. 0 if scaledW > rect.width,
+      // else center it (tx = offX*(state.scale-1) zero).
+      const maxTx = scaledW > rect.width ? offX * state.scale + (scaledW - rect.width - 2*offX*state.scale) / 2 : 0;
+      const minTx = scaledW > rect.width ? -((scaledW - rect.width) - maxTx) : maxTx;
+      // Simpler: just allow free drag, then snap back at scale=1.
+      if (state.scale <= 1.001) { state.tx = 0; state.ty = 0; return; }
+      const slackX = scaledW - rect.width;
+      const slackY = scaledH - rect.height;
+      const lowX = -((scaledW + offX*2*state.scale - rect.width) / 1) - offX*state.scale;
+      const highX = offX*state.scale;
+      // Pragmatic clamp: don't pull the image's outer edges past the
+      // container edges. Recompute extents from a baseline of "image
+      // top-left at offX, offY before zoom".
+      const baseX = offX, baseY = offY;
+      // After translate(tx,ty) scale(s), the image rect is:
+      //   left  = tx + baseX*s
+      //   right = tx + (baseX + dispW)*s   (because scale origin is 0,0)
+      // We want left <= 0 and right >= rect.width:
+      //   tx <= -baseX * s
+      //   tx >= rect.width - (baseX + dispW) * s
+      const leftBound  = rect.width - (baseX + dispW) * state.scale;
+      const rightBound = -baseX * state.scale;
+      if (state.tx > rightBound) state.tx = rightBound;
+      if (state.tx < leftBound)  state.tx = leftBound;
+      const topBound    = rect.height - (baseY + dispH) * state.scale;
+      const bottomBound = -baseY * state.scale;
+      if (state.ty > bottomBound) state.ty = bottomBound;
+      if (state.ty < topBound)    state.ty = topBound;
+    }
+
+    function zoomAt(deltaY, cx, cy) {
+      const rect = container.getBoundingClientRect();
+      const px = cx - rect.left;
+      const py = cy - rect.top;
+      const ix = (px - state.tx) / state.scale;
+      const iy = (py - state.ty) / state.scale;
+      const factor = deltaY < 0 ? 1.18 : 1 / 1.18;
+      const next = Math.max(minScale, Math.min(maxScale, state.scale * factor));
+      if (next === state.scale) return;
+      state.scale = next;
+      state.tx = px - ix * state.scale;
+      state.ty = py - iy * state.scale;
+      clamp(); apply();
+    }
+    function reset() {
+      state.scale = 1; state.tx = 0; state.ty = 0;
+      apply();
+    }
+
+    container.addEventListener('wheel', (e) => {
+      // Only zoom when ctrl/meta or always — for image panels, wheel
+      // alone is fine; on pages without scroll context this is the
+      // expected behavior. preventDefault stops page scroll.
+      e.preventDefault();
+      zoomAt(e.deltaY, e.clientX, e.clientY);
+    }, { passive: false });
+
+    let drag = null;
+    container.addEventListener('mousedown', (e) => {
+      if (state.scale <= 1.001) return;
+      drag = { x: e.clientX, y: e.clientY, tx: state.tx, ty: state.ty };
+      container.classList.add('dragging');
+    });
+    window.addEventListener('mousemove', (e) => {
+      if (!drag) return;
+      state.tx = drag.tx + (e.clientX - drag.x);
+      state.ty = drag.ty + (e.clientY - drag.y);
+      clamp(); apply();
+    });
+    window.addEventListener('mouseup', () => {
+      if (drag) { drag = null; container.classList.remove('dragging'); }
+    });
+    container.addEventListener('dblclick', reset);
+
+    container.__zoomReset = reset;
+    apply();
+  }
+
+  // Per-panel control buttons + view-mode toggles.
+  function mkFsButton(onClick) {
+    return el('button', { class: 'pbtn', title: 'Fullscreen', onclick: onClick }, '⛶');
+  }
+  function mkInfoButton(onClick) {
+    return el('button', { class: 'pbtn', title: 'Show / hide labels', onclick: onClick }, 'i');
+  }
+
+  // Compact mode: hide the panel-bar above and the legend below so the
+  // image stands alone. Useful in fullscreen where chrome is noise.
+  function toggleCompact(which) {
+    const wrap = which === 'therm' ? fields.thermWrap : fields.visWrap;
+    if (!wrap) return;
+    wrap.classList.toggle('compact');
+  }
+
+  // Fullscreen via the browser's Fullscreen API. Works on desktop and
+  // most mobile. The wrap element gets .fullscreen for our own CSS too,
+  // because requestFullscreen styling alone leaves the rest of the
+  // page visible behind it on some browsers.
+  function toggleFullscreen(which) {
+    const wrap = which === 'therm' ? fields.thermWrap : fields.visWrap;
+    if (!wrap) return;
+    const inFs = !!document.fullscreenElement;
+    if (inFs) {
+      document.exitFullscreen?.();
+      return;
+    }
+    wrap.classList.add('fullscreen');
+    const exit = () => {
+      if (!document.fullscreenElement) {
+        wrap.classList.remove('fullscreen');
+        document.removeEventListener('fullscreenchange', exit);
+      }
+    };
+    document.addEventListener('fullscreenchange', exit);
+    (wrap.requestFullscreen?.() ?? Promise.reject('no fs api'))
+      .catch(() => {
+        // Some browsers (Safari iOS) don't support element fullscreen.
+        // Fall back to our CSS-only fullscreen + Esc-to-exit.
+        const onKey = (e) => {
+          if (e.key === 'Escape') {
+            wrap.classList.remove('fullscreen');
+            document.removeEventListener('keydown', onKey);
+          }
+        };
+        document.addEventListener('keydown', onKey);
+      });
+  }
+
   function setupThermPanelHover(panel) {
     const showCursor = (panelX, panelY, tF) => {
       fields.thermCursor.style.left = panelX + 'px';
@@ -796,6 +1055,9 @@ export const USER_UI_HTML = `<!doctype html>
       fields.thermTip.style.display = '';
       fields.thermTip.style.left = panelX + 'px';
       fields.thermTip.style.top  = panelY + 'px';
+      // Flip tooltip below cursor when near the top edge so it doesn't
+      // get clipped by the panel boundary.
+      fields.thermTip.classList.toggle('below', panelY < 40);
       fields.thermTip.textContent = fmtTemp(tF);
     };
     const hide = () => {
@@ -803,6 +1065,10 @@ export const USER_UI_HTML = `<!doctype html>
       fields.thermTip.style.display = 'none';
     };
     panel.addEventListener('mousemove', (e) => {
+      // Hide the temp readout while the panel is zoomed/panned —
+      // pointerToRawIdx assumes the unzoomed object-fit:contain
+      // layout, so the lookup would be wrong for zoomed views.
+      if (panel.__zoom && panel.__zoom.scale > 1.001) { hide(); return; }
       const hit = pointerToRawIdx(panel, e);
       if (!hit || !thermRaw) { hide(); return; }
       const raw = thermRaw[hit.idx];
@@ -1033,21 +1299,31 @@ export const USER_UI_HTML = `<!doctype html>
         applySettingPreview({ thermRotation: next });
         sendSettings({ thermRotation: next });
       } }, '⟲');
-    const thermCtrls = el('div', { class: 'panel-ctrls' }, fields.thermRotBtn);
-    // Per-pixel temperature readout overlay. Cursor + tooltip follow
-    // the mouse over the thermal panel; the JS handler computes temp
-    // from the most recent raw16 frame fetched alongside the JPEG.
+    // Per-pixel temperature readout overlay (in-image — only thing
+    // that needs to live ON the JPEG so it can follow the cursor).
     fields.thermCursor = el('div', { class: 'therm-cursor hidden' });
     fields.thermTip    = el('div', { class: 'therm-tip',  style: 'display:none' });
     const thermReadout = el('div', { class: 'therm-readout' },
       fields.thermCursor, fields.thermTip);
     fields.thermalPanel = el('div', { class: 'panel thermal' },
-      el('div', { class: 'panel-label thermal' }, 'Thermal'),
-      fields.thermalMeta,
-      thermCtrls,
-      thermReadout,
-      fields.thermalEmpty);
+      thermReadout, fields.thermalEmpty);
     setupThermPanelHover(fields.thermalPanel);
+
+    // Header bar above the image: title + meta + rotate/fullscreen/info btns.
+    fields.thermFs   = mkFsButton(() => toggleFullscreen('therm'));
+    fields.thermInfo = mkInfoButton(() => toggleCompact('therm'));
+    const thermBar = el('div', { class: 'panel-bar thermal' },
+      el('span', { class: 'ptitle' }, 'Thermal'),
+      el('div', { class: 'pmeta' }, fields.thermalMeta),
+      el('div', { class: 'pbtns' }, fields.thermRotBtn, fields.thermInfo, fields.thermFs));
+
+    fields.legendMin = el('span', { class: 'lmin' }, '—');
+    fields.legendMax = el('span', { class: 'lmax' }, '—');
+    fields.legend = el('div', { class: 'panel-legend' },
+      fields.legendMin, el('span', { class: 'lbar' }), fields.legendMax);
+
+    fields.thermWrap = el('div', { class: 'panel-wrap therm-wrap' },
+      thermBar, fields.thermalPanel, fields.legend);
 
     fields.visImg = el('img', { id: 'vis-img', alt: 'Visible preview' });
     fields.visEmpty = el('div', { class: 'panel-empty' }, 'no visible preview yet');
@@ -1056,32 +1332,39 @@ export const USER_UI_HTML = `<!doctype html>
       el('span', { id: 'vis-res' }, '—'),
       el('span', {}, '·'),
       fields.visAge);
-    // Visible rotate button: cycles 0→90→180→270 like thermal.
-    // 0/180 use OV2640 hardware flips (free); 90/270 trigger software
-    // decode→rotate→re-encode in firmware (~250 ms per VGA frame).
-    fields.visRotBtn = el('button', { class: 'pc rotate', title: 'Rotate visible (cycles 0/90/180/270)',
+    fields.visRotBtn = el('button', { class: 'pbtn', title: 'Rotate visible (cycles 0/90/180/270)',
       onclick: () => {
         const next = (currentSettings.visRotation + 1) & 3;
         applySettingPreview({ visRotation: next });
         sendSettings({ visRotation: next });
       } }, '⟲');
-    const visCtrls = el('div', { class: 'panel-ctrls' }, fields.visRotBtn);
-    fields.visPanel = el('div', { class: 'panel visible' },
-      el('div', { class: 'panel-label' }, 'Visible'),
-      fields.visMeta,
-      visCtrls,
-      fields.visEmpty);
+    fields.visFs   = mkFsButton(() => toggleFullscreen('vis'));
+    fields.visInfo = mkInfoButton(() => toggleCompact('vis'));
+    fields.visPanel = el('div', { class: 'panel visible' }, fields.visEmpty);
+    const visBar = el('div', { class: 'panel-bar' },
+      el('span', { class: 'ptitle' }, 'Visible'),
+      el('div', { class: 'pmeta' }, fields.visMeta),
+      el('div', { class: 'pbtns' }, fields.visRotBtn, fields.visInfo, fields.visFs));
+    fields.visWrap = el('div', { class: 'panel-wrap vis-wrap' },
+      visBar, fields.visPanel);
 
-    const views = el('div', { class: 'views' }, fields.thermalPanel, fields.visPanel);
+    // Update the thermal rotate button styling to match the new pbtn class.
+    fields.thermRotBtn.className = 'pbtn';
 
-    // Iron-palette legend bar: gradient + min/max temp labels updated
-    // each tick from radiometric.{minTempF, maxTempF}. Sits below the
-    // panels so it stays close to the thermal preview without
-    // affecting the panel aspect-ratio.
-    fields.legendMin = el('span', { class: 'lmin' }, '—');
-    fields.legendMax = el('span', { class: 'lmax' }, '—');
-    fields.legend = el('div', { class: 'panel-legend' },
-      fields.legendMin, el('span', { class: 'lbar' }), fields.legendMax);
+    // Attach zoom to each Live View panel. Wheel-zoom around cursor,
+    // drag to pan when zoomed, double-click to reset. Setup deferred
+    // until images are appended (handled in updateLiveView).
+    const ensureZoom = () => {
+      if (!fields.thermalPanel.__zoom && fields.thermalImg.parentElement) {
+        attachZoom(fields.thermalPanel, fields.thermalImg);
+      }
+      if (!fields.visPanel.__zoom && fields.visImg.parentElement) {
+        attachZoom(fields.visPanel, fields.visImg);
+      }
+    };
+    fields._ensureZoom = ensureZoom;
+
+    const views = el('div', { class: 'views' }, fields.thermWrap, fields.visWrap);
 
     fields.captureBtn = el('button', {
       class: 'btn primary',
@@ -1130,7 +1413,8 @@ export const USER_UI_HTML = `<!doctype html>
       el('summary', {}, 'Diagnostics & device state'),
       el('div', { class: 'body' }, fields.statBlock, tokenRow));
 
-    return el('div', {}, fields.tlBannerSlot, views, fields.legend, fields.actions, fields.actionsSec, diagnostics);
+    // (Legend lives inside the thermal wrap now; no longer rendered separately here.)
+    return el('div', {}, fields.tlBannerSlot, views, fields.actions, fields.actionsSec, diagnostics);
   }
 
   // ───── Live view update ─────
@@ -1160,13 +1444,17 @@ export const USER_UI_HTML = `<!doctype html>
     renderThermTempLabel(lastRadiometric);
 
     if (therm && therm.frames > 0 && !fields.thermalImg.parentElement) {
-      fields.thermalPanel.appendChild(fields.thermalImg);
+      // Insert image as the first child so the .therm-readout overlay
+      // renders on top of it.
+      fields.thermalPanel.insertBefore(fields.thermalImg, fields.thermalPanel.firstChild);
       fields.thermalEmpty.remove();
     }
     if (vis && vis.ready && !fields.visImg.parentElement) {
       fields.visPanel.appendChild(fields.visImg);
       fields.visEmpty.remove();
     }
+    // Now that images live inside their panels, wire the zoom helper.
+    fields._ensureZoom?.();
 
     const now = Date.now();
     if (therm && therm.frames !== lastThermFrames) {
@@ -1535,6 +1823,97 @@ export const USER_UI_HTML = `<!doctype html>
     activeBlobUrls = [];
   }
 
+  // Auth-fetch a file and trigger a browser download with the given
+  // filename. Used for capture downloads (vis JPEG, therm JPEG,
+  // raw16, sidecar JSON). Cleans up the temp blob URL.
+  async function authDownload(url, filename) {
+    try {
+      const r = await fetch(url, {
+        headers: { 'Authorization': 'Bearer ' + authToken },
+        cache: 'no-store',
+      });
+      if (!r.ok) {
+        toast('Download failed: HTTP ' + r.status, 'err');
+        return;
+      }
+      const blob = await r.blob();
+      const u = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = u; a.download = filename;
+      document.body.appendChild(a); a.click();
+      setTimeout(() => { URL.revokeObjectURL(u); a.remove(); }, 1000);
+    } catch (e) {
+      toast('Download error: ' + (e?.message || e), 'err');
+    }
+  }
+
+  // Show a small menu of file-download options anchored near a button.
+  // closes on outside click + Esc.
+  function openDownloadMenu(anchor, captures, sessionId) {
+    closeDownloadMenu();
+    const baseUrl = (file) => '/api/devices/' + encodeURIComponent(currentDeviceId) +
+                              '/sessions/' + encodeURIComponent(sessionId) +
+                              '/file/' + file;
+    const items = [];
+    for (const c of captures) {
+      const tag = '#' + c.seq + ' ';
+      if (c.visOk) items.push({
+        label: tag + 'visible JPEG', sub: c.visFile,
+        url: baseUrl(c.visFile), filename: sessionId + '_' + c.visFile,
+      });
+      if (c.thermOk) {
+        items.push({
+          label: tag + 'thermal JPEG', sub: c.thermFile,
+          url: baseUrl(c.thermFile), filename: sessionId + '_' + c.thermFile,
+        });
+        items.push({
+          label: tag + 'thermal raw16', sub: 'lossless 160×120 uint16',
+          url: baseUrl(pad6(c.seq) + '_therm.raw16'),
+          filename: sessionId + '_' + pad6(c.seq) + '_therm.raw16',
+        });
+        items.push({
+          label: tag + 'thermal sidecar', sub: 'metadata JSON',
+          url: baseUrl(pad6(c.seq) + '_therm.json'),
+          filename: sessionId + '_' + pad6(c.seq) + '_therm.json',
+        });
+      }
+    }
+    if (items.length === 0) return;
+    const menu = el('div', { class: 'dl-menu', id: 'dl-menu' });
+    for (const it of items) {
+      menu.appendChild(el('button', {
+        class: 'dl-item',
+        onclick: () => { closeDownloadMenu(); authDownload(it.url, it.filename); },
+      }, it.label, el('span', { class: 'dl-sub' }, it.sub)));
+    }
+    document.body.appendChild(menu);
+    // Position near anchor.
+    const rect = anchor.getBoundingClientRect();
+    menu.style.left = Math.max(8, Math.min(window.innerWidth - menu.offsetWidth - 8,
+                                rect.left)) + 'px';
+    menu.style.top  = Math.min(window.innerHeight - menu.offsetHeight - 8,
+                                rect.bottom + 4) + 'px';
+    setTimeout(() => {
+      const onDocClick = (e) => {
+        if (!menu.contains(e.target) && e.target !== anchor) {
+          closeDownloadMenu();
+          document.removeEventListener('click', onDocClick);
+        }
+      };
+      const onKey = (e) => {
+        if (e.key === 'Escape') {
+          closeDownloadMenu();
+          document.removeEventListener('keydown', onKey);
+        }
+      };
+      document.addEventListener('click', onDocClick);
+      document.addEventListener('keydown', onKey);
+    }, 0);
+  }
+  function closeDownloadMenu() {
+    document.getElementById('dl-menu')?.remove();
+  }
+
   // Load an image with Authorization header and assign the resulting
   // blob URL to <img>. Returns the blob URL (also tracked for cleanup).
   // Falls back to onerror handler if the fetch fails.
@@ -1859,6 +2238,16 @@ export const USER_UI_HTML = `<!doctype html>
             'no vis'));
         }
         tile.appendChild(el('div', { class: 'seq' }, '#' + c.seq));
+        // Per-tile download button: opens menu with this capture's
+        // available files (vis/therm JPEG + thermal raw16 + sidecar).
+        const dl = el('button', {
+          class: 'dl', title: 'Download files for this capture',
+          onclick: (e) => {
+            e.stopPropagation();   // don't open lightbox
+            openDownloadMenu(dl, [c], sid);
+          },
+        }, '⬇');
+        tile.appendChild(dl);
         return tile;
       }));
     } catch (e) {
@@ -1903,6 +2292,8 @@ export const USER_UI_HTML = `<!doctype html>
   function renderLightbox() {
     const c = detailCaptureList[lightboxIdx];
     if (!c) return;
+    // Reset zoom to 1x on every image swap so each capture starts fresh.
+    document.getElementById('lightbox').__zoomReset?.();
     // Honor what's actually present for this capture. If the requested
     // modality wasn't recorded, fall back to the other; if neither, show
     // a placeholder + disable nav switches.
@@ -1939,6 +2330,17 @@ export const USER_UI_HTML = `<!doctype html>
   document.getElementById('lb-next').onclick = () => navLightbox(1);
   document.getElementById('lb-vis').onclick   = () => setLbModality('vis');
   document.getElementById('lb-therm').onclick = () => setLbModality('therm');
+  document.getElementById('lb-dl').onclick = (e) => {
+    if (lightboxIdx < 0) return;
+    const c = detailCaptureList[lightboxIdx];
+    if (!c) return;
+    openDownloadMenu(e.currentTarget, [c], c.sessionId);
+  };
+  // Lightbox zoom: wheel + drag + dblclick reset on the lb-img inside
+  // the lightbox container. Reset on each navLightbox / setLbModality
+  // so a fresh image starts at 1x (handled inside renderLightbox).
+  attachZoom(document.getElementById('lightbox'),
+             document.getElementById('lb-img'), { maxScale: 12 });
   document.addEventListener('keydown', (e) => {
     const lb = document.getElementById('lightbox');
     if (!lb.classList.contains('show')) return;
