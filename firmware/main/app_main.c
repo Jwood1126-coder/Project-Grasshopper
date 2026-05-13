@@ -353,10 +353,15 @@ static void tick_task(void *arg) {
 //   offset 20: 4 B epoch seconds
 //   offset 24: <jpeg bytes>
 
-// 1 s instead of 2 s so the integer-rounded FPS metric isn't always 0.
-// At ~30-50 KB per VGA q12 JPEG that's ~30-50 KB/s upload — fine on a
-// hotspot, well under the relay's WS buffer (64 KB).
-#define PREVIEW_INTERVAL_MS 1000
+// 2 s rather than 1 s — at the previous 1 Hz visible + 1.33 Hz thermal
+// (~106 KB/s combined), the WS-client mutex was held for 1-2 s per
+// large send on iPhone-hotspot uplinks. Other senders (tick, log,
+// thermal preview) timed out at 1000 ms with "Could not lock
+// ws-client within 1000 timeout", and the relay-side ping/pong stalled
+// long enough for the server to drop us with code=1006 — perpetual
+// thrash. Halving preview rates gives the WS task headroom; integer
+// fps still rounds nonzero because grabs land at ~0.5 Hz.
+#define PREVIEW_INTERVAL_MS 2000
 #define PREVIEW_HDR_LEN     24
 #define PREVIEW_MAGIC       "GHFR"
 #define PREVIEW_MOD_VIS     1
@@ -448,10 +453,13 @@ static uint8_t *s_therm_preview_buf = NULL;
 void thermal_preview_task(void *arg) {
     (void)arg;
     while (1) {
-        // VoSPI is at most ~9 fps. 750 ms gives the splice detector
-        // time to commit a clean frame between renders, while keeping
-        // the UI feeling live (1.5 s was perceptibly stale).
-        vTaskDelay(pdMS_TO_TICKS(750));
+        // 1.5 s rather than 750 ms — combined with the doubled visible
+        // interval, brings total preview throughput to ~50 KB/s,
+        // leaving the WS client enough cycles to ping/pong + ship
+        // ticks/cmd.results without timing out on the client mutex.
+        // 1.5 s is perceptible but acceptable until the WS sender
+        // is rebuilt as a single-task queue (see PR-C backlog).
+        vTaskDelay(pdMS_TO_TICKS(1500));
         if (!net_relay_is_connected()) continue;
 
         if (!s_therm_preview_buf) {
