@@ -198,10 +198,16 @@ export const USER_UI_HTML = `<!doctype html>
     border: none; border-radius: 8px;
   }
   .panel.stale img { opacity: 0.55; filter: saturate(0.5) brightness(0.85); }
-  /* Old in-image overlays kept for compatibility with detail/lightbox
-     code, but hidden inside live-view panels (info now lives in the
-     panel-bar above the image). */
-  .panel-label, .panel-meta { display: none; }
+  /* Old in-image overlays — only hidden when used as direct children
+     of .panel (legacy overlay position). The same fields are reused
+     inside the new .panel-bar (.pmeta > .panel-meta), where they
+     should stay visible. */
+  .panel > .panel-label, .panel > .panel-meta { display: none; }
+  /* Inside the bar, .panel-meta is just a flex row of spans. */
+  .panel-bar .pmeta .panel-meta {
+    display: flex; gap: 6px; align-items: center; padding: 0;
+    background: none; backdrop-filter: none; position: static;
+  }
   .panel-meta .age.warn { color: var(--warn); }
   .panel-meta .age.err  { color: var(--err); }
   .panel img {
@@ -1186,6 +1192,10 @@ export const USER_UI_HTML = `<!doctype html>
   let visPreviewAgeMs = null;
   const pendingCmds = new Map();
   let lastEventsTs = Date.now();
+  // Counter so brief device drops don't immediately blank the UI.
+  // poll() bumps this when devices is empty; flips to "searching"
+  // empty state only when sustained for many polls.
+  let noDeviceTicks = 0;
 
   // ───── Timelapse settings modal ─────
   const TL_INTERVALS = [
@@ -1754,20 +1764,29 @@ export const USER_UI_HTML = `<!doctype html>
       const content = document.getElementById('content');
 
       if (!d) {
-        currentDeviceId = null;
-        lastThermFrames = 0;
-        lastThermFramesTs = 0;
-        if (currentView === 'live' && !content.querySelector('.empty')) {
-          content.innerHTML = '';
-          content.appendChild(el('div', { class: 'empty' },
-            el('div', { class: 'pulse' }),
-            el('h2', {}, 'Looking for your device…'),
-            el('p', {}, 'Power on a Grasshopper unit and connect it to Wi-Fi. It should appear here within a few seconds.')
-          ));
+        // Don't blank a working live view the instant the device drops.
+        // Wait until we've seen no device for ~10 polls (~20 s at 2 s
+        // poll cadence) before flipping to the "searching" empty state.
+        // This rides through brief WS reconnect cycles without
+        // visible UI churn.
+        noDeviceTicks = (noDeviceTicks || 0) + 1;
+        if (noDeviceTicks >= 10) {
+          currentDeviceId = null;
+          lastThermFrames = 0;
+          lastThermFramesTs = 0;
+          if (currentView === 'live' && !content.querySelector('.empty')) {
+            content.innerHTML = '';
+            content.appendChild(el('div', { class: 'empty' },
+              el('div', { class: 'pulse' }),
+              el('h2', {}, 'Looking for your device…'),
+              el('p', {}, 'Power on a Grasshopper unit and connect it to Wi-Fi. It should appear here within a few seconds.')
+            ));
+          }
         }
         updateChips(null, null);
         return;
       }
+      noDeviceTicks = 0;
 
       // Only rebuild Live View when actually showing it. Otherwise just
       // update tracking state so chips stay correct on other tabs.

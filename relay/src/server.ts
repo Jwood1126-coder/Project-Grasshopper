@@ -24,11 +24,14 @@ app.get('/health', (c) =>
   })
 )
 
-// online = WS open OR fresh data in the last 8 s. The OR catches the
-// case where a frame just arrived but the relay's socket-readyState
+// online = WS open OR fresh data in the last N seconds. The OR catches
+// the case where a frame just arrived but the relay's socket-readyState
 // poll briefly reads !=1 (Bun's WS readyState lags slightly behind
 // frame delivery on flaky connections like the iPhone hotspot).
-const ONLINE_FRESHNESS_MS = 8000
+// 30s is generous: covers brief reconnect cycles without the UI
+// flipping to "searching for device" between them. The device only
+// truly looks offline after half a minute of silence.
+const ONLINE_FRESHNESS_MS = 30000
 function deviceOnline(d: { socket: { readyState: number } | null; lastSeenMs: number }) {
   if (d.socket?.readyState === 1) return true
   return Date.now() - d.lastSeenMs < ONLINE_FRESHNESS_MS
