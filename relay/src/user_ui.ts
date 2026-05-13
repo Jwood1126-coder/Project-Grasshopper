@@ -133,6 +133,10 @@ export const USER_UI_HTML = `<!doctype html>
   .panel-wrap {
     display: flex; flex-direction: column; gap: 6px;
     min-width: 0;
+    /* Don't stretch in the views grid — keep content top-aligned so
+       both modality bars line up at the top of the row regardless
+       of their panel heights. */
+    align-self: start;
   }
   .panel-bar {
     display: flex; align-items: center; justify-content: space-between;
@@ -147,6 +151,10 @@ export const USER_UI_HTML = `<!doctype html>
   .panel-bar .pmeta {
     font: 500 11px/1.4 ui-monospace, monospace;
     overflow: hidden; text-overflow: ellipsis;
+    /* Hard single-line + shrink-to-fit so the bar can't wrap when
+       the temp readout grows. Min-width: 0 lets the flex item shrink
+       below its content's intrinsic width. */
+    white-space: nowrap; min-width: 0; flex: 1 1 0;
   }
   .panel-bar .pbtns { display: flex; gap: 4px; align-items: center; }
   .panel-bar .pbtn {
@@ -244,10 +252,16 @@ export const USER_UI_HTML = `<!doctype html>
   }
   .panel-ctrls .pc.rotate { font-size: 18px; line-height: 1; }
   /* Firmware does the actual rotation/flip in the JPEG it sends, so
-     no CSS transform here — that would double-rotate. We just track
-     orientation classes so the panel can adapt its aspect-ratio when
-     either modality goes portrait (90° / 270°). */
-  .panel.portrait { aspect-ratio: 3/4; }
+     no CSS transform here — that would double-rotate. The panel
+     adapts its aspect-ratio to portrait when either modality is at
+     90°/270°, and lets width derive from height (instead of always
+     filling the column) so the panel hugs the JPEG with no
+     letterbox bars on the sides. */
+  .panel.portrait {
+    aspect-ratio: 3/4;
+    width: auto;
+    max-width: 100%;
+  }
 
   /* Zoom transforms applied via inline style; CSS just makes the img
      respect the parent's clip and stay performant during transforms. */
