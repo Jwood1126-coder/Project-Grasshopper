@@ -155,9 +155,13 @@ static void do_list(const sess_req_t *req) {
         return;
     }
 
+    // Scan ALL session.json files first, then sort, then trim to
+    // SESS_LIST_MAX. Previous code capped during readdir, which made
+    // "newest 50" arbitrary once the SD had >50 sessions (caller saw
+    // whichever 50 happened to come up first in directory order).
     cJSON *arr = cJSON_CreateArray();
     DIR *dir = opendir(SESSIONS_BASE_DIR);
-    uint32_t total = 0, listed = 0;
+    uint32_t total = 0;
     if (dir) {
         struct dirent *ent;
         while ((ent = readdir(dir)) != NULL) {
@@ -182,9 +186,6 @@ static void do_list(const sess_req_t *req) {
                 cJSON_AddStringToObject(meta, "sessionId", ent->d_name);
             }
             cJSON_AddItemToArray(arr, meta);
-            listed++;
-
-            if (listed >= SESS_LIST_MAX) break;
         }
         closedir(dir);
     } else {
@@ -193,7 +194,8 @@ static void do_list(const sess_req_t *req) {
     hal_storage_sd_unlock();
 
     // Sort newest-first by timestamp using cJSON's array index swap.
-    // Simple bubble sort since SESS_LIST_MAX is small (50).
+    // Bubble sort is fine — even at 500 sessions this is < 250k compares
+    // of two doubles each. Heap+JSON traversal dominates if anything.
     int n = cJSON_GetArraySize(arr);
     for (int i = 0; i < n - 1; i++) {
         for (int j = 0; j < n - 1 - i; j++) {
@@ -205,6 +207,12 @@ static void do_list(const sess_req_t *req) {
             }
         }
     }
+
+    // Trim AFTER sort so the response really is the newest N.
+    while (cJSON_GetArraySize(arr) > (int)SESS_LIST_MAX) {
+        cJSON_DeleteItemFromArray(arr, cJSON_GetArraySize(arr) - 1);
+    }
+    uint32_t listed = (uint32_t)cJSON_GetArraySize(arr);
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddItemToObject(root, "sessions", arr);
