@@ -51,6 +51,13 @@ int  hal_lepton_gain_mode(void);
 // Persist current AGC + gain to NVS (namespace "lepcfg").
 void hal_lepton_save_settings(void);
 
+// Read back the TLinear (radiometric) state captured by the last
+// CCI configure. `resolution` is 0 for 0.1 K/count, 1 for 0.01 K/count
+// (Lepton's RAD_TLINEAR_RESOLUTION encoding). Returns true if TLinear
+// is currently active (raw frame pixels = K * scale).
+bool lepton_cci_get_tlinear_state(bool *active, bool *auto_res,
+                                   uint16_t *resolution);
+
 // ---------- Diagnostics (for status / Tick) ----------
 
 typedef struct {

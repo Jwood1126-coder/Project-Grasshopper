@@ -78,6 +78,26 @@ static uint8_t  *s_therm_rot = NULL;   // dest for rotated RGB565 (90/180/270)
 // Rotation: 0/1/2/3 → 0/90/180/270 CW. Set via capture_set_thermal_rotation.
 static volatile uint8_t s_therm_rotation = 0;
 
+// Last-frame thermal stats from raw Lepton pixels. Updated each call to
+// capture_encode_thermal_jpeg. With TLinear=1 these are scaled Kelvin
+// values (resolution 0.01K or 0.1K depending on Lepton AUTO_RESOLUTION
+// choice — caller queries lepton_cci_get_tlinear_state for scale).
+static volatile uint16_t s_last_min_raw    = 0;
+static volatile uint16_t s_last_max_raw    = 0;
+static volatile uint16_t s_last_center_raw = 0;
+static volatile bool     s_last_temps_valid = false;
+
+void capture_get_last_thermal_temps_ck(uint32_t *min_ck, uint32_t *max_ck,
+                                        uint32_t *center_ck) {
+    // Caller's "ck" naming assumes 0.01K — we report whatever raw scale
+    // the Lepton produced; the unit is encoded in the tlinear state
+    // exposed alongside this in tick metadata. Caller is responsible
+    // for multiplying by 10 if resolution=0 (0.1K).
+    if (min_ck)    *min_ck    = s_last_temps_valid ? s_last_min_raw    : 0;
+    if (max_ck)    *max_ck    = s_last_temps_valid ? s_last_max_raw    : 0;
+    if (center_ck) *center_ck = s_last_temps_valid ? s_last_center_raw : 0;
+}
+
 void capture_set_thermal_rotation(uint8_t r) { s_therm_rotation = (uint8_t)(r & 3); }
 uint8_t capture_get_thermal_rotation(void)   { return s_therm_rotation; }
 
@@ -216,6 +236,13 @@ size_t capture_encode_thermal_jpeg(uint8_t *dst, size_t cap) {
     }
     if (mx <= mn) mx = (uint16_t)(mn + 1);
     uint32_t range = (uint32_t)(mx - mn);
+
+    // Stash stats for tick payload. Center pixel is taken before any
+    // rotation since rotation only affects the encoded output.
+    s_last_min_raw    = mn;
+    s_last_max_raw    = mx;
+    s_last_center_raw = s_therm_raw[(LEP_H / 2) * LEP_W + (LEP_W / 2)];
+    s_last_temps_valid = true;
 
     // raw → palette index → RGB565 BE
     uint16_t *out = (uint16_t *)s_therm_rgb;

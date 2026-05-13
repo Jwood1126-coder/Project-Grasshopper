@@ -28,7 +28,21 @@ extern "C" {
 // palette with per-frame auto-ranging. Output goes into `dst`, capacity
 // `cap`. Returns the JPEG byte length, 0 on failure (no frame yet, or
 // out of memory). Thread-safe (uses internal lazy-allocated buffers).
+//
+// Side effect: updates the last-seen temperature stats accessible via
+// capture_get_last_thermal_temps_ck() — so calling this from preview
+// is what keeps the tick's "temp" block fresh.
 size_t capture_encode_thermal_jpeg(uint8_t *dst, size_t cap);
+
+// Per-frame thermal temperature stats from the most recent encode.
+// Values are in centi-Kelvin (raw Lepton TLinear=1 output assuming
+// 0.01K resolution — the default; we don't yet handle the auto-switch
+// to 0.1K when the scene exceeds 16-bit dynamic range). Caller can
+// pass NULL for any field it doesn't want.
+//   centi-K to °C: ck / 100 - 273.15
+//   centi-K to °F: (ck/100 - 273.15) * 9/5 + 32
+void capture_get_last_thermal_temps_ck(uint32_t *min_ck, uint32_t *max_ck,
+                                        uint32_t *center_ck);
 
 // Thermal rotation applied during JPEG encode. Affects both preview
 // and recorded captures. Argument is 0/1/2/3 → 0/90/180/270 CW.

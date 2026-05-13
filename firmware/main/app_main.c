@@ -133,20 +133,64 @@ static void fill_thermal(Thermal_t *out) {
     out->state = hal_lepton_state_name(st.state);
 }
 
-// Splice extra fields (timelapse status + user settings) into a JSON
-// envelope produced by Init_to_json/Tick_to_json. Both fields live
-// outside the proto schema, so we hand-append them by trimming the
-// trailing `}` and writing `,"timelapse":{...},"settings":{...}}`.
-// Returns the new total length (or the original n if anything went wrong).
+// Build the radiometric block — appended into both init and tick.
+// Codex's Phase 1 checklist: report capability flags + raw resolution
+// alongside derived display-temp fields. UI does its own °C/°F
+// conversion; centerTempF is included for at-a-glance reading.
+//
+// scale_x100 = number of centi-Kelvin per raw count.
+//   resolution=0 → 0.1 K/count → 10 cK/count
+//   resolution=1 → 0.01 K/count → 1 cK/count
+static int build_radiometric_json(char *out, size_t cap) {
+    bool active = false, auto_res = false;
+    uint16_t res = 0;
+    lepton_cci_get_tlinear_state(&active, &auto_res, &res);
+    int scale_x100 = (res == 1) ? 1 : 10;
+
+    uint32_t mn_raw = 0, mx_raw = 0, ce_raw = 0;
+    capture_get_last_thermal_temps_ck(&mn_raw, &mx_raw, &ce_raw);
+
+    // Convert raw → °F via centi-Kelvin. cK = raw * scale_x100, then
+    // C = cK/100 - 273.15, F = C*9/5 + 32. Inlined per call below.
+    #define RAW_TO_F(raw) \
+        ((((double)(raw) * (double)scale_x100) / 100.0 - 273.15) * 9.0 / 5.0 + 32.0)
+    bool have_temps = active && (mx_raw > 0);
+    if (!have_temps) {
+        return snprintf(out, cap,
+            ",\"radiometric\":{\"active\":%s,\"tlinearAutoRes\":%s,"
+            "\"tlinearResolution\":%u,\"haveTemps\":false}",
+            active ? "true" : "false",
+            auto_res ? "true" : "false",
+            (unsigned)res);
+    }
+    int n = snprintf(out, cap,
+        ",\"radiometric\":{\"active\":true,\"tlinearAutoRes\":%s,"
+        "\"tlinearResolution\":%u,\"haveTemps\":true,"
+        "\"minRaw\":%lu,\"maxRaw\":%lu,\"centerRaw\":%lu,"
+        "\"minTempF\":%.2f,\"maxTempF\":%.2f,\"centerTempF\":%.2f}",
+        auto_res ? "true" : "false",
+        (unsigned)res,
+        (unsigned long)mn_raw, (unsigned long)mx_raw, (unsigned long)ce_raw,
+        RAW_TO_F(mn_raw), RAW_TO_F(mx_raw), RAW_TO_F(ce_raw));
+    #undef RAW_TO_F
+    return n;
+}
+
+// Splice extra fields (timelapse status + user settings + radiometric)
+// into a JSON envelope produced by Init_to_json/Tick_to_json. Both
+// fields live outside the proto schema, so we hand-append by trimming
+// the trailing `}` and writing the additions before re-closing.
 static size_t splice_extras(char *buf, size_t n, size_t cap) {
     if (n == 0 || n + 1 >= cap || buf[n - 1] != '}') return n;
 
     timelapse_status_t tl = {0};
     timelapse_get_status(&tl);
 
+    // Drop the trailing } and start appending.
+    n -= 1;
     int extra;
     if (tl.active) {
-        extra = snprintf(buf + n - 1, cap - (n - 1),
+        extra = snprintf(buf + n, cap - n,
             ",\"timelapse\":{"
               "\"active\":true,"
               "\"sessionId\":\"%s\","
@@ -159,7 +203,7 @@ static size_t splice_extras(char *buf, size_t n, size_t cap) {
             "\"settings\":{"
               "\"visRotation\":%u,"
               "\"thermRotation\":%u"
-            "}}",
+            "}",
             tl.session_id,
             (unsigned long)tl.interval_sec,
             (unsigned long)tl.capture_count,
@@ -169,18 +213,23 @@ static size_t splice_extras(char *buf, size_t n, size_t cap) {
             (unsigned)capture_get_visible_rotation(),
             (unsigned)capture_get_thermal_rotation());
     } else {
-        extra = snprintf(buf + n - 1, cap - (n - 1),
+        extra = snprintf(buf + n, cap - n,
             ",\"timelapse\":{\"active\":false},"
             "\"settings\":{"
               "\"visRotation\":%u,"
               "\"thermRotation\":%u"
-            "}}",
+            "}",
             (unsigned)capture_get_visible_rotation(),
             (unsigned)capture_get_thermal_rotation());
     }
-    if (extra > 0 && (size_t)(n - 1 + extra) < cap) {
-        return (size_t)(n - 1 + extra);
-    }
+    if (extra <= 0 || (size_t)(n + extra) >= cap) return n + 1;
+    n += extra;
+
+    extra = build_radiometric_json(buf + n, cap - n);
+    if (extra > 0 && (size_t)(n + extra) < cap) n += extra;
+
+    if (n + 1 >= cap) return n;
+    buf[n++] = '}';
     return n;
 }
 

@@ -255,14 +255,45 @@ static bool lep_enable_radiometry(void) {
     return cci_set_attribute(CCI_CMD_RAD_ENABLE, 1);
 }
 
+// Cached tlinear state (read back via GET right after enabling).
+// Zero values mean "unknown / not radiometric" — used by capture.c
+// to decide whether to publish temp readings.
+static volatile bool     s_tlinear_active        = false;
+static volatile bool     s_tlinear_auto_res      = false;
+static volatile uint16_t s_tlinear_resolution    = 0;  // 0 = 0.1K, 1 = 0.01K
+
 static bool lep_enable_tlinear(void) {
-    // Workaround state: TLinear=0 because TLinear=1 currently correlates
-    // with line-20 packets only ever showing seg=0/2/4. Cause unproven —
-    // most likely a marginal VoSPI link issue (see memory). Until the
-    // link is clean we don't draw conclusions about TLinear behavior.
-    s_tlinear_intended = false;
-    ESP_LOGI(TAG, "TLinear=0 (workaround for marginal-link segment dropout)");
-    return cci_set_attribute(CCI_CMD_RAD_TLINEAR_ENABLE, 0);
+    // VoSPI link is now clean, so retire the old TLinear=0 workaround.
+    // Codex-recommended order: AUTO_RESOLUTION first (so the Lepton
+    // chooses scale per frame), then ENABLE TLinear. Verify both with
+    // GET and capture the resulting resolution so the host knows the
+    // raw→Kelvin scale factor (0.01K or 0.1K per count).
+    s_tlinear_intended = true;
+    bool ok_auto    = cci_set_attribute(CCI_CMD_RAD_TLINEAR_AUTO_RESOLUTION, 1);
+    bool ok_enable  = cci_set_attribute(CCI_CMD_RAD_TLINEAR_ENABLE, 1);
+
+    uint16_t v_auto = 0, v_enable = 0, v_res = 0;
+    int ra = cci_get_attribute_n(CCI_CMD_RAD_TLINEAR_AUTO_RESOLUTION, 1, &v_auto);
+    int re = cci_get_attribute_n(CCI_CMD_RAD_TLINEAR_ENABLE,          1, &v_enable);
+    int rr = cci_get_attribute_n(CCI_CMD_RAD_TLINEAR_RESOLUTION,      1, &v_res);
+
+    s_tlinear_active     = (re == 0 && v_enable == 1);
+    s_tlinear_auto_res   = (ra == 0 && v_auto == 1);
+    s_tlinear_resolution = (rr == 0) ? v_res : 0;
+
+    ESP_LOGI(TAG, "TLinear set: enable=%d auto_res=%d res=%u (verified %d/%d/%d)",
+             (int)s_tlinear_active, (int)s_tlinear_auto_res,
+             (unsigned)s_tlinear_resolution, re, ra, rr);
+    return ok_auto && ok_enable;
+}
+
+extern "C" bool lepton_cci_get_tlinear_state(bool *active,
+                                              bool *auto_res,
+                                              uint16_t *resolution) {
+    if (active)     *active     = s_tlinear_active;
+    if (auto_res)   *auto_res   = s_tlinear_auto_res;
+    if (resolution) *resolution = s_tlinear_resolution;
+    return s_tlinear_active;
 }
 
 static bool lep_enable_agc_calc(void) {

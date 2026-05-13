@@ -645,6 +645,32 @@ export const USER_UI_HTML = `<!doctype html>
   }
   let authToken = loadToken();
 
+  // Temperature unit (°F default per user preference). Persists.
+  let tempUnit = (() => {
+    try { return localStorage.getItem('gh_temp_unit') || 'F'; }
+    catch { return 'F'; }
+  })();
+  let lastRadiometric = null;
+
+  function fToC(f) { return (f - 32) * 5 / 9; }
+  function fmtTemp(tF) {
+    if (tF == null || !isFinite(tF)) return '—';
+    if (tempUnit === 'C') return fToC(tF).toFixed(1) + '°C';
+    return tF.toFixed(1) + '°F';
+  }
+  function renderThermTempLabel(rad) {
+    if (!fields.thermalTempLabel) return;
+    if (!rad || !rad.haveTemps) {
+      fields.thermalTempLabel.textContent = rad && rad.active === false
+        ? 'radiometric off' : '—';
+      return;
+    }
+    fields.thermalTempLabel.textContent =
+      'min ' + fmtTemp(rad.minTempF) +
+      '  ctr ' + fmtTemp(rad.centerTempF) +
+      '  max ' + fmtTemp(rad.maxTempF);
+  }
+
   // Current device-side orientation. Updated from tick.settings.
   // Both modalities use the same rotation model: 0/1/2/3 → 0/90/180/270.
   let currentSettings = { visRotation: 0, thermRotation: 0 };
@@ -834,9 +860,18 @@ export const USER_UI_HTML = `<!doctype html>
     fields.thermalImg = el('img', { id: 'therm-img', alt: 'Thermal preview' });
     fields.thermalEmpty = el('div', { class: 'panel-empty' }, 'no thermal frames yet');
     fields.thermalAge = el('span', { class: 'age' }, '—');
+    fields.thermalTempLabel = el('span', { id: 'therm-temp', title: 'Click to toggle °F / °C' }, '');
+    fields.thermalTempLabel.style.cursor = 'pointer';
+    fields.thermalTempLabel.onclick = () => {
+      tempUnit = (tempUnit === 'F') ? 'C' : 'F';
+      try { localStorage.setItem('gh_temp_unit', tempUnit); } catch {}
+      // Force a redraw on the next tick — done via the cached state.
+      if (lastRadiometric) renderThermTempLabel(lastRadiometric);
+    };
     fields.thermalMeta = el('div', { class: 'panel-meta' },
       el('span', { id: 'therm-fps' }, '—'),
       el('span', {}, '·'),
+      fields.thermalTempLabel,
       fields.thermalAge);
     // Thermal rotate button: cycles 0→90→180→270→0 CW. Settings live
     // on the device (NVS-backed) so live preview AND recordings rotate
@@ -949,6 +984,11 @@ export const USER_UI_HTML = `<!doctype html>
       currentSettings.thermRotation = (s.thermRotation | 0) & 3;
       applyPanelOrientationCss();
     }
+
+    // Radiometric temps. Cached so the °F/°C toggle handler can re-
+    // render without waiting for the next tick.
+    lastRadiometric = live.radiometric || null;
+    renderThermTempLabel(lastRadiometric);
 
     if (therm && therm.frames > 0 && !fields.thermalImg.parentElement) {
       fields.thermalPanel.appendChild(fields.thermalImg);
