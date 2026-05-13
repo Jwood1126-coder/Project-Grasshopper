@@ -191,8 +191,8 @@ export const USER_UI_HTML = `<!doctype html>
   /* Firmware does the actual rotation/flip in the JPEG it sends, so
      no CSS transform here — that would double-rotate. We just track
      orientation classes so the panel can adapt its aspect-ratio when
-     thermal goes portrait (90° / 270°). */
-  .panel.thermal.portrait { aspect-ratio: 3/4; }
+     either modality goes portrait (90° / 270°). */
+  .panel.portrait { aspect-ratio: 3/4; }
 
   /* ─── Action buttons ─── */
   .actions {
@@ -645,29 +645,32 @@ export const USER_UI_HTML = `<!doctype html>
   }
   let authToken = loadToken();
 
-  // Current device-side orientation. Updated from tick.settings; mirrors
-  // are applied to the preview <img> via CSS so the user sees the change
-  // instantly (cmd round-trip is async). Defaults match firmware boot.
-  let currentSettings = { visHmirror: false, visVflip: false, thermRotation: 0 };
+  // Current device-side orientation. Updated from tick.settings.
+  // Both modalities use the same rotation model: 0/1/2/3 → 0/90/180/270.
+  let currentSettings = { visRotation: 0, thermRotation: 0 };
 
   function applyPanelOrientationCss() {
-    const tp = fields.thermalPanel;
+    const tp = fields.thermalPanel, vp = fields.visPanel;
+    // Both panels swap to portrait aspect at 90/270 since the firmware
+    // serves a JPEG with swapped dimensions in those modes.
     if (tp) {
-      // 90° and 270° produce a portrait JPEG; swap panel aspect so it
-      // fits without letterboxing. 0/180 stays landscape.
       const r = currentSettings.thermRotation & 3;
       tp.classList.toggle('portrait', r === 1 || r === 3);
     }
-    // Visible flip: state classes only (no CSS transform — the OV2640
-    // hardware-flips the JPEG itself, applying a CSS scaleX/Y on top
-    // would un-flip it on every refreshed frame).
+    if (vp) {
+      const r = currentSettings.visRotation & 3;
+      vp.classList.toggle('portrait', r === 1 || r === 3);
+    }
     if (fields.thermRotBtn) {
       fields.thermRotBtn.classList.toggle('active', currentSettings.thermRotation !== 0);
       fields.thermRotBtn.title = 'Rotate thermal — currently ' +
         (currentSettings.thermRotation * 90) + '°';
     }
-    if (fields.visHBtn) fields.visHBtn.classList.toggle('active', !!currentSettings.visHmirror);
-    if (fields.visVBtn) fields.visVBtn.classList.toggle('active', !!currentSettings.visVflip);
+    if (fields.visRotBtn) {
+      fields.visRotBtn.classList.toggle('active', currentSettings.visRotation !== 0);
+      fields.visRotBtn.title = 'Rotate visible — currently ' +
+        (currentSettings.visRotation * 90) + '°';
+    }
   }
 
   function applySettingPreview(patch) {
@@ -858,20 +861,16 @@ export const USER_UI_HTML = `<!doctype html>
       el('span', { id: 'vis-res' }, '—'),
       el('span', {}, '·'),
       fields.visAge);
-    // Visible H/V flip toggles (OV2640 hardware flip — no CPU cost).
-    fields.visHBtn = el('button', { class: 'pc', title: 'Mirror horizontally',
+    // Visible rotate button: cycles 0→90→180→270 like thermal.
+    // 0/180 use OV2640 hardware flips (free); 90/270 trigger software
+    // decode→rotate→re-encode in firmware (~250 ms per VGA frame).
+    fields.visRotBtn = el('button', { class: 'pc rotate', title: 'Rotate visible (cycles 0/90/180/270)',
       onclick: () => {
-        const next = !currentSettings.visHmirror;
-        applySettingPreview({ visHmirror: next });
-        sendSettings({ visHmirror: next });
-      } }, '⇄');
-    fields.visVBtn = el('button', { class: 'pc', title: 'Flip vertically',
-      onclick: () => {
-        const next = !currentSettings.visVflip;
-        applySettingPreview({ visVflip: next });
-        sendSettings({ visVflip: next });
-      } }, '⇅');
-    const visCtrls = el('div', { class: 'panel-ctrls' }, fields.visHBtn, fields.visVBtn);
+        const next = (currentSettings.visRotation + 1) & 3;
+        applySettingPreview({ visRotation: next });
+        sendSettings({ visRotation: next });
+      } }, '⟲');
+    const visCtrls = el('div', { class: 'panel-ctrls' }, fields.visRotBtn);
     fields.visPanel = el('div', { class: 'panel visible' },
       el('div', { class: 'panel-label' }, 'Visible'),
       fields.visMeta,
@@ -944,11 +943,9 @@ export const USER_UI_HTML = `<!doctype html>
     // taps just optimistically update the local CSS while the cmd
     // round-trips. Compares before assign so we don't churn DOM.
     const s = live.settings;
-    if (s && (s.visHmirror !== currentSettings.visHmirror ||
-              s.visVflip   !== currentSettings.visVflip   ||
-              s.thermRotation !== currentSettings.thermRotation)) {
-      currentSettings.visHmirror   = !!s.visHmirror;
-      currentSettings.visVflip     = !!s.visVflip;
+    if (s && ((s.visRotation | 0) !== currentSettings.visRotation ||
+              (s.thermRotation | 0) !== currentSettings.thermRotation)) {
+      currentSettings.visRotation   = (s.visRotation | 0) & 3;
       currentSettings.thermRotation = (s.thermRotation | 0) & 3;
       applyPanelOrientationCss();
     }

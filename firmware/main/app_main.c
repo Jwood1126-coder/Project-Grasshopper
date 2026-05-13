@@ -157,8 +157,7 @@ static size_t splice_extras(char *buf, size_t n, size_t cap) {
               "\"captureTherm\":%s"
             "},"
             "\"settings\":{"
-              "\"visHmirror\":%s,"
-              "\"visVflip\":%s,"
+              "\"visRotation\":%u,"
               "\"thermRotation\":%u"
             "}}",
             tl.session_id,
@@ -167,19 +166,16 @@ static size_t splice_extras(char *buf, size_t n, size_t cap) {
             (unsigned long long)tl.started_ms,
             tl.capture_vis ? "true" : "false",
             tl.capture_therm ? "true" : "false",
-            hal_camera_get_hmirror() ? "true" : "false",
-            hal_camera_get_vflip()   ? "true" : "false",
+            (unsigned)capture_get_visible_rotation(),
             (unsigned)capture_get_thermal_rotation());
     } else {
         extra = snprintf(buf + n - 1, cap - (n - 1),
             ",\"timelapse\":{\"active\":false},"
             "\"settings\":{"
-              "\"visHmirror\":%s,"
-              "\"visVflip\":%s,"
+              "\"visRotation\":%u,"
               "\"thermRotation\":%u"
             "}}",
-            hal_camera_get_hmirror() ? "true" : "false",
-            hal_camera_get_vflip()   ? "true" : "false",
+            (unsigned)capture_get_visible_rotation(),
             (unsigned)capture_get_thermal_rotation());
     }
     if (extra > 0 && (size_t)(n - 1 + extra) < cap) {
@@ -351,8 +347,19 @@ void preview_task(void *arg) {
         uint32_t w = 0, h = 0;
         if (hal_camera_grab_jpeg(&jpg, &jpg_len, &w, &h) != ESP_OK) continue;
 
-        if (jpg_len + PREVIEW_HDR_LEN > PREVIEW_MAX_BYTES) {
-            ESP_LOGW(TAG, "preview: jpg %u too big — skip", (unsigned)jpg_len);
+        // For 90°/270° visible rotation, decode/rotate/re-encode here so
+        // the dashboard preview matches what recordings will look like.
+        // The rotated buffer owns its own memory; copy it before release.
+        uint8_t *rot_jpg = NULL; size_t rot_len = 0;
+        uint32_t rw = w, rh = h;
+        bool rotated = capture_rotate_visible_jpeg_if_needed(
+            jpg, jpg_len, w, h, &rot_jpg, &rot_len, &rw, &rh);
+        const uint8_t *send_jpg = rotated ? rot_jpg : jpg;
+        size_t         send_len = rotated ? rot_len : jpg_len;
+
+        if (send_len + PREVIEW_HDR_LEN > PREVIEW_MAX_BYTES) {
+            ESP_LOGW(TAG, "preview: jpg %u too big — skip", (unsigned)send_len);
+            if (rot_jpg) free(rot_jpg);
             hal_camera_release();
             continue;
         }
@@ -362,13 +369,17 @@ void preview_task(void *arg) {
         s_preview_buf[5] = 1;        // version
         s_preview_buf[6] = 0;
         s_preview_buf[7] = 0;
-        put_u32_le(s_preview_buf + 8,  w);
-        put_u32_le(s_preview_buf + 12, h);
-        put_u32_le(s_preview_buf + 16, (uint32_t)jpg_len);
+        put_u32_le(s_preview_buf + 8,  rw);
+        put_u32_le(s_preview_buf + 12, rh);
+        put_u32_le(s_preview_buf + 16, (uint32_t)send_len);
         put_u32_le(s_preview_buf + 20, (uint32_t)time(NULL));
-        memcpy(s_preview_buf + PREVIEW_HDR_LEN, jpg, jpg_len);
+        memcpy(s_preview_buf + PREVIEW_HDR_LEN, send_jpg, send_len);
 
+        if (rot_jpg) free(rot_jpg);
         hal_camera_release();   // releases the camera FB lock immediately
+        size_t  jpg_len_dummy = send_len;
+        (void)jpg_len_dummy;     // keep below ESP_LOGD happy
+        jpg_len = send_len;
 
         size_t total = PREVIEW_HDR_LEN + jpg_len;
         if (net_relay_send_binary(s_preview_buf, total) != ESP_OK) {
@@ -469,23 +480,18 @@ static net_relay_cmd_status_t app_cmd_handler(const char *cmd, const char *id,
 
     // settings.update: live-apply user orientation choices and persist
     // to NVS so they survive reboot. Payload may include any subset of
-    // { visHmirror: bool, visVflip: bool, thermRotation: 0|1|2|3 }.
+    // { visRotation: 0|1|2|3, thermRotation: 0|1|2|3 }.
     if (strcmp(cmd, "settings.update") == 0) {
         nvs_handle_t h = 0;
         bool nvs_ok = nvs_open("ghset", NVS_READWRITE, &h) == ESP_OK;
         int applied = 0;
         if (payload) {
-            const cJSON *vh = cJSON_GetObjectItemCaseSensitive(payload, "visHmirror");
-            const cJSON *vv = cJSON_GetObjectItemCaseSensitive(payload, "visVflip");
+            const cJSON *vr = cJSON_GetObjectItemCaseSensitive(payload, "visRotation");
             const cJSON *tr = cJSON_GetObjectItemCaseSensitive(payload, "thermRotation");
-            if (cJSON_IsBool(vh)) {
-                hal_camera_set_hmirror(cJSON_IsTrue(vh));
-                if (nvs_ok) nvs_set_u8(h, "vh", hal_camera_get_hmirror() ? 1 : 0);
-                applied++;
-            }
-            if (cJSON_IsBool(vv)) {
-                hal_camera_set_vflip(cJSON_IsTrue(vv));
-                if (nvs_ok) nvs_set_u8(h, "vv", hal_camera_get_vflip() ? 1 : 0);
+            if (cJSON_IsNumber(vr)) {
+                uint8_t r = (uint8_t)vr->valueint & 3;
+                capture_set_visible_rotation(r);
+                if (nvs_ok) nvs_set_u8(h, "vr", r);
                 applied++;
             }
             if (cJSON_IsNumber(tr)) {
@@ -497,8 +503,9 @@ static net_relay_cmd_status_t app_cmd_handler(const char *cmd, const char *id,
         }
         if (nvs_ok) { nvs_commit(h); nvs_close(h); }
         snprintf(msg_out, msg_cap,
-                 "applied %d setting(s): vh=%d vv=%d tr=%d",
-                 applied, hal_camera_get_hmirror(), hal_camera_get_vflip(),
+                 "applied %d setting(s): visRot=%d thermRot=%d",
+                 applied,
+                 capture_get_visible_rotation(),
                  capture_get_thermal_rotation());
         return NET_RELAY_CMD_OK;
     }
@@ -621,14 +628,15 @@ void app_main(void) {
         nvs_handle_t h;
         if (nvs_open("ghset", NVS_READONLY, &h) == ESP_OK) {
             uint8_t v = 0;
-            if (nvs_get_u8(h, "vh", &v) == ESP_OK) hal_camera_set_hmirror(v != 0);
-            v = 0;
-            if (nvs_get_u8(h, "vv", &v) == ESP_OK) hal_camera_set_vflip(v != 0);
+            // visRotation supersedes the older visHmirror/visVflip pair.
+            // capture_set_visible_rotation drives the OV2640 flip
+            // registers as a side-effect.
+            if (nvs_get_u8(h, "vr", &v) == ESP_OK) capture_set_visible_rotation(v);
             v = 0;
             if (nvs_get_u8(h, "tr", &v) == ESP_OK) capture_set_thermal_rotation(v);
             nvs_close(h);
-            ESP_LOGI(TAG, "settings loaded: hmirror=%d vflip=%d thermRot=%d",
-                     hal_camera_get_hmirror(), hal_camera_get_vflip(),
+            ESP_LOGI(TAG, "settings loaded: visRot=%d thermRot=%d",
+                     capture_get_visible_rotation(),
                      capture_get_thermal_rotation());
         }
     }

@@ -35,6 +35,23 @@ size_t capture_encode_thermal_jpeg(uint8_t *dst, size_t cap);
 void    capture_set_thermal_rotation(uint8_t r);
 uint8_t capture_get_thermal_rotation(void);
 
+// Visible rotation 0/1/2/3 → 0/90/180/270 CW. 0 and 180 use the
+// OV2640's hardware H/V flip (free); 90 and 270 require a software
+// JPEG decode → rotate → re-encode (~250 ms per VGA frame on S3).
+// Configures the sensor flips internally as a side-effect of set.
+void    capture_set_visible_rotation(uint8_t r);
+uint8_t capture_get_visible_rotation(void);
+
+// If visible rotation is 90 or 270, decode the input JPEG, rotate the
+// pixel buffer, and re-encode. On success, *out_jpg is heap-allocated
+// (caller frees with free()) and *out_w / *out_h are swapped.
+// If rotation is 0 or 180 (or input is invalid), returns false and
+// leaves outputs untouched — caller should use the original JPEG.
+bool capture_rotate_visible_jpeg_if_needed(const uint8_t *in_jpg, size_t in_len,
+                                            uint32_t in_w, uint32_t in_h,
+                                            uint8_t **out_jpg, size_t *out_len,
+                                            uint32_t *out_w, uint32_t *out_h);
+
 // Single immediate capture — vis JPEG + thermal JPEG, written to a
 // new SD session directory. On success, copies the new session id
 // (e.g. "session_4517") into `session_id_out`.

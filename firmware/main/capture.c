@@ -81,6 +81,81 @@ static volatile uint8_t s_therm_rotation = 0;
 void capture_set_thermal_rotation(uint8_t r) { s_therm_rotation = (uint8_t)(r & 3); }
 uint8_t capture_get_thermal_rotation(void)   { return s_therm_rotation; }
 
+// Visible rotation. 0 and 180 are free (sensor hflip+vflip); 90/270
+// trigger SW decode→rotate→re-encode in apply_visible_rotation().
+static volatile uint8_t s_vis_rotation = 0;
+
+void capture_set_visible_rotation(uint8_t r) {
+    r = (uint8_t)(r & 3);
+    s_vis_rotation = r;
+    // Map rotation to sensor flips. 180° is the only state we can do
+    // entirely in hardware; 0/90/270 leave the sensor un-flipped and
+    // (for 90/270) defer rotation to the software path.
+    bool h = (r == 2);
+    bool v = (r == 2);
+    hal_camera_set_hmirror(h);
+    hal_camera_set_vflip(v);
+}
+uint8_t capture_get_visible_rotation(void) { return s_vis_rotation; }
+
+// Rotate an RGB888 buffer (W × H) 90 or 270 CW into dst (which must be
+// H × W). Tightly packed, 3 bytes per pixel.
+static void rotate_rgb888(const uint8_t *src, uint8_t *dst,
+                          uint32_t W, uint32_t H, uint8_t rot) {
+    if (rot == 1) {              // 90° CW
+        for (uint32_t y = 0; y < H; y++) {
+            for (uint32_t x = 0; x < W; x++) {
+                const uint8_t *s = src + (y * W + x) * 3;
+                uint8_t *d = dst + (x * H + (H - 1 - y)) * 3;
+                d[0] = s[0]; d[1] = s[1]; d[2] = s[2];
+            }
+        }
+    } else if (rot == 3) {       // 270° CW
+        for (uint32_t y = 0; y < H; y++) {
+            for (uint32_t x = 0; x < W; x++) {
+                const uint8_t *s = src + (y * W + x) * 3;
+                uint8_t *d = dst + ((W - 1 - x) * H + y) * 3;
+                d[0] = s[0]; d[1] = s[1]; d[2] = s[2];
+            }
+        }
+    }
+}
+
+bool capture_rotate_visible_jpeg_if_needed(const uint8_t *in_jpg, size_t in_len,
+                                            uint32_t in_w, uint32_t in_h,
+                                            uint8_t **out_jpg, size_t *out_len,
+                                            uint32_t *out_w, uint32_t *out_h) {
+    uint8_t r = s_vis_rotation;
+    if (r != 1 && r != 3) return false;
+    if (!in_jpg || in_len == 0 || in_w == 0 || in_h == 0) return false;
+
+    size_t pix_len = (size_t)in_w * in_h * 3;
+    uint8_t *rgb = heap_caps_malloc(pix_len, MALLOC_CAP_SPIRAM);
+    if (!rgb) return false;
+
+    if (!fmt2rgb888(in_jpg, in_len, PIXFORMAT_JPEG, rgb)) {
+        free(rgb);
+        return false;
+    }
+    uint8_t *rot = heap_caps_malloc(pix_len, MALLOC_CAP_SPIRAM);
+    if (!rot) { free(rgb); return false; }
+
+    rotate_rgb888(rgb, rot, in_w, in_h, r);
+    free(rgb);
+
+    uint8_t *jpg = NULL; size_t jpg_len = 0;
+    bool ok = fmt2jpg(rot, pix_len, in_h, in_w, PIXFORMAT_RGB888, 80,
+                       &jpg, &jpg_len);
+    free(rot);
+    if (!ok || !jpg) return false;
+
+    *out_jpg = jpg;
+    *out_len = jpg_len;
+    *out_w = in_h;          // dims swapped
+    *out_h = in_w;
+    return true;
+}
+
 static void ensure_therm_buffers(void) {
     if (!s_therm_enc_mutex) s_therm_enc_mutex = xSemaphoreCreateMutex();
     if (!s_iron_lut_built)  build_iron_lut();
@@ -232,14 +307,28 @@ esp_err_t capture_now(char *session_id_out, size_t session_id_cap,
         return err;
     }
 
-    // Copy vis JPEG out of the camera FB (which we'll release shortly).
-    uint8_t *vis_copy = heap_caps_malloc(vis_len, MALLOC_CAP_SPIRAM);
-    if (!vis_copy) {
-        hal_camera_release();
-        snprintf(msg_out, msg_cap, "OOM copying vis JPEG (%u B)", (unsigned)vis_len);
-        return ESP_ERR_NO_MEM;
+    // For 90/270 visible rotation, decode → rotate → re-encode here so
+    // recordings save in the chosen orientation.
+    uint8_t *vis_copy = NULL;
+    {
+        uint8_t *rot_jpg = NULL; size_t rot_len = 0;
+        uint32_t rw = vis_w, rh = vis_h;
+        if (capture_rotate_visible_jpeg_if_needed(vis_jpg, vis_len, vis_w, vis_h,
+                                                   &rot_jpg, &rot_len, &rw, &rh)) {
+            vis_copy = rot_jpg;     // already heap-allocated; we own it
+            vis_len  = rot_len;
+            vis_w    = rw;
+            vis_h    = rh;
+        } else {
+            vis_copy = heap_caps_malloc(vis_len, MALLOC_CAP_SPIRAM);
+            if (!vis_copy) {
+                hal_camera_release();
+                snprintf(msg_out, msg_cap, "OOM copying vis JPEG (%u B)", (unsigned)vis_len);
+                return ESP_ERR_NO_MEM;
+            }
+            memcpy(vis_copy, vis_jpg, vis_len);
+        }
     }
-    memcpy(vis_copy, vis_jpg, vis_len);
     hal_camera_release();
 
     // Encode thermal next (also outside SD lock — it has its own mutex).
@@ -460,14 +549,24 @@ static void tl_capture_iteration(uint32_t seq) {
     }
 
     // Grab vis JPEG into a PSRAM copy so we can release the camera FB.
+    // SW rotation (90°/270°) happens here so each timelapse capture is
+    // saved in the user-selected orientation.
     const uint8_t *vis_jpg = NULL;
     size_t vis_len = 0;
     uint32_t vis_w = 0, vis_h = 0;
     bool vis_grabbed = (hal_camera_grab_jpeg(&vis_jpg, &vis_len, &vis_w, &vis_h) == ESP_OK);
     uint8_t *vis_copy = NULL;
     if (vis_grabbed && s_tl_capture_vis) {
-        vis_copy = heap_caps_malloc(vis_len, MALLOC_CAP_SPIRAM);
-        if (vis_copy) memcpy(vis_copy, vis_jpg, vis_len);
+        uint8_t *rot_jpg = NULL; size_t rot_len = 0;
+        uint32_t rw = vis_w, rh = vis_h;
+        if (capture_rotate_visible_jpeg_if_needed(vis_jpg, vis_len, vis_w, vis_h,
+                                                   &rot_jpg, &rot_len, &rw, &rh)) {
+            vis_copy = rot_jpg;
+            vis_len  = rot_len;
+        } else {
+            vis_copy = heap_caps_malloc(vis_len, MALLOC_CAP_SPIRAM);
+            if (vis_copy) memcpy(vis_copy, vis_jpg, vis_len);
+        }
     }
     if (vis_grabbed) hal_camera_release();
 
