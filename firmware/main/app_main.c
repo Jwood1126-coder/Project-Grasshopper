@@ -33,6 +33,7 @@
 #include "sdkconfig.h"
 
 #include "capture.h"
+#include "session_store.h"
 #include "sessions.h"
 #include "ota.h"
 #include "cJSON.h"
@@ -690,6 +691,13 @@ void app_main(void) {
     // Storage — non-fatal if a partition is missing or the SD slot is empty.
     hal_storage_littlefs_mount();
     hal_storage_sd_mount();
+
+    // Sweep any incomplete sessions left over from a crash / power loss
+    // mid-write. Repairs session.json from journal, deletes orphan
+    // finalized files (seq > journal max), deletes any *.tmp orphans.
+    // Must run before any session_store_open call, while no other SD
+    // writers are around. Cheap when there's nothing to do.
+    session_store_recover_all();
 
     if (strlen(CONFIG_GRASSHOPPER_WIFI_SSID) > 0) {
         ESP_ERROR_CHECK(net_wifi_init());
