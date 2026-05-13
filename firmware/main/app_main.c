@@ -463,14 +463,19 @@ void thermal_preview_task(void *arg) {
             }
         }
 
+        // Reserve room at the tail for the raw uint16 frame (160*120*2
+        // = 38400 B). Trailer comes after the JPEG bytes; relay/UI
+        // detect it via total > HDR+jpg_len. Lets the dashboard show
+        // per-pixel temps on hover with no extra request round-trip.
+        const size_t RAW_BYTES = (size_t)LEP_W * LEP_H * 2;
+        size_t jpg_cap = PREVIEW_MAX_BYTES - PREVIEW_HDR_LEN - RAW_BYTES;
         size_t jpg_len = capture_encode_thermal_jpeg(
-            s_therm_preview_buf + PREVIEW_HDR_LEN,
-            PREVIEW_MAX_BYTES - PREVIEW_HDR_LEN);
+            s_therm_preview_buf + PREVIEW_HDR_LEN, jpg_cap);
         if (jpg_len == 0) continue;     // no committed frame yet
 
         memcpy(s_therm_preview_buf, PREVIEW_MAGIC, 4);
         s_therm_preview_buf[4] = PREVIEW_MOD_THERM;
-        s_therm_preview_buf[5] = 1;
+        s_therm_preview_buf[5] = 2;        // version 2: raw trailer present
         s_therm_preview_buf[6] = 0;
         s_therm_preview_buf[7] = 0;
         put_u32_le(s_therm_preview_buf + 8,  LEP_W);
@@ -478,7 +483,16 @@ void thermal_preview_task(void *arg) {
         put_u32_le(s_therm_preview_buf + 16, (uint32_t)jpg_len);
         put_u32_le(s_therm_preview_buf + 20, (uint32_t)time(NULL));
 
-        size_t total = PREVIEW_HDR_LEN + jpg_len;
+        // Append the raw uint16 frame (pre-rotation). The first capture
+        // before any thermal commit returns false → skip the trailer
+        // and fall back to v1 layout.
+        bool raw_ok = capture_snapshot_thermal_raw(
+            (uint16_t *)(s_therm_preview_buf + PREVIEW_HDR_LEN + jpg_len),
+            RAW_BYTES);
+        size_t trailer = raw_ok ? RAW_BYTES : 0;
+        if (!raw_ok) s_therm_preview_buf[5] = 1;   // back to v1 if no raw
+
+        size_t total = PREVIEW_HDR_LEN + jpg_len + trailer;
         if (net_relay_send_binary(s_therm_preview_buf, total) != ESP_OK) {
             ESP_LOGW(TAG, "therm: send failed (%u B)", (unsigned)total);
         }

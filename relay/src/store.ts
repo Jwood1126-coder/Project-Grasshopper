@@ -9,6 +9,10 @@ export interface PreviewFrame {
   height: number
   ts: number          // ms when received by relay
   jpeg: Uint8Array
+  // Optional raw uint16 thermal frame (160 × 120 = 38400 bytes,
+  // little-endian). Present on thermal previews v2+; let UI compute
+  // per-pixel temperatures on hover without an extra round-trip.
+  raw16?: Uint8Array
 }
 
 export interface DeviceRecord {

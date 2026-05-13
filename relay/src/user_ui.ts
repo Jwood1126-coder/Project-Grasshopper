@@ -194,6 +194,42 @@ export const USER_UI_HTML = `<!doctype html>
      either modality goes portrait (90° / 270°). */
   .panel.portrait { aspect-ratio: 3/4; }
 
+  /* Thermal crosshair + per-pixel readout (Phase 3 radiometric) */
+  .panel.thermal .therm-readout {
+    position: absolute; pointer-events: none;
+    inset: 0; z-index: 4;
+  }
+  .panel.thermal .therm-cursor {
+    position: absolute; width: 14px; height: 14px;
+    margin-left: -7px; margin-top: -7px;
+    border: 2px solid #fff; border-radius: 50%;
+    box-shadow: 0 0 0 1px rgba(0,0,0,0.6);
+    pointer-events: none; transition: opacity 0.15s;
+  }
+  .panel.thermal .therm-cursor.hidden { opacity: 0; }
+  .panel.thermal .therm-tip {
+    position: absolute; transform: translate(-50%, -130%);
+    background: rgba(10, 14, 20, 0.85); backdrop-filter: blur(6px);
+    color: #fff; font: 600 12px/1.2 ui-monospace, monospace;
+    padding: 4px 8px; border-radius: 4px; border: 1px solid var(--border);
+    pointer-events: none; white-space: nowrap;
+  }
+
+  /* Temperature legend bar (under each thermal panel) */
+  .panel-legend {
+    margin-top: -6px; margin-bottom: 12px;
+    display: flex; align-items: center; gap: 8px;
+    font: 11px/1 ui-monospace, monospace; color: var(--muted);
+  }
+  .panel-legend .lbar {
+    flex: 1; height: 12px; border-radius: 3px;
+    background: linear-gradient(to right,
+      #000000 0%, #500082 25%, #dc1e3c 50%, #ffc828 75%, #ffffff 100%);
+    border: 1px solid var(--border);
+  }
+  .panel-legend .lmin, .panel-legend .lmax { min-width: 56px; text-align: center; color: var(--text); }
+  .panel-legend .lmax { text-align: right; }
+
   /* ─── Action buttons ─── */
   .actions {
     display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
@@ -652,6 +688,13 @@ export const USER_UI_HTML = `<!doctype html>
   })();
   let lastRadiometric = null;
 
+  // Latest thermal raw frame fetched alongside the JPEG. Cached so the
+  // hover handler can compute temps without a per-mouse-move fetch.
+  // tempScaleX100: 1 means raw counts ARE centi-Kelvin; 10 means deci-K.
+  let thermRaw = null;       // Uint16Array of length W*H, native (pre-rotation)
+  let thermRawW = 0, thermRawH = 0, thermRawTs = 0;
+  let tempScaleX100 = 1;
+
   function fToC(f) { return (f - 32) * 5 / 9; }
   function fmtTemp(tF) {
     if (tF == null || !isFinite(tF)) return '—';
@@ -663,12 +706,120 @@ export const USER_UI_HTML = `<!doctype html>
     if (!rad || !rad.haveTemps) {
       fields.thermalTempLabel.textContent = rad && rad.active === false
         ? 'radiometric off' : '—';
+      if (fields.legendMin) fields.legendMin.textContent = '—';
+      if (fields.legendMax) fields.legendMax.textContent = '—';
       return;
     }
     fields.thermalTempLabel.textContent =
       'min ' + fmtTemp(rad.minTempF) +
       '  ctr ' + fmtTemp(rad.centerTempF) +
       '  max ' + fmtTemp(rad.maxTempF);
+    // Refresh legend bar labels.
+    if (fields.legendMin) fields.legendMin.textContent = fmtTemp(rad.minTempF);
+    if (fields.legendMax) fields.legendMax.textContent = fmtTemp(rad.maxTempF);
+    // Cache scale factor for crosshair temp lookups.
+    tempScaleX100 = (rad.tlinearResolution === 1) ? 1 : 10;
+  }
+
+  // Convert a single raw count → °F using the cached scale.
+  function rawToF(raw) {
+    const cK = raw * tempScaleX100;
+    const C  = cK / 100 - 273.15;
+    return C * 9 / 5 + 32;
+  }
+
+  // Periodic fetch of the latest thermal raw16 frame. Caches to
+  // thermRaw / thermRawW / thermRawH so the hover handler is purely
+  // synchronous (no per-mouse-move fetch). Only fires while the
+  // thermal panel is visible (live view) and we haven't already got
+  // a fresh frame for this preview cycle.
+  async function refreshThermRaw() {
+    if (currentView !== 'live' || !currentDeviceId) return;
+    try {
+      const r = await fetch(
+        '/api/devices/' + encodeURIComponent(currentDeviceId) + '/last-thermal.raw16',
+        { cache: 'no-store' }
+      );
+      if (!r.ok) return;
+      const w = Number(r.headers.get('X-Frame-Width'))  || 160;
+      const h = Number(r.headers.get('X-Frame-Height')) || 120;
+      const buf = await r.arrayBuffer();
+      if (buf.byteLength !== w * h * 2) return;
+      thermRaw = new Uint16Array(buf);
+      thermRawW = w; thermRawH = h; thermRawTs = Date.now();
+    } catch {}
+  }
+
+  // Map a panel-relative pointer position to a raw-frame pixel index.
+  // Honors object-fit:contain (letterboxing) and the current thermal
+  // rotation so the cursor lands on the correct source pixel.
+  function pointerToRawIdx(panel, ev) {
+    if (!thermRaw) return null;
+    const rect = panel.getBoundingClientRect();
+    const px = ev.clientX - rect.left;
+    const py = ev.clientY - rect.top;
+    if (px < 0 || py < 0 || px > rect.width || py > rect.height) return null;
+
+    // The displayed image is the firmware-rotated JPEG. After rotation
+    // 1 or 3 the displayed dims are H × W (portrait). Compute fitted
+    // size + offsets for object-fit: contain, then map back to raw.
+    const r = currentSettings.thermRotation & 3;
+    const dispW = (r & 1) ? thermRawH : thermRawW;
+    const dispH = (r & 1) ? thermRawW : thermRawH;
+    const scale = Math.min(rect.width / dispW, rect.height / dispH);
+    const fittedW = dispW * scale;
+    const fittedH = dispH * scale;
+    const offX = (rect.width  - fittedW) / 2;
+    const offY = (rect.height - fittedH) / 2;
+    if (px < offX || px > offX + fittedW ||
+        py < offY || py > offY + fittedH) return null;
+    // Pixel coord in the displayed (rotated) image.
+    const dx = Math.floor((px - offX) / scale);
+    const dy = Math.floor((py - offY) / scale);
+    // Inverse-rotate to native raw-frame coords.
+    let rx, ry;
+    switch (r) {
+      case 0: rx = dx;                    ry = dy;                    break;
+      case 1: rx = dy;                    ry = thermRawH - 1 - dx;    break;
+      case 2: rx = thermRawW - 1 - dx;    ry = thermRawH - 1 - dy;    break;
+      case 3: rx = thermRawW - 1 - dy;    ry = dx;                    break;
+    }
+    if (rx < 0 || ry < 0 || rx >= thermRawW || ry >= thermRawH) return null;
+    return { idx: ry * thermRawW + rx, panelX: px, panelY: py };
+  }
+
+  function setupThermPanelHover(panel) {
+    const showCursor = (panelX, panelY, tF) => {
+      fields.thermCursor.style.left = panelX + 'px';
+      fields.thermCursor.style.top  = panelY + 'px';
+      fields.thermCursor.classList.remove('hidden');
+      fields.thermTip.style.display = '';
+      fields.thermTip.style.left = panelX + 'px';
+      fields.thermTip.style.top  = panelY + 'px';
+      fields.thermTip.textContent = fmtTemp(tF);
+    };
+    const hide = () => {
+      fields.thermCursor.classList.add('hidden');
+      fields.thermTip.style.display = 'none';
+    };
+    panel.addEventListener('mousemove', (e) => {
+      const hit = pointerToRawIdx(panel, e);
+      if (!hit || !thermRaw) { hide(); return; }
+      const raw = thermRaw[hit.idx];
+      if (raw === 0) { hide(); return; }
+      showCursor(hit.panelX, hit.panelY, rawToF(raw));
+    });
+    panel.addEventListener('mouseleave', hide);
+    // Touch: tap-to-show, single-tap pin (auto-clears after 2 s).
+    panel.addEventListener('touchstart', (e) => {
+      const t = e.touches[0]; if (!t) return;
+      const hit = pointerToRawIdx(panel, t);
+      if (!hit || !thermRaw) return;
+      const raw = thermRaw[hit.idx];
+      if (raw === 0) return;
+      showCursor(hit.panelX, hit.panelY, rawToF(raw));
+      setTimeout(hide, 2000);
+    }, { passive: true });
   }
 
   // Current device-side orientation. Updated from tick.settings.
@@ -883,11 +1034,20 @@ export const USER_UI_HTML = `<!doctype html>
         sendSettings({ thermRotation: next });
       } }, '⟲');
     const thermCtrls = el('div', { class: 'panel-ctrls' }, fields.thermRotBtn);
+    // Per-pixel temperature readout overlay. Cursor + tooltip follow
+    // the mouse over the thermal panel; the JS handler computes temp
+    // from the most recent raw16 frame fetched alongside the JPEG.
+    fields.thermCursor = el('div', { class: 'therm-cursor hidden' });
+    fields.thermTip    = el('div', { class: 'therm-tip',  style: 'display:none' });
+    const thermReadout = el('div', { class: 'therm-readout' },
+      fields.thermCursor, fields.thermTip);
     fields.thermalPanel = el('div', { class: 'panel thermal' },
       el('div', { class: 'panel-label thermal' }, 'Thermal'),
       fields.thermalMeta,
       thermCtrls,
+      thermReadout,
       fields.thermalEmpty);
+    setupThermPanelHover(fields.thermalPanel);
 
     fields.visImg = el('img', { id: 'vis-img', alt: 'Visible preview' });
     fields.visEmpty = el('div', { class: 'panel-empty' }, 'no visible preview yet');
@@ -913,6 +1073,15 @@ export const USER_UI_HTML = `<!doctype html>
       fields.visEmpty);
 
     const views = el('div', { class: 'views' }, fields.thermalPanel, fields.visPanel);
+
+    // Iron-palette legend bar: gradient + min/max temp labels updated
+    // each tick from radiometric.{minTempF, maxTempF}. Sits below the
+    // panels so it stays close to the thermal preview without
+    // affecting the panel aspect-ratio.
+    fields.legendMin = el('span', { class: 'lmin' }, '—');
+    fields.legendMax = el('span', { class: 'lmax' }, '—');
+    fields.legend = el('div', { class: 'panel-legend' },
+      fields.legendMin, el('span', { class: 'lbar' }), fields.legendMax);
 
     fields.captureBtn = el('button', {
       class: 'btn primary',
@@ -961,7 +1130,7 @@ export const USER_UI_HTML = `<!doctype html>
       el('summary', {}, 'Diagnostics & device state'),
       el('div', { class: 'body' }, fields.statBlock, tokenRow));
 
-    return el('div', {}, fields.tlBannerSlot, views, fields.actions, fields.actionsSec, diagnostics);
+    return el('div', {}, fields.tlBannerSlot, views, fields.legend, fields.actions, fields.actionsSec, diagnostics);
   }
 
   // ───── Live view update ─────
@@ -1173,6 +1342,10 @@ export const USER_UI_HTML = `<!doctype html>
     if (currentView !== 'live') return;
     refreshImg('thermal');
     refreshImg('vis');
+    // Pull the raw thermal frame for crosshair temp lookups. Same
+    // cadence as JPEG refresh so the per-pixel readout stays roughly
+    // in sync with what the user sees.
+    refreshThermRaw();
   }
 
   // ───── Commands with id/result ─────

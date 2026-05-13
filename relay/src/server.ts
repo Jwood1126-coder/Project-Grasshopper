@@ -97,6 +97,26 @@ app.get('/api/devices/:id/last-frame.jpg', (c) => {
   })
 })
 
+// Latest thermal raw uint16 frame (160 × 120 = 38400 bytes LE).
+// UI fetches this alongside the JPEG so it can compute per-pixel
+// temperatures on hover. 404 if no v2 thermal frame has been
+// received yet (firmware older than the radiometric Phase 3 push).
+app.get('/api/devices/:id/last-thermal.raw16', (c) => {
+  const d = store.get(c.req.param('id'))
+  if (!d) return c.text('unknown device', 404)
+  const f = d.previewTherm
+  if (!f || !f.raw16) return c.text('no raw frame yet', 404)
+  return new Response(f.raw16, {
+    headers: {
+      'Content-Type':   'application/octet-stream',
+      'Cache-Control':  'no-store',
+      'X-Frame-Width':  String(f.width),
+      'X-Frame-Height': String(f.height),
+      'X-Frame-Age-Ms': String(Date.now() - f.ts),
+    },
+  })
+})
+
 app.post('/api/devices/:id/cmd', async (c) => {
   // Require the same shared secret the device uses to register, sent
   // as a Bearer header. Prevents anonymous internet traffic from
@@ -318,20 +338,31 @@ const RELAY_TOKEN = process.env.RELAY_TOKEN ?? 'dev-token'
 function handlePreview(ws: ServerWebSocket<WsCtx>, buf: Buffer) {
   if (!ws.data.authed || !ws.data.deviceId) return
   const modalityByte = buf[4]
+  const version      = buf[5]
   const w = buf.readUInt32LE(8)
   const h = buf.readUInt32LE(12)
   const jpegLen = buf.readUInt32LE(16)
-  if (jpegLen + 24 !== buf.length) {
-    console.warn(`[ws] preview length mismatch: hdr says ${jpegLen}, got ${buf.length - 24}`)
+  // v2 thermal frames carry the raw uint16 frame as a trailer after
+  // the JPEG. v1 frames have nothing past the JPEG. Tolerate both.
+  const expectedV1 = 24 + jpegLen
+  const trailerLen = buf.length - expectedV1
+  if (trailerLen < 0) {
+    console.warn(`[ws] preview length short: hdr says ${jpegLen}, got ${buf.length - 24}`)
     return
   }
   const jpeg = new Uint8Array(buf.buffer, buf.byteOffset + 24, jpegLen)
+  let raw16: Uint8Array | undefined
+  if (modalityByte === 2 && version >= 2 && trailerLen >= w * h * 2) {
+    raw16 = new Uint8Array(buf.buffer, buf.byteOffset + 24 + jpegLen, w * h * 2)
+    raw16 = new Uint8Array(raw16)   // copy out of WS buffer
+  }
   const frame: PreviewFrame = {
     modality: modalityByte === 2 ? 'thermal' : 'vis',
     width: w,
     height: h,
     ts: Date.now(),
-    jpeg: new Uint8Array(jpeg), // copy out of the WS buffer
+    jpeg: new Uint8Array(jpeg),
+    raw16,
   }
   store.setPreview(ws.data.deviceId, frame)
   store.upsert(ws.data.deviceId, { lastSeenMs: Date.now() })
