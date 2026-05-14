@@ -7,11 +7,13 @@
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_websocket_client.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 
 #include "hal_lepton.h"
@@ -35,6 +37,52 @@ static net_relay_cmd_handler_t s_cmd_handler = NULL;
 #define INBOUND_BUF_SIZE 4096
 static char s_inbound_buf[INBOUND_BUF_SIZE];
 static size_t s_inbound_len = 0;
+
+// ---- Single-sender queue (PR-F) ----
+//
+// Previously every sender (preview, tick, log, cmd.result) called
+// esp_websocket_client_send_* directly. The WS client takes its
+// own internal mutex during the entire TLS+TCP write, so a slow
+// 50 KB preview send (1-2 s on iPhone-hotspot uplink) blocks tick
+// + cmd.result for that whole window. Tick failed at its 1000 ms
+// timeout, the WS event task couldn't process pings/pongs while
+// the mutex was held, and the relay closed the connection with
+// code=1006 — the WS thrash we hunted in PR-A.
+//
+// Now: callers post messages to a bounded queue. A single sender
+// task drains the queue and owns esp_websocket_client_send_*
+// exclusively. Tick + cmd.result + preview no longer race on the
+// mutex; each just enqueues and returns immediately.
+//
+// Buffers are heap-copied at enqueue (callers don't have to manage
+// lifetime), freed by the sender after the send completes.
+//
+// Drop policy: if the queue is full, the new message is dropped
+// (return ESP_FAIL). 16 slots is enough for ~10 s of buildup at
+// the steady-state ~2 msg/s rate; any more and we're behind on
+// throughput, in which case dropping the newest is the right call.
+
+typedef enum {
+    SEND_TEXT   = 0,
+    SEND_BINARY = 1,
+} send_kind_t;
+
+typedef struct {
+    send_kind_t kind;
+    uint8_t    *buf;       // heap-owned (PSRAM for binary, internal for text)
+    size_t      len;
+} send_msg_t;
+
+#define SEND_QUEUE_DEPTH 16
+static QueueHandle_t s_send_queue = NULL;
+static TaskHandle_t  s_sender_task = NULL;
+static volatile bool s_sender_stop = false;
+
+// Forward decls — these are defined further down but referenced by
+// emit_cmd_result (early), net_relay_start, and net_relay_stop.
+static esp_err_t enqueue(send_kind_t kind, const void *src, size_t len);
+static void      send_queue_flush(void);
+static void      sender_task(void *arg);
 
 static void send_hello(void) {
     Hello_t h = {
@@ -95,7 +143,9 @@ void net_relay_emit_cmd_result(const char *cmd_type, const char *cmd_id,
 
     if (s_connected) {
         size_t len = strlen(json);
-        esp_websocket_client_send_text(s_client, json, (int)len, pdMS_TO_TICKS(1000));
+        // Goes through the single-sender queue so it doesn't race with
+        // tick / preview on the WS client mutex (PR-F).
+        enqueue(SEND_TEXT, json, len);
         ESP_LOGI(TAG, "cmd.result %s id=%s %s msg=\"%s\"%s",
                  cmd_type, cmd_id, ok ? "OK" : "FAIL", msg,
                  data_json ? " (+data)" : "");
@@ -302,10 +352,45 @@ esp_err_t net_relay_start(void) {
 
     ESP_ERROR_CHECK(esp_websocket_register_events(
         s_client, WEBSOCKET_EVENT_ANY, on_event, NULL));
+
+    // Single-sender setup (PR-F). Spawned before client_start so the
+    // sender is draining by the time the first send queues up.
+    if (!s_send_queue) {
+        s_send_queue = xQueueCreate(SEND_QUEUE_DEPTH, sizeof(send_msg_t));
+        if (!s_send_queue) {
+            ESP_LOGE(TAG, "send queue create failed");
+            esp_websocket_client_destroy(s_client);
+            s_client = NULL;
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    s_sender_stop = false;
+    if (!s_sender_task) {
+        // Pinned to core 0 alongside the WS event task so we don't
+        // share core 1 with the VoSPI reader.
+        xTaskCreatePinnedToCore(sender_task, "ws-sender", 4096, NULL, 6,
+                                 &s_sender_task, 0);
+    }
+
     return esp_websocket_client_start(s_client);
 }
 
 void net_relay_stop(void) {
+    // Tell sender to exit at next queue-receive boundary, then drain
+    // any in-flight buffers so we don't leak.
+    if (s_sender_task) {
+        s_sender_stop = true;
+        // Sender wakes every 250 ms even on empty queue.
+        for (int i = 0; i < 20 && s_sender_task; i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+    }
+    send_queue_flush();
+    if (s_send_queue) {
+        vQueueDelete(s_send_queue);
+        s_send_queue = NULL;
+    }
+
     if (!s_client) return;
     // close + destroy. The relay sees a graceful close (not 1006)
     // because esp_websocket_client_close sends a CLOSE frame.
@@ -317,18 +402,96 @@ void net_relay_stop(void) {
     ESP_LOGI(TAG, "stopped");
 }
 
+// Drain the send queue, freeing any pending buffers. Used on stop /
+// shutdown so we don't leak heap.
+static void send_queue_flush(void) {
+    if (!s_send_queue) return;
+    send_msg_t m;
+    while (xQueueReceive(s_send_queue, &m, 0) == pdTRUE) {
+        if (m.buf) free(m.buf);
+    }
+}
+
+// Sender task — single owner of esp_websocket_client_send_*. Drains
+// the queue, sends each message, frees the heap buffer. Holds the
+// WS client mutex (internally, inside send_*) for as long as each
+// individual send takes; other senders no longer race on it because
+// they only enqueue, they never call send_* themselves.
+static void sender_task(void *arg) {
+    (void)arg;
+    while (!s_sender_stop) {
+        send_msg_t m;
+        if (xQueueReceive(s_send_queue, &m, pdMS_TO_TICKS(250)) != pdTRUE) {
+            continue;
+        }
+        if (s_connected && s_client && m.buf) {
+            int sent;
+            if (m.kind == SEND_TEXT) {
+                sent = esp_websocket_client_send_text(
+                    s_client, (const char *)m.buf, (int)m.len,
+                    pdMS_TO_TICKS(5000));
+            } else {
+                sent = esp_websocket_client_send_bin(
+                    s_client, (const char *)m.buf, (int)m.len,
+                    pdMS_TO_TICKS(5000));
+            }
+            if (sent <= 0) {
+                ESP_LOGW(TAG, "sender: %s send failed (%u B)",
+                         m.kind == SEND_TEXT ? "text" : "binary",
+                         (unsigned)m.len);
+            }
+        }
+        if (m.buf) free(m.buf);
+    }
+    // Drain remaining queue contents so we don't leak.
+    send_queue_flush();
+    s_sender_task = NULL;
+    vTaskDelete(NULL);
+}
+
+// Enqueue a message for the sender task. Copies the payload to a
+// freshly-allocated heap buffer so the caller can release/free its
+// own buffer immediately after this returns. binary=true allocates
+// from PSRAM (~50 KB preview frames), false from internal RAM
+// (small JSON text fits comfortably).
+static esp_err_t enqueue(send_kind_t kind, const void *src, size_t len) {
+    if (!s_connected || !s_client || !s_send_queue) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (len == 0) return ESP_ERR_INVALID_ARG;
+    uint32_t caps = (kind == SEND_BINARY)
+                    ? MALLOC_CAP_SPIRAM
+                    : MALLOC_CAP_8BIT;
+    uint8_t *copy = (uint8_t *)heap_caps_malloc(len, caps);
+    if (!copy) {
+        // Fallback: if SPIRAM allocator says no for binary, try the
+        // generic heap. Internal text alloc failures are real OOM and
+        // should propagate.
+        if (kind == SEND_BINARY) {
+            copy = (uint8_t *)malloc(len);
+        }
+        if (!copy) return ESP_ERR_NO_MEM;
+    }
+    memcpy(copy, src, len);
+    send_msg_t m = { .kind = kind, .buf = copy, .len = len };
+    if (xQueueSend(s_send_queue, &m, 0) != pdTRUE) {
+        // Queue full — drop. With SEND_QUEUE_DEPTH=16 and steady-state
+        // ~2 msg/s, only happens if the link is genuinely too slow to
+        // keep up; the right call is to drop the newest rather than
+        // back-pressure callers (which would re-introduce the lock
+        // contention we built the queue to eliminate).
+        free(copy);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
 esp_err_t net_relay_send(const char *json, size_t len) {
-    if (!s_connected || !s_client) return ESP_ERR_INVALID_STATE;
-    int sent = esp_websocket_client_send_text(s_client, json, (int)len,
-                                              pdMS_TO_TICKS(1000));
-    return sent > 0 ? ESP_OK : ESP_FAIL;
+    return enqueue(SEND_TEXT, json, len);
 }
 
 esp_err_t net_relay_send_binary(const void *buf, size_t len) {
-    if (!s_connected || !s_client) return ESP_ERR_INVALID_STATE;
-    int sent = esp_websocket_client_send_bin(s_client, (const char *)buf,
-                                              (int)len, pdMS_TO_TICKS(2000));
-    return sent > 0 ? ESP_OK : ESP_FAIL;
+    return enqueue(SEND_BINARY, buf, len);
 }
 
 bool net_relay_is_connected(void) { return s_connected; }
