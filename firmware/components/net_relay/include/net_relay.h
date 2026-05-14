@@ -14,6 +14,11 @@ extern "C" {
 // underlying esp_websocket_client.
 esp_err_t net_relay_start(void);
 
+// Tear the WS client down cleanly. Sends a close frame so the relay
+// sees a graceful disconnect rather than a code=1006. Used by the
+// deep-sleep wake-window cycle between wakes. Idempotent.
+void net_relay_stop(void);
+
 // Send a JSON envelope to the relay. Drops if not connected. Thread-safe.
 esp_err_t net_relay_send(const char *json, size_t len);
 

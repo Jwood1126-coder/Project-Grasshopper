@@ -233,6 +233,24 @@ static size_t splice_extras(char *buf, size_t n, size_t cap) {
     extra = build_radiometric_json(buf + n, cap - n);
     if (extra > 0 && (size_t)(n + extra) < cap) n += extra;
 
+    // Deep-sleep block — only when a session is active. The dashboard
+    // reads this to render "session in progress, next wake at T+30s,
+    // 4/12 captures done" during wake-window phases (the only times
+    // the device is online during a DS session).
+    if (ds_scheduler_state() == DS_ACTIVE) {
+        extra = snprintf(buf + n, cap - n,
+            ",\"deepSleep\":{"
+              "\"active\":true,"
+              "\"sessionId\":\"%s\","
+              "\"nextSeq\":%lu,"
+              "\"maxCaptures\":%lu"
+            "}",
+            ds_scheduler_session_id(),
+            (unsigned long)ds_scheduler_next_seq(),
+            (unsigned long)ds_scheduler_max_captures());
+        if (extra > 0 && (size_t)(n + extra) < cap) n += extra;
+    }
+
     if (n + 1 >= cap) return n;
     buf[n++] = '}';
     return n;
@@ -529,15 +547,17 @@ static net_relay_cmd_status_t app_cmd_handler(const char *cmd, const char *id,
 
     if (strcmp(cmd, "timelapse.start") == 0) {
         // Payload: { intervalSec, captureVis, captureTherm, maxDurationSec?,
-        //            deepSleep?, maxCaptures? }
+        //            deepSleep?, maxCaptures?, wakeWifi?, wakeWindowSec? }
         // deepSleep:true  → switch to ds_scheduler (PR-C). intervalSec must
-        //                   be ≥60. maxCaptures is required (≥1). After
-        //                   arming, fires capture #1 immediately, then the
-        //                   device enters deep sleep until the next due
-        //                   interval. Each wake captures one frame.
+        //                   be ≥60. maxCaptures is required (≥1).
+        // wakeWifi:true   → after each commit, before sleep, bring up Wi-Fi
+        //                   + relay for wakeWindowSec (default 15, range
+        //                   1..60) and accept timelapse.stop.
         uint32_t interval = 30, max_dur = 0, max_caps = 0;
         bool capture_vis = true, capture_therm = true;
         bool deep_sleep  = false;
+        bool wake_wifi   = false;
+        uint32_t wake_window = 15;
         if (payload) {
             const cJSON *iv = cJSON_GetObjectItemCaseSensitive(payload, "intervalSec");
             if (cJSON_IsNumber(iv)) interval = (uint32_t)iv->valueint;
@@ -551,6 +571,10 @@ static net_relay_cmd_status_t app_cmd_handler(const char *cmd, const char *id,
             if (cJSON_IsBool(ds)) deep_sleep = cJSON_IsTrue(ds);
             const cJSON *mc = cJSON_GetObjectItemCaseSensitive(payload, "maxCaptures");
             if (cJSON_IsNumber(mc) && mc->valueint > 0) max_caps = (uint32_t)mc->valueint;
+            const cJSON *ww = cJSON_GetObjectItemCaseSensitive(payload, "wakeWifi");
+            if (cJSON_IsBool(ww)) wake_wifi = cJSON_IsTrue(ww);
+            const cJSON *ws = cJSON_GetObjectItemCaseSensitive(payload, "wakeWindowSec");
+            if (cJSON_IsNumber(ws) && ws->valueint > 0) wake_window = (uint32_t)ws->valueint;
         }
 
         if (deep_sleep) {
@@ -562,15 +586,18 @@ static net_relay_cmd_status_t app_cmd_handler(const char *cmd, const char *id,
                 snprintf(msg_out, msg_cap, "deep-sleep mode requires intervalSec ≥ 60 (Lepton boot ~10s/wake)");
                 return NET_RELAY_CMD_FAIL;
             }
+            if (wake_window > 60) wake_window = 60;
             char session_id[64];
             uint32_t r = (uint32_t)esp_random();
             snprintf(session_id, sizeof(session_id), "session_%lu",
                      (unsigned long)(1000 + (r % 99000)));
             ds_arm_args_t args = {
-                .max_captures  = max_caps,
-                .interval_sec  = interval,
-                .capture_vis   = capture_vis,
-                .capture_therm = capture_therm,
+                .max_captures    = max_caps,
+                .interval_sec    = interval,
+                .capture_vis     = capture_vis,
+                .capture_therm   = capture_therm,
+                .wake_wifi       = wake_wifi,
+                .wake_window_sec = wake_window,
             };
             esp_err_t err = ds_scheduler_arm(session_id, &args);
             if (err != ESP_OK) {
@@ -612,6 +639,18 @@ static net_relay_cmd_status_t app_cmd_handler(const char *cmd, const char *id,
     }
 
     if (strcmp(cmd, "timelapse.stop") == 0) {
+        // Route to whichever subsystem owns the active session. During
+        // a DS wake-window phase the live timelapse module isn't
+        // running, so timelapse_stop would say "no active timelapse"
+        // even though the user clearly wants to stop the deep-sleep
+        // session they just set up. ds_scheduler_state() tells us.
+        if (ds_scheduler_state() == DS_ACTIVE) {
+            ds_scheduler_request_stop();
+            snprintf(msg_out, msg_cap,
+                     "deep-sleep session %s will finalize at end of this wake window",
+                     ds_scheduler_session_id());
+            return NET_RELAY_CMD_OK;
+        }
         esp_err_t err = timelapse_stop(msg_out, msg_cap);
         return err == ESP_OK ? NET_RELAY_CMD_OK : NET_RELAY_CMD_FAIL;
     }
@@ -764,18 +803,27 @@ void app_main(void) {
     // writers are around. Cheap when there's nothing to do.
     session_store_recover_all();
 
+    // Register the cmd handler BEFORE ds_scheduler_maybe_handle_wake.
+    // The wake-window phase (PR-D, when wakeWifi:true) brings up the
+    // relay inside the wake cycle to accept timelapse.stop, so the
+    // handler must already be installed by then. net_relay_register
+    // is just a function-pointer store — safe to call before relay
+    // start, no side effects.
+    net_relay_register_cmd_handler(app_cmd_handler);
+
     // Deep-sleep wake handler. Examines wakeup cause + NVS state and:
     //   - timer wake + active session → run one capture cycle (returns
-    //     here only if the session completed; otherwise sleeps and
-    //     does not return)
+    //     here only if the session completed OR was stopped via
+    //     wake-window cmd; otherwise sleeps and does not return)
     //   - any other wake → ESP_ERR_INVALID_STATE; we fall through to
     //     normal boot. This keeps the cold-boot path unchanged for
     //     non-DS use, while making the DS wake path cheap (it skips
-    //     WiFi/relay/preview/OLED/tick init entirely).
+    //     WiFi/relay/preview/OLED/tick init entirely when wakeWifi
+    //     is false).
     ds_scheduler_init();
     ds_scheduler_maybe_handle_wake();
     // If we're here: either it wasn't a DS wake, or the session just
-    // completed its last capture — continue normal boot.
+    // completed its last capture / was stopped — continue normal boot.
 
     if (strlen(CONFIG_GRASSHOPPER_WIFI_SSID) > 0) {
         ESP_ERROR_CHECK(net_wifi_init());
@@ -791,7 +839,6 @@ void app_main(void) {
 
 #if CONFIG_GRASSHOPPER_RELAY_ENABLED
     ESP_LOGI(TAG, "starting relay → %s", CONFIG_GRASSHOPPER_RELAY_URL);
-    net_relay_register_cmd_handler(app_cmd_handler);
     ESP_ERROR_CHECK(net_relay_start());
     // OTA pending-verify watchdog: if this image is awaiting validation
     // (just booted from a fresh OTA), wait until the relay has been

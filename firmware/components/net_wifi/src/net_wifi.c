@@ -92,6 +92,14 @@ esp_err_t net_wifi_connect_blocking(const char *ssid, const char *password) {
     return ESP_FAIL;
 }
 
+void net_wifi_stop(void) {
+    if (!s_connected) return;
+    esp_wifi_disconnect();
+    esp_wifi_stop();
+    s_connected = false;
+    ESP_LOGI(TAG, "stopped");
+}
+
 bool net_wifi_is_connected(void) { return s_connected; }
 
 void net_wifi_get_link(char *ip_buf, size_t ip_len,

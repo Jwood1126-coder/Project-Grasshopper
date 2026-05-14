@@ -305,6 +305,18 @@ esp_err_t net_relay_start(void) {
     return esp_websocket_client_start(s_client);
 }
 
+void net_relay_stop(void) {
+    if (!s_client) return;
+    // close + destroy. The relay sees a graceful close (not 1006)
+    // because esp_websocket_client_close sends a CLOSE frame.
+    esp_websocket_client_close(s_client, pdMS_TO_TICKS(1000));
+    esp_websocket_client_stop(s_client);
+    esp_websocket_client_destroy(s_client);
+    s_client = NULL;
+    s_connected = false;
+    ESP_LOGI(TAG, "stopped");
+}
+
 esp_err_t net_relay_send(const char *json, size_t len) {
     if (!s_connected || !s_client) return ESP_ERR_INVALID_STATE;
     int sent = esp_websocket_client_send_text(s_client, json, (int)len,

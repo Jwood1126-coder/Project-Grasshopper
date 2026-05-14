@@ -14,6 +14,11 @@ esp_err_t net_wifi_init(void);
 // have elapsed. Returns ESP_OK on success, ESP_FAIL on timeout.
 esp_err_t net_wifi_connect_blocking(const char *ssid, const char *password);
 
+// Disconnect + esp_wifi_stop. Used by the deep-sleep wake-window cycle
+// to drop the radio cleanly between wakes (the next wake's init will
+// bring everything back up). Idempotent.
+void net_wifi_stop(void);
+
 bool net_wifi_is_connected(void);
 
 // Live link info; rssi=0 means "not associated".

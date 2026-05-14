@@ -44,7 +44,10 @@
 #include "hal_camera.h"
 #include "hal_lepton.h"
 #include "hal_storage.h"
+#include "net_wifi.h"
+#include "net_relay.h"
 #include "power_manager.h"
+#include "sdkconfig.h"
 #include "session_store.h"
 
 static const char *TAG = "ds_sched";
@@ -70,7 +73,9 @@ typedef struct {
     char     session_id[32];
     uint8_t  capture_vis;
     uint8_t  capture_therm;
-    uint8_t  reserved1[6];
+    uint8_t  wake_wifi;
+    uint8_t  reserved1;
+    uint32_t wake_window_sec;
 } ds_rtc_state_t;
 
 _Static_assert(sizeof(ds_rtc_state_t) <= 256,
@@ -114,6 +119,8 @@ static esp_err_t nvs_save(const ds_arm_args_t *args, const char *session_id,
     nvs_set_u8 (h, "vis",      args->capture_vis  ? 1 : 0);
     nvs_set_u8 (h, "therm",    args->capture_therm ? 1 : 0);
     nvs_set_u64(h, "start",    start_epoch);
+    nvs_set_u8 (h, "wfi",      args->wake_wifi ? 1 : 0);
+    nvs_set_u32(h, "wwin",     args->wake_window_sec);
     err = nvs_commit(h);
     nvs_close(h);
     return err;
@@ -133,20 +140,24 @@ static bool nvs_load(ds_arm_args_t *args, char *session_id, size_t cap,
         nvs_close(h);
         return false;
     }
-    uint32_t mx = 0, iv = 0;
-    uint8_t vis = 0, therm = 0;
+    uint32_t mx = 0, iv = 0, wwin = 0;
+    uint8_t vis = 0, therm = 0, wfi = 0;
     uint64_t start = 0;
     nvs_get_u32(h, "max",      &mx);
     nvs_get_u32(h, "interval", &iv);
     nvs_get_u8 (h, "vis",      &vis);
     nvs_get_u8 (h, "therm",    &therm);
     nvs_get_u64(h, "start",    &start);
+    nvs_get_u8 (h, "wfi",      &wfi);     // missing key on old sessions → 0
+    nvs_get_u32(h, "wwin",     &wwin);
     nvs_close(h);
 
-    args->max_captures  = mx;
-    args->interval_sec  = iv;
-    args->capture_vis   = (vis != 0);
-    args->capture_therm = (therm != 0);
+    args->max_captures    = mx;
+    args->interval_sec    = iv;
+    args->capture_vis     = (vis != 0);
+    args->capture_therm   = (therm != 0);
+    args->wake_wifi       = (wfi != 0);
+    args->wake_window_sec = wwin;
     if (start_epoch) *start_epoch = start;
     return true;
 }
@@ -212,6 +223,90 @@ static void load_user_settings(void) {
     nvs_close(h);
 }
 
+// ---- Wake-window stop hook ----
+//
+// Set by the cmd handler when timelapse.stop arrives during a wake
+// window. The wake-window loop polls this every 100ms; once it flips
+// true, the loop exits early and run_one_cycle finalizes the session
+// instead of sleeping again. RAM-only — wake windows fire fresh
+// each wake, so no persistence needed.
+
+static volatile bool s_stop_requested = false;
+
+void ds_scheduler_request_stop(void) {
+    ESP_LOGI(TAG, "stop requested via cmd");
+    s_stop_requested = true;
+}
+
+bool ds_scheduler_stop_requested(void) { return s_stop_requested; }
+
+// Run the wake-window phase: bring up Wi-Fi + relay, sit for up to
+// `window_sec` seconds, return early if a stop arrives. Returns true
+// if a stop was received (caller finalizes the session); false on
+// natural timeout (caller sleeps and continues the schedule).
+//
+// On entry the cmd handler must already be registered with net_relay
+// (app_main does this before ds_scheduler_maybe_handle_wake fires).
+// Wi-Fi credentials come from sdkconfig CONFIG_GRASSHOPPER_WIFI_*.
+//
+// Tolerant of Wi-Fi connect failure: if the radio can't associate
+// inside the bring-up budget, we still hold a brief settle (~2s) so
+// the dashboard sees one last log line if it's looking, then return
+// false (no stop). The session keeps going.
+static bool run_wake_window(uint32_t window_sec) {
+    if (window_sec < 1) window_sec = 1;
+    if (window_sec > 60) window_sec = 60;
+
+    s_stop_requested = false;
+
+    int64_t t0 = esp_timer_get_time();
+
+    // Bring up Wi-Fi. SSID/PASS from build config.
+    const char *ssid = CONFIG_GRASSHOPPER_WIFI_SSID;
+    const char *pass = CONFIG_GRASSHOPPER_WIFI_PASS;
+    if (!ssid || !*ssid) {
+        ESP_LOGW(TAG, "wake-window: no Wi-Fi SSID configured — skipping");
+        return false;
+    }
+    if (net_wifi_init() != ESP_OK) {
+        ESP_LOGW(TAG, "wake-window: net_wifi_init failed");
+        return false;
+    }
+    esp_err_t werr = net_wifi_connect_blocking(ssid, pass);
+    if (werr != ESP_OK) {
+        ESP_LOGW(TAG, "wake-window: Wi-Fi connect failed (%s) — sleeping again",
+                 esp_err_to_name(werr));
+        net_wifi_stop();
+        return false;
+    }
+
+    // Bring up the relay. Cmd handler should already be registered by
+    // app_main; net_relay_start opens the WSS and sends hello.
+    if (net_relay_start() != ESP_OK) {
+        ESP_LOGW(TAG, "wake-window: net_relay_start failed");
+        net_wifi_stop();
+        return false;
+    }
+
+    int64_t end_us = t0 + (int64_t)window_sec * 1000000LL;
+    ESP_LOGI(TAG, "wake-window open for %lus (will exit early on stop)",
+             (unsigned long)window_sec);
+    while (esp_timer_get_time() < end_us && !s_stop_requested) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    bool stopped = s_stop_requested;
+
+    int64_t up_ms = (esp_timer_get_time() - t0) / 1000;
+    ESP_LOGI(TAG, "wake-window closed after %lldms (stopped=%d)",
+             (long long)up_ms, (int)stopped);
+
+    // Tear down cleanly. relay first so the close frame goes out
+    // before we drop the radio.
+    net_relay_stop();
+    net_wifi_stop();
+    return stopped;
+}
+
 // ---- Public API ----
 
 void ds_scheduler_init(void) {
@@ -248,6 +343,8 @@ esp_err_t ds_scheduler_arm(const char *session_id,
     s_rtc.next_due_epoch      = start_epoch;     // first capture: now
     s_rtc.capture_vis         = args->capture_vis  ? 1 : 0;
     s_rtc.capture_therm       = args->capture_therm ? 1 : 0;
+    s_rtc.wake_wifi           = args->wake_wifi ? 1 : 0;
+    s_rtc.wake_window_sec     = args->wake_window_sec;
     rtc_seal();
 
     esp_err_t err = nvs_save(args, session_id, start_epoch);
@@ -256,11 +353,12 @@ esp_err_t ds_scheduler_arm(const char *session_id,
         memset(&s_rtc, 0, sizeof(s_rtc));
         return err;
     }
-    ESP_LOGI(TAG, "armed %s: %lu captures, %lus interval, vis=%d therm=%d",
+    ESP_LOGI(TAG, "armed %s: %lu captures, %lus interval, vis=%d therm=%d, wakeWifi=%d window=%lus",
              session_id,
              (unsigned long)args->max_captures,
              (unsigned long)args->interval_sec,
-             (int)args->capture_vis, (int)args->capture_therm);
+             (int)args->capture_vis, (int)args->capture_therm,
+             (int)args->wake_wifi, (unsigned long)args->wake_window_sec);
     return ESP_OK;
 }
 
@@ -292,6 +390,8 @@ esp_err_t ds_scheduler_run_one_cycle(void) {
         s_rtc.next_due_epoch      = start;
         s_rtc.capture_vis         = args.capture_vis  ? 1 : 0;
         s_rtc.capture_therm       = args.capture_therm ? 1 : 0;
+        s_rtc.wake_wifi           = args.wake_wifi ? 1 : 0;
+        s_rtc.wake_window_sec     = args.wake_window_sec;
         rtc_seal();
         ESP_LOGW(TAG, "run_one_cycle: rebuilt RTC from NVS (cold-boot resume)");
     }
@@ -393,12 +493,25 @@ esp_err_t ds_scheduler_run_one_cycle(void) {
     }
 
     bool last_capture = (s_rtc.next_seq >= s_rtc.max_captures);
-    if (last_capture) {
+
+    // Wake-window phase (PR-D): post-commit, before sleep, optionally
+    // bring up Wi-Fi + relay so the dashboard can see in-progress
+    // sessions and issue timelapse.stop. Skipped on the last capture
+    // (we're about to return to normal boot anyway, which brings up
+    // Wi-Fi + relay through the standard path).
+    bool stop_received = false;
+    if (!last_capture && s_rtc.wake_wifi && s_rtc.wake_window_sec > 0) {
+        stop_received = run_wake_window(s_rtc.wake_window_sec);
+    }
+
+    if (last_capture || stop_received) {
         // Finalize: complete=true, free handle, clear all DS state.
         session_store_close(store);
         nvs_clear();
         memset(&s_rtc, 0, sizeof(s_rtc));
-        ESP_LOGI(TAG, "session complete — returning to normal boot");
+        ESP_LOGI(TAG, "%s — returning to normal boot",
+                 stop_received ? "session stopped via wake-window cmd"
+                               : "session complete");
         return ESP_OK;
     }
 

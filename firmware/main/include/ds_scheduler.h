@@ -43,6 +43,15 @@ typedef struct {
     uint32_t interval_sec;       // ≥60 enforced — Lepton boot eats ~10s of awake budget
     bool     capture_vis;
     bool     capture_therm;
+    // PR-D: wake-Wi-Fi window. After each capture commits to SD, the
+    // device brings up Wi-Fi + relay for `wake_window_sec`, sends a
+    // ds-state init/tick so the dashboard sees the in-progress
+    // session, and accepts timelapse.stop. If stop arrives, the
+    // session is finalized + the device returns to normal boot.
+    // Wake-window adds ~5-10s for Wi-Fi connect + the window itself,
+    // so it costs battery — opt in only when visibility matters.
+    bool     wake_wifi;
+    uint32_t wake_window_sec;    // 5..60; ignored when wake_wifi=false
 } ds_arm_args_t;
 
 // Initialize an empty (DS_INACTIVE) state. Reads NVS — if a session
@@ -90,6 +99,16 @@ esp_err_t ds_scheduler_run_one_cycle(void);
 // finalizing the session.json (recovery sweep will mop up). Used
 // for explicit user-cancel; not called automatically.
 void ds_scheduler_abort(void);
+
+// Request the in-progress session to stop at the end of the current
+// wake window. Called by the cmd handler when timelapse.stop arrives
+// during a wake-window phase. Sets a flag the wake-window loop polls;
+// effect is observed only between wakes (the current capture cycle
+// always completes its commit). Idempotent.
+void ds_scheduler_request_stop(void);
+
+// True iff a wake-window stop has been requested this wake.
+bool ds_scheduler_stop_requested(void);
 
 // Status accessors — used by tick payload + UI.
 ds_state_t  ds_scheduler_state(void);
