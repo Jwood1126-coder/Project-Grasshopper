@@ -115,6 +115,22 @@ export const USER_UI_HTML = `<!doctype html>
   .tl-banner .stop-btn:hover:not(:disabled) { background: #ff8a8c; }
   .tl-banner .stop-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
+  /* Deep-sleep variant — moonlit color so it reads "device offline most of
+     the time" rather than the green "live and capturing" banner. */
+  .tl-banner.ds {
+    background: linear-gradient(180deg, #1a2438 0%, #0e1422 100%);
+    border-color: #3a4a78;
+  }
+  .tl-banner.ds .icon { background: #6b8acc; color: #001022; animation: none; }
+  .tl-banner.ds .info .title { color: #aac6ff; }
+  .tl-banner.ds .info .meta  { color: #88a4d8; }
+
+  /* Modal hint: small explanatory text under a control. */
+  .hint {
+    font: 12px/1.4 -apple-system, sans-serif;
+    color: #999; margin-top: 6px;
+  }
+
   /* ─── View grid: always two columns so both feeds fit on-screen
      without scrolling on tablet, desktop, AND phone (Fox parity).
      Panel height is capped to the viewport minus the chrome that sits
@@ -783,6 +799,14 @@ export const USER_UI_HTML = `<!doctype html>
   <div class="modal">
     <h3>Start Timelapse</h3>
     <div class="modal-row">
+      <label>Mode</label>
+      <div class="toggle-row">
+        <div class="tog on" id="mode-live" data-mode="live">Live</div>
+        <div class="tog"    id="mode-ds"   data-mode="ds">Low Power</div>
+      </div>
+      <div class="hint" id="mode-hint">Device stays on between captures.</div>
+    </div>
+    <div class="modal-row">
       <label>Interval</label>
       <div class="interval-grid" id="iv-grid"></div>
     </div>
@@ -793,9 +817,24 @@ export const USER_UI_HTML = `<!doctype html>
         <div class="tog on" id="tog-therm"><span class="check">●</span> Thermal</div>
       </div>
     </div>
-    <div class="modal-row">
+    <div class="modal-row" id="row-dur">
       <label>Stop after</label>
       <div class="interval-grid" id="dur-grid"></div>
+    </div>
+    <div class="modal-row" id="row-ds-max" style="display:none">
+      <label>Captures</label>
+      <input type="number" id="ds-max-captures" min="1" max="999" value="12" style="width:80px;padding:6px;border-radius:6px;border:1px solid #444;background:#222;color:#eee" />
+    </div>
+    <div class="modal-row" id="row-ds-wifi" style="display:none">
+      <label>Wake radio</label>
+      <div class="toggle-row">
+        <div class="tog" id="ds-wakewifi">Bring up Wi-Fi between captures</div>
+      </div>
+      <div class="hint">Lets the dashboard see in-progress sessions and accept Stop. Adds ~5–15 s awake per capture.</div>
+    </div>
+    <div class="modal-row" id="row-ds-window" style="display:none">
+      <label>Window</label>
+      <input type="number" id="ds-window-sec" min="5" max="60" value="15" style="width:80px;padding:6px;border-radius:6px;border:1px solid #444;background:#222;color:#eee" /> seconds
     </div>
     <div class="modal-actions">
       <button class="btn" onclick="closeTlModal()">Cancel</button>
@@ -1279,14 +1318,20 @@ export const USER_UI_HTML = `<!doctype html>
   let noDeviceTicks = 0;
 
   // ───── Timelapse settings modal ─────
+  // Live mode allows fast intervals (task-loop captures); deep-sleep
+  // mode requires ≥60s because Lepton boot eats ~10–18s of awake time
+  // per wake. Modal filters which buttons render based on mode.
   const TL_INTERVALS = [
-    { label: '5s',   sec: 5   },
-    { label: '10s',  sec: 10  },
-    { label: '30s',  sec: 30  },
-    { label: '1 min', sec: 60  },
-    { label: '5 min', sec: 300 },
-    { label: '15 min',sec: 900 },
+    { label: '5s',     sec: 5,    liveOnly: true  },
+    { label: '10s',    sec: 10,   liveOnly: true  },
+    { label: '30s',    sec: 30,   liveOnly: true  },
+    { label: '1 min',  sec: 60   },
+    { label: '5 min',  sec: 300  },
+    { label: '15 min', sec: 900  },
+    { label: '30 min', sec: 1800 },
+    { label: '1 hr',   sec: 3600 },
   ];
+  let tlMode = 'live';                 // 'live' | 'ds'
   let tlSelectedInterval = 30;
   let tlCaptureVis = true;
   let tlCaptureTherm = true;
@@ -1319,7 +1364,17 @@ export const USER_UI_HTML = `<!doctype html>
   function buildIvGrid() {
     const grid = document.getElementById('iv-grid');
     grid.innerHTML = '';
-    TL_INTERVALS.forEach(opt => {
+    const opts = tlMode === 'ds'
+      ? TL_INTERVALS.filter(o => !o.liveOnly)
+      : TL_INTERVALS;
+    // If mode just switched and the selection is no longer valid (e.g.
+    // we were on 5s and switched to ds), bump up to the smallest legal
+    // option so confirm doesn't silently send a value the firmware will
+    // reject.
+    if (!opts.find(o => o.sec === tlSelectedInterval)) {
+      tlSelectedInterval = opts[0]?.sec ?? 60;
+    }
+    opts.forEach(opt => {
       const e = el('div', {
         class: 'iv' + (opt.sec === tlSelectedInterval ? ' active' : ''),
         onclick: () => {
@@ -1331,6 +1386,21 @@ export const USER_UI_HTML = `<!doctype html>
     });
   }
 
+  function applyModeUi() {
+    document.getElementById('mode-live').classList.toggle('on', tlMode === 'live');
+    document.getElementById('mode-ds').classList.toggle('on', tlMode === 'ds');
+    const ds = tlMode === 'ds';
+    document.getElementById('row-dur').style.display       = ds ? 'none' : '';
+    document.getElementById('row-ds-max').style.display    = ds ? '' : 'none';
+    document.getElementById('row-ds-wifi').style.display   = ds ? '' : 'none';
+    const wakeWifi = document.getElementById('ds-wakewifi').classList.contains('on');
+    document.getElementById('row-ds-window').style.display = (ds && wakeWifi) ? '' : 'none';
+    document.getElementById('mode-hint').textContent = ds
+      ? 'Device deep-sleeps between captures. Capture journal lands on SD; dashboard sees the session only during optional wake-Wi-Fi windows.'
+      : 'Device stays on between captures.';
+    buildIvGrid();    // re-render interval grid with mode-appropriate options
+  }
+
   function setupModalToggles() {
     const v = document.getElementById('tog-vis');
     const t = document.getElementById('tog-therm');
@@ -1338,12 +1408,23 @@ export const USER_UI_HTML = `<!doctype html>
     t.classList.toggle('on', tlCaptureTherm);
     v.onclick = () => { tlCaptureVis = !tlCaptureVis; v.classList.toggle('on', tlCaptureVis); };
     t.onclick = () => { tlCaptureTherm = !tlCaptureTherm; t.classList.toggle('on', tlCaptureTherm); };
+
+    document.getElementById('mode-live').onclick = () => { tlMode = 'live'; applyModeUi(); };
+    document.getElementById('mode-ds').onclick   = () => { tlMode = 'ds';   applyModeUi(); };
+    const wf = document.getElementById('ds-wakewifi');
+    wf.onclick = () => {
+      wf.classList.toggle('on');
+      // window row visibility tracks the wakeWifi toggle
+      document.getElementById('row-ds-window').style.display =
+        (tlMode === 'ds' && wf.classList.contains('on')) ? '' : 'none';
+    };
   }
 
   function openTlModal() {
     buildIvGrid();
     buildDurGrid();
     setupModalToggles();
+    applyModeUi();   // apply current mode visibility BEFORE showing
     document.getElementById('tl-modal').classList.add('show');
   }
   window.closeTlModal = () => {
@@ -1352,6 +1433,24 @@ export const USER_UI_HTML = `<!doctype html>
   document.getElementById('tl-confirm').onclick = () => {
     if (!tlCaptureVis && !tlCaptureTherm) {
       toast('Enable at least one of vis / thermal', 'err');
+      return;
+    }
+    if (tlMode === 'ds') {
+      const maxCaps = parseInt(document.getElementById('ds-max-captures').value, 10) || 0;
+      if (maxCaps < 1) {
+        toast('Captures must be ≥ 1', 'err');
+        return;
+      }
+      const wakeWifi = document.getElementById('ds-wakewifi').classList.contains('on');
+      const wakeWindowSec = wakeWifi
+        ? (parseInt(document.getElementById('ds-window-sec').value, 10) || 15)
+        : 0;
+      closeTlModal();
+      sendCmd('timelapse.start',
+        { intervalSec: tlSelectedInterval, captureVis: tlCaptureVis, captureTherm: tlCaptureTherm,
+          deepSleep: true, maxCaptures: maxCaps,
+          wakeWifi, wakeWindowSec },
+        null, 'Start Deep-Sleep Timelapse');
       return;
     }
     closeTlModal();
@@ -1597,8 +1696,10 @@ export const USER_UI_HTML = `<!doctype html>
       fields.visPanel.classList.toggle('stale', visStale);
     }
 
-    // Active timelapse banner + Start/Stop button toggle
-    updateTlBanner(tl);
+    // Active timelapse banner + Start/Stop button toggle. Deep-sleep
+    // sessions take precedence (the dashboard only sees them during
+    // wake-Wi-Fi windows, so when we DO see one, surface it loudly).
+    updateTlBanner(tl, live.deepSleep);
 
     // Diagnostics
     const validRatio = therm && therm.totalPackets > 0
@@ -1630,33 +1731,64 @@ export const USER_UI_HTML = `<!doctype html>
     );
   }
 
-  function updateTlBanner(tl) {
+  function updateTlBanner(tl, ds) {
     const slot = fields.tlBannerSlot;
     if (!slot) return;
-    const active = !!(tl && tl.active);
+    const dsActive = !!(ds && ds.active);
+    const tlActive = !!(tl && tl.active);
+    const anyActive = dsActive || tlActive;
 
-    // Toggle Start button label/visibility.
+    // Toggle Start button label/visibility — both modes use the same button.
     if (fields.tlBtn) {
       const lbl = fields.tlBtn.querySelector('.btn-label');
-      if (lbl) lbl.textContent = active ? 'Timelapse running…' : 'Start Timelapse…';
-      fields.tlBtn.disabled = active;
-      fields.tlBtn.style.opacity = active ? '0.55' : '';
+      if (lbl) {
+        lbl.textContent = dsActive
+          ? 'Deep-sleep timelapse running…'
+          : tlActive
+            ? 'Timelapse running…'
+            : 'Start Timelapse…';
+      }
+      fields.tlBtn.disabled = anyActive;
+      fields.tlBtn.style.opacity = anyActive ? '0.55' : '';
     }
 
-    if (!active) {
+    if (!anyActive) {
       slot.replaceChildren();
       return;
     }
 
+    // Deep-sleep banner (takes precedence). The session is mostly
+    // invisible to the dashboard — we see it only during wake-Wi-Fi
+    // windows. When we do see it, render the count + max so the user
+    // knows where in the schedule we are. timelapse.stop is routed
+    // device-side to the DS scheduler when DS_ACTIVE.
+    if (dsActive) {
+      const stopBtn = el('button', {
+        class: 'stop-btn',
+        id: 'tl-stop',
+        onclick: () => sendCmd('timelapse.stop', {}, stopBtn, 'Stop'),
+      }, '■  Stop');
+      const banner = el('div', { class: 'tl-banner ds' },
+        el('div', { class: 'icon' }, '◐'),
+        el('div', { class: 'info' },
+          el('div', { class: 'title' },
+            'Deep-sleep timelapse · ' + ds.sessionId),
+          el('div', { class: 'meta' },
+            'next capture seq ' + ds.nextSeq + ' / ' + ds.maxCaptures +
+            ' · device sleeps between captures · this view appears only during wake windows')
+        ),
+        stopBtn);
+      slot.replaceChildren(banner);
+      return;
+    }
+
+    // Live timelapse banner (unchanged behavior).
     const elapsed = Date.now() - (tl.startedMs || Date.now());
     const stopBtn = el('button', {
       class: 'stop-btn',
       id: 'tl-stop',
-      onclick: () => {
-        sendCmd('timelapse.stop', {}, stopBtn, 'Stop');
-      },
+      onclick: () => sendCmd('timelapse.stop', {}, stopBtn, 'Stop'),
     }, '■  Stop');
-
     const banner = el('div', { class: 'tl-banner' },
       el('div', { class: 'icon' }, '●'),
       el('div', { class: 'info' },
