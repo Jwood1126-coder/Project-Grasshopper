@@ -582,6 +582,19 @@ const server = Bun.serve<WsCtx>({
     return app.fetch(req, srv)
   },
   websocket: {
+    // Bun defaults to 120 s. iPhone-hotspot uplinks can stall briefly
+    // during e.g. hotspot DHCP renewals or the device's own long-running
+    // operations (deep-sleep arm + sensor bring-up takes ~10 s during
+    // which the device may not send anything useful). 240 s gives the
+    // device-side detection (ping_interval=15 s + pingpong_timeout=30 s)
+    // first crack at noticing a dead peer; only if THAT misses do we
+    // fall back to the server-side timer. Without this bump, Bun was
+    // closing healthy connections with reason "WebSocket timed out
+    // from inactivity" because no data crossed for >120 s.
+    idleTimeout: 240,
+    // Default is 16 MB, but our preview frames cap at ~64 KB; tighter
+    // limit prevents a misbehaving client from staging a huge frame.
+    maxPayloadLength: 256 * 1024,
     open(ws) {
       console.log(`[ws] open from ${ws.data.remoteIp}`)
     },

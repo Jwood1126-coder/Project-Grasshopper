@@ -376,13 +376,22 @@ esp_err_t net_relay_start(void) {
 }
 
 void net_relay_stop(void) {
-    // Tell sender to exit at next queue-receive boundary, then drain
-    // any in-flight buffers so we don't leak.
+    // Tell sender to exit at next queue-receive boundary. The sender
+    // can be blocked inside esp_websocket_client_send_*() for up to
+    // 5000 ms (its tx-lock timeout), so the wait window has to be at
+    // LEAST as long as that — otherwise we'd race past it, free the
+    // queue and the client out from under an in-flight send and the
+    // sender task would crash on use-after-free. 6000 ms covers the
+    // 5 s send timeout plus a tick of slack.
     if (s_sender_task) {
         s_sender_stop = true;
-        // Sender wakes every 250 ms even on empty queue.
-        for (int i = 0; i < 20 && s_sender_task; i++) {
+        // Sender wakes every 250 ms when idle; when busy, blocks up
+        // to 5 s inside send_*. Poll for self-deletion at 50 ms cadence.
+        for (int i = 0; i < 120 && s_sender_task; i++) {
             vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        if (s_sender_task) {
+            ESP_LOGW(TAG, "sender did not exit within 6 s — forcing teardown");
         }
     }
     send_queue_flush();

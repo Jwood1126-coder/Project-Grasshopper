@@ -612,10 +612,15 @@ static net_relay_cmd_status_t app_cmd_handler(const char *cmd, const char *id,
                          esp_err_to_name(err));
                 return NET_RELAY_CMD_FAIL;
             }
-            // Send the result back BEFORE we go heads-down. The result
-            // tells the dashboard "armed; first capture firing now;
-            // device will be offline until session completes". The
-            // run_one_cycle below will not return — it sleeps.
+            // Emit the success cmd.result BEFORE returning, so the UI
+            // sees "armed" and clears its 8 s pending-cmd timeout. The
+            // worker (below) sleeps 1.5 s before bringing peripherals
+            // up, which gives this message time to actually flush over
+            // TLS — running the long sensor bring-up + capture in the
+            // WS task context (the old pattern) was blocking the WS
+            // event loop and starving the sender, so the cmd.result
+            // never made it onto the wire before deep_sleep killed
+            // the radio.
             net_relay_emit_cmd_result("timelapse.start", id, true,
                                       "deep-sleep session armed", NULL);
             char m[256];
@@ -624,16 +629,16 @@ static net_relay_cmd_status_t app_cmd_handler(const char *cmd, const char *id,
                      session_id, (unsigned long)max_caps, (unsigned long)interval,
                      capture_vis ? "on" : "off", capture_therm ? "on" : "off");
             ESP_LOGI(TAG, "%s", m);
-            // Tiny breath so the WS send actually flushes before we
-            // start tearing peripherals down.
-            vTaskDelay(pdMS_TO_TICKS(200));
-            // No-return on success-with-more-to-go; ESP_OK on completion.
-            ds_scheduler_run_one_cycle();
-            // If we get here, the session completed in ONE cycle (e.g.
-            // maxCaptures=1). Fall through to a normal cmd response —
-            // unreachable for PR-C tests at maxCaptures=3.
-            snprintf(msg_out, msg_cap, "%s: 1-shot deep-sleep session done", session_id);
-            return NET_RELAY_CMD_OK;
+            // Spawn worker; cmd handler returns DEFERRED so the
+            // dispatcher does NOT emit a second cmd.result.
+            if (ds_scheduler_run_one_cycle_async() != ESP_OK) {
+                // Worker failed to spawn — abort the arm so we don't
+                // leave NVS pointing at a session that'll never run.
+                ds_scheduler_abort();
+                snprintf(msg_out, msg_cap, "ds worker spawn failed");
+                return NET_RELAY_CMD_FAIL;
+            }
+            return NET_RELAY_CMD_DEFERRED;
         }
 
         // Live (non-deep-sleep) timelapse path — unchanged.
@@ -828,9 +833,23 @@ void app_main(void) {
     //     WiFi/relay/preview/OLED/tick init entirely when wakeWifi
     //     is false).
     ds_scheduler_init();
-    ds_scheduler_maybe_handle_wake();
-    // If we're here: either it wasn't a DS wake, or the session just
-    // completed its last capture / was stopped — continue normal boot.
+    esp_err_t ds_wake_rc = ds_scheduler_maybe_handle_wake();
+    // ESP_OK from maybe_handle_wake means the DS cycle ran and the
+    // session is now complete (last capture committed, or remote-stopped
+    // via wake-window cmd). At this point we have peripherals partly
+    // brought up by run_one_cycle (Lepton, possibly camera, possibly
+    // Wi-Fi/relay if wake-window fired) — re-running the live-mode init
+    // path on top of that produces double-init bugs. Cleanest path back
+    // to normal operation is a fresh boot: NVS session is already cleared,
+    // so the next boot's wake handler will see no DS state and run the
+    // standard live-mode init from a known-good cold start.
+    if (ds_wake_rc == ESP_OK) {
+        ESP_LOGI(TAG, "DS session completed in this wake — restarting for clean live-mode boot");
+        vTaskDelay(pdMS_TO_TICKS(500));   // flush logs
+        esp_restart();
+    }
+    // Fell through with INVALID_STATE — not a DS wake (cold boot, brownout,
+    // user reset). Continue normal boot unchanged.
 
     if (strlen(CONFIG_GRASSHOPPER_WIFI_SSID) > 0) {
         ESP_ERROR_CHECK(net_wifi_init());

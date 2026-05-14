@@ -104,6 +104,18 @@ esp_err_t ds_scheduler_maybe_handle_wake(void);
 // more captures are due — calls esp_deep_sleep_start() instead.
 esp_err_t ds_scheduler_run_one_cycle(void);
 
+// Spawn a background task that calls ds_scheduler_run_one_cycle().
+// Used by the cmd handler so it can return DEFERRED right after arm:
+// the WS task immediately frees up to ship cmd.result + drain pending
+// preview frames, while the worker does sensor bring-up + capture +
+// deep_sleep on its own task. Returns once the task is created.
+//
+// Safe to call multiple times only if the previous worker has already
+// finished (which it will have, because it deep-sleeps and the device
+// reboots). In practice: arm → spawn → deep-sleep → wake handler runs
+// run_one_cycle directly (not through this helper) → loop.
+esp_err_t ds_scheduler_run_one_cycle_async(void);
+
 // Mark current session aborted: free RTC + NVS state without
 // finalizing the session.json (recovery sweep will mop up). Used
 // for explicit user-cancel; not called automatically.

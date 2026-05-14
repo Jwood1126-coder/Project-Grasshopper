@@ -569,6 +569,35 @@ esp_err_t ds_scheduler_run_one_cycle(void) {
     return ESP_OK;
 }
 
+// Worker task that runs ONE cycle. Created by ds_scheduler_run_one_cycle_async
+// so the WS task can return immediately after arm. Self-deletes after the
+// cycle returns (which only happens on session-complete or stop — otherwise
+// it deep-sleeps and the device reboots, killing the task implicitly).
+static void run_one_cycle_task(void *arg) {
+    (void)arg;
+    // Hold a beat so the cmd.result enqueued by the cmd handler has a
+    // chance to actually flush onto the wire. The sender task drains
+    // its queue at ~250 ms cycle, but the underlying TLS write can
+    // take another ~hundreds of ms over an iPhone-hotspot uplink.
+    // 1500 ms is empirical headroom; cheaper than losing the result.
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    ds_scheduler_run_one_cycle();
+    // If we get here, the session completed in one cycle (e.g.
+    // maxCaptures=1) and we want to drop back to normal boot. The
+    // safest way to recover live-mode peripherals is to reboot —
+    // sensors / Wi-Fi / relay all init cleanly from cold rather than
+    // having to add tear-down/re-init paths to every subsystem.
+    ESP_LOGI(TAG, "DS cycle returned (single-shot or stopped) — restarting");
+    vTaskDelay(pdMS_TO_TICKS(500));   // flush any final logs
+    esp_restart();
+}
+
+esp_err_t ds_scheduler_run_one_cycle_async(void) {
+    BaseType_t r = xTaskCreatePinnedToCore(run_one_cycle_task, "ds_run",
+                                            6144, NULL, 5, NULL, 0);
+    return (r == pdPASS) ? ESP_OK : ESP_FAIL;
+}
+
 esp_err_t ds_scheduler_maybe_handle_wake(void) {
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
     bool timer_wake = (cause == ESP_SLEEP_WAKEUP_TIMER);
