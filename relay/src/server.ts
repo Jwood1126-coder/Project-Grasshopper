@@ -206,6 +206,71 @@ function executeCmd(
   })
 }
 
+// Transient device-side errors that are safe to retry. The device's
+// sessions worker queue caps at 32 entries; when the dashboard opens
+// the Library, dozens of thumbnails fire in parallel and the queue
+// briefly overflows. SD lock timeouts are similar — another writer
+// holds the lock for >5 s. Both clear on their own; retrying with a
+// bit of jitter beats surfacing the failure to the user as 502.
+function isRetryableErr(msg: string): boolean {
+  const s = String(msg || '').toLowerCase()
+  return s.includes('queue full') ||
+         s.includes('sd lock timeout') ||
+         s.includes('busy')
+}
+
+async function executeCmdWithRetry(
+  deviceId: string,
+  cmd: string,
+  payload: Record<string, unknown>,
+  timeoutMs = 10000,
+  maxAttempts = 5,
+): Promise<unknown> {
+  let lastErr: unknown
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await executeCmd(deviceId, cmd, payload, timeoutMs)
+    } catch (e) {
+      lastErr = e
+      const msg = String(e ?? '')
+      if (!isRetryableErr(msg)) throw e
+      // Backoff: 75, 150, 300, 600 ms (+ ±25% jitter so simultaneous
+      // retries don't re-pile on the same drain cycle).
+      const base = 75 * Math.pow(2, attempt)
+      const jitter = base * 0.5 * (Math.random() - 0.5)
+      await new Promise((r) => setTimeout(r, Math.max(50, base + jitter)))
+    }
+  }
+  throw lastErr
+}
+
+// Per-device semaphore for session.read_file. The device's sessions
+// worker drains at ~20 cmds/s; opening Library can fire 100+ thumbnail
+// requests at once. Capping concurrent in-flight reads keeps the device
+// queue well under its 32-deep limit and removes 'queue full' as a
+// steady-state failure mode (retries above still cover the edges).
+const READ_FILE_CONCURRENCY = 4
+const readFileSlots = new Map<string, { inFlight: number; waiters: (() => void)[] }>()
+
+async function acquireReadSlot(deviceId: string): Promise<void> {
+  let s = readFileSlots.get(deviceId)
+  if (!s) { s = { inFlight: 0, waiters: [] }; readFileSlots.set(deviceId, s) }
+  if (s.inFlight < READ_FILE_CONCURRENCY) { s.inFlight++; return }
+  await new Promise<void>((resolve) => s!.waiters.push(resolve))
+  // waiter increments inFlight when released
+}
+function releaseReadSlot(deviceId: string): void {
+  const s = readFileSlots.get(deviceId)
+  if (!s) return
+  const next = s.waiters.shift()
+  if (next) {
+    // hand off the slot directly — keeps inFlight accounting tight
+    next()
+  } else {
+    s.inFlight = Math.max(0, s.inFlight - 1)
+  }
+}
+
 function requireBearer(c: any): true | Response {
   const auth = c.req.header('Authorization') || ''
   const presented = auth.startsWith('Bearer ') ? auth.slice(7) : ''
@@ -218,7 +283,7 @@ function requireBearer(c: any): true | Response {
 app.get('/api/devices/:id/sessions', async (c) => {
   const auth = requireBearer(c); if (auth !== true) return auth
   try {
-    const data = await executeCmd(c.req.param('id'), 'sessions.list', {})
+    const data = await executeCmdWithRetry(c.req.param('id'), 'sessions.list', {})
     return c.json(data ?? {})
   } catch (msg) {
     return c.json({ error: String(msg) }, 502)
@@ -230,7 +295,7 @@ app.get('/api/devices/:id/sessions/:sid', async (c) => {
   const sid = c.req.param('sid')
   if (!SESSION_ID_RE.test(sid)) return c.json({ error: 'bad sessionId' }, 400)
   try {
-    const data = await executeCmd(c.req.param('id'), 'sessions.get', {
+    const data = await executeCmdWithRetry(c.req.param('id'), 'sessions.get', {
       sessionId: sid,
     })
     return c.json(data ?? {})
@@ -369,37 +434,60 @@ app.get('/api/devices/:id/sessions/:sid/file/:filename', async (c) => {
     return c.body(cached as any)
   }
 
-  // Pull chunks until eof.
-  const CHUNK = 16 * 1024
-  let offset = 0
-  const chunks: Uint8Array[] = []
-  let totalSize = 0
-  for (;;) {
-    let data: any
-    try {
-      data = await executeCmd(deviceId, 'session.read_file', {
-        sessionId: sid, filename, offset, maxLen: CHUNK,
-      }, 15000)
-    } catch (msg) {
-      return c.json({ error: String(msg) }, 502)
+  // Hold the device's read slot for the FULL file (all chunks). Holding
+  // it across chunks keeps reads contiguous and stops a second large
+  // file from interleaving its chunks with this one's, which would
+  // otherwise re-introduce the queue pressure the slot is meant to
+  // prevent. Slot is released in `finally`.
+  await acquireReadSlot(deviceId)
+  try {
+    // Pull chunks until eof.
+    const CHUNK = 16 * 1024
+    let offset = 0
+    const chunks: Uint8Array[] = []
+    let totalSize = 0
+    let notFound = false
+    let lastErr = ''
+    for (;;) {
+      let data: any
+      try {
+        data = await executeCmdWithRetry(deviceId, 'session.read_file', {
+          sessionId: sid, filename, offset, maxLen: CHUNK,
+        }, 15000)
+      } catch (msg) {
+        // Device-side ENOENT (file genuinely missing — common for
+        // 000001_therm.jpg before Lepton warmup): surface as 404 so
+        // the UI can try its fallback candidate cleanly. Anything else
+        // that survived the retry loop is a real upstream failure.
+        const s = String(msg ?? '')
+        lastErr = s
+        if (/errno=2\b/.test(s) || /no such file/i.test(s)) {
+          notFound = true
+        }
+        break
+      }
+      if (!data || typeof data !== 'object' || typeof data.b64 !== 'string') {
+        return c.json({ error: 'malformed read_file response' }, 502)
+      }
+      const buf = Uint8Array.from(Buffer.from(data.b64, 'base64'))
+      chunks.push(buf)
+      offset += buf.byteLength
+      totalSize = data.totalSize ?? totalSize
+      if (data.eof || buf.byteLength === 0) break
+      if (offset > 50 * 1024 * 1024) {
+        return c.json({ error: 'file too large (>50MB)' }, 413)
+      }
     }
-    if (!data || typeof data !== 'object' || typeof data.b64 !== 'string') {
-      return c.json({ error: 'malformed read_file response' }, 502)
-    }
-    const buf = Uint8Array.from(Buffer.from(data.b64, 'base64'))
-    chunks.push(buf)
-    offset += buf.byteLength
-    totalSize = data.totalSize ?? totalSize
-    if (data.eof || buf.byteLength === 0) break
-    if (offset > 50 * 1024 * 1024) {
-      return c.json({ error: 'file too large (>50MB)' }, 413)
-    }
+    if (notFound) return c.json({ error: lastErr }, 404)
+    if (lastErr)  return c.json({ error: lastErr }, 502)
+    const bytes = concatBytes(chunks, totalSize)
+    cachePut(cacheKey, bytes)
+    c.header('Content-Type', guessMime(filename))
+    c.header('X-Cache', 'MISS')
+    return c.body(bytes as any)
+  } finally {
+    releaseReadSlot(deviceId)
   }
-  const bytes = concatBytes(chunks, totalSize)
-  cachePut(cacheKey, bytes)
-  c.header('Content-Type', guessMime(filename))
-  c.header('X-Cache', 'MISS')
-  return c.body(bytes as any)
 })
 
 function guessMime(filename: string): string {

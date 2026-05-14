@@ -2582,6 +2582,22 @@ export const USER_UI_HTML = `<!doctype html>
     return copy;
   }
 
+  // Cheap fingerprint of the session list: mtime-ish bits per row that
+  // would warrant a re-render. Lets auto-refresh avoid replaceChildren
+  // (and the 100-thumbnail re-fetch storm that follows) when nothing
+  // has actually changed since the last poll.
+  function sessionsFingerprint(list) {
+    let s = '';
+    for (const x of list) {
+      s += (x.sessionId || '?') + ':' +
+           (x.captureCount ?? '?') + ':' +
+           (x.durationSec ?? '?') + ':' +
+           (x.complete === false ? 'i' : 'c') + ';';
+    }
+    return s;
+  }
+  let lastSessionsFp = '';
+
   async function loadLibrary() {
     const meta = document.getElementById('lib-meta');
     const grid = document.getElementById('session-grid');
@@ -2615,6 +2631,13 @@ export const USER_UI_HTML = `<!doctype html>
             'Press Capture or Start Timelapse on the Live View to record one.')));
         return;
       }
+      // Skip re-render if nothing observable changed since last load.
+      // Avoids destroying live <img> elements on every 8s auto-refresh,
+      // which would otherwise re-issue every thumbnail fetch (cheap when
+      // cached, but the 404-fallback chain still hits the device).
+      const fp = sessionsFingerprint(list);
+      if (fp === lastSessionsFp && grid.children.length > 0) return;
+      lastSessionsFp = fp;
       const sorted = sortSessions(list, libPrefs.sort);
       grid.replaceChildren(...sorted.map(renderSessionCard));
     } catch (e) {
