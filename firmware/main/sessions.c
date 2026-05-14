@@ -24,7 +24,13 @@
 static const char *TAG = "sessions";
 
 #define SESSIONS_BASE_DIR     "/sdcard/timelapse"
-#define SESS_LIST_MAX          50      // cap session list response size
+// 200 was too low — once the SD has more than that, sessions with
+// timestamp=0 (NTP not synced when the first wake committed)
+// silently fall off the end of the newest-first sort and never reach
+// the dashboard. Bumped to 200 with the do_list sort below now treating
+// ts=0 as "most recent" so in-progress DS sessions stay visible
+// regardless.
+#define SESS_LIST_MAX          200     // cap session list response size
 #define SESS_CAPTURES_MAX      200     // cap captures.jsonl entries inline
 #define SESS_FILE_CHUNK_MAX    16384   // 16 KB binary -> ~22 KB base64
 // Browsers parallelize HTTP requests per origin (Chrome: 6); each
@@ -198,14 +204,24 @@ static void do_list(const sess_req_t *req) {
     hal_storage_sd_unlock();
 
     // Sort newest-first by timestamp using cJSON's array index swap.
-    // Bubble sort is fine — even at 500 sessions this is < 250k compares
-    // of two doubles each. Heap+JSON traversal dominates if anything.
+    // ts=0 means "no NTP at session open AND first commit didn't write
+    // a real epoch either" — typically a deep-sleep session that fired
+    // its first wake with the clock unsynced. Treat those as MAX (sort
+    // first) so the user's just-armed session can't silently fall off
+    // the end of a truncated list. Bubble sort is fine — at our cap
+    // of 200 it's <40k compares of two doubles each; heap+JSON traversal
+    // dominates if anything.
     int n = cJSON_GetArraySize(arr);
     for (int i = 0; i < n - 1; i++) {
         for (int j = 0; j < n - 1 - i; j++) {
             cJSON *a = cJSON_GetArrayItem(arr, j);
             cJSON *b = cJSON_GetArrayItem(arr, j + 1);
-            if (json_num(a, "timestamp", 0) < json_num(b, "timestamp", 0)) {
+            double ats = json_num(a, "timestamp", 0);
+            double bts = json_num(b, "timestamp", 0);
+            // ts=0 → infinity, so it sorts to the front
+            double aeff = (ats == 0) ? 1e18 : ats;
+            double beff = (bts == 0) ? 1e18 : bts;
+            if (aeff < beff) {
                 cJSON_DetachItemFromArray(arr, j + 1);
                 cJSON_InsertItemInArray(arr, j, b);
             }

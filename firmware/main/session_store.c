@@ -516,6 +516,21 @@ esp_err_t session_store_commit(session_store_handle_t *h,
     return ESP_OK;
 }
 
+uint32_t session_store_journal_max_seq(const char *session_id) {
+    if (!session_id || !*session_id) return 0;
+    char dir[160];
+    snprintf(dir, sizeof(dir), "%s/%s", SESSIONS_BASE_DIR, session_id);
+    if (!hal_storage_sd_lock(5000)) {
+        ESP_LOGW(TAG, "journal_max_seq: SD lock timeout");
+        return 0;
+    }
+    replay_agg_t agg; replay_init(&agg);
+    esp_err_t r = replay_journal(dir, &agg);
+    hal_storage_sd_unlock();
+    if (r != ESP_OK) return 0;
+    return agg.max_seq;
+}
+
 esp_err_t session_store_close(session_store_handle_t *h) {
     if (!h) return ESP_ERR_INVALID_ARG;
     if (hal_storage_sd_lock(5000)) {

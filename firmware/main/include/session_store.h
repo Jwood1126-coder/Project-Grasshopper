@@ -111,6 +111,13 @@ const char *session_store_dir(const session_store_handle_t *h);
 // starve other workers.
 esp_err_t session_store_recover_all(void);
 
+// Read the highest committed seq from a session's captures.jsonl.
+// Returns 0 if the session dir or journal don't exist, or if the
+// journal has no committed entries. Used by the deep-sleep scheduler
+// to reconcile next_seq when RTC state is lost but NVS still says a
+// session is active — the SD journal is the source of truth.
+uint32_t session_store_journal_max_seq(const char *session_id);
+
 #ifdef __cplusplus
 }
 #endif

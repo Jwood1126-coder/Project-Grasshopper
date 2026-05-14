@@ -396,7 +396,14 @@ esp_err_t ds_scheduler_run_one_cycle(void) {
         }
         memset(&s_rtc, 0, sizeof(s_rtc));
         snprintf(s_rtc.session_id, sizeof(s_rtc.session_id), "%s", sid);
-        s_rtc.next_seq            = 1;  // safe lower bound — replay will reconcile
+        // Reconcile next_seq with the SD journal (Codex review). Without
+        // this, an RTC-lost-NVS-active resume restarts from seq=1 even
+        // if the journal already records 4 captures — the next commit
+        // would write seq=1 again, colliding with the existing 000001
+        // files. We let the SD journal win: count its committed entries
+        // and resume from one past the last seq.
+        uint32_t journal_max_seq = session_store_journal_max_seq(sid);
+        s_rtc.next_seq            = journal_max_seq + 1;
         s_rtc.max_captures        = args.max_captures;
         s_rtc.interval_sec        = args.interval_sec;
         s_rtc.session_start_epoch = start;
@@ -407,7 +414,8 @@ esp_err_t ds_scheduler_run_one_cycle(void) {
         s_rtc.wake_window_sec     = args.wake_window_sec;
         s_rtc.wake_wifi_every     = args.wake_wifi_every ? args.wake_wifi_every : 1;
         rtc_seal();
-        ESP_LOGW(TAG, "run_one_cycle: rebuilt RTC from NVS (cold-boot resume)");
+        ESP_LOGW(TAG, "run_one_cycle: rebuilt RTC from NVS (cold-boot resume) — next_seq=%lu (journal had %lu)",
+                 (unsigned long)s_rtc.next_seq, (unsigned long)journal_max_seq);
     }
 
     int64_t wake_t0 = esp_timer_get_time();
