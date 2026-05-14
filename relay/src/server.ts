@@ -692,6 +692,11 @@ const server = Bun.serve<WsCtx>({
             // dropped — the field is meant for typed responses, not
             // arbitrary scalars.
             data: (msg.data && typeof msg.data === 'object') ? msg.data : undefined,
+            // Phase transition fields (kind="phase"). See store.ts.
+            from: typeof msg.from === 'string' ? msg.from : undefined,
+            to: typeof msg.to === 'string' ? msg.to : undefined,
+            prevDurMs: typeof msg.prevDurMs === 'number' ? msg.prevDurMs : undefined,
+            uptimeMs: typeof msg.uptimeMs === 'number' ? msg.uptimeMs : undefined,
           })
           // Resolve a pending HTTP wait if this is the cmd.result we issued.
           if (msg.kind === 'cmd.result' && typeof msg.id === 'string') {

@@ -20,6 +20,7 @@
 #include "freertos/task.h"
 
 #include "net_relay.h"
+#include "system_phase.h"
 
 static const char *TAG = "ota";
 
@@ -37,8 +38,16 @@ static void emit_progress(const char *cmd_id, int pct, const char *msg) {
 static void ota_task(void *arg) {
     ota_req_t *req = (ota_req_t *)arg;
     ESP_LOGI(TAG, "starting HTTPS OTA from %s", req->url);
+    // OTA holds radio bandwidth + flash; mark phase so preview/sessions
+    // workers (commit 2) defer. Success path esp_restart()s, so no
+    // explicit return-to-LIVE needed there. Failure paths return to
+    // LIVE via OTA_BAIL_TO_LIVE() so the device doesn't sit in OTA
+    // forever with bulk work suppressed after a failed update.
+    system_phase_enter(PHASE_OTA);
     net_relay_emit_cmd_result("firmware.update", req->cmd_id, true,
                                "starting download", NULL);
+
+    #define OTA_BAIL_TO_LIVE() do { system_phase_enter(PHASE_LIVE); } while (0)
 
     esp_http_client_config_t http = {
         .url = req->url,
@@ -57,6 +66,7 @@ static void ota_task(void *arg) {
         snprintf(msg, sizeof(msg), "ota_begin failed: %s", esp_err_to_name(err));
         net_relay_emit_cmd_result("firmware.update", req->cmd_id, false, msg, NULL);
         free(req);
+        OTA_BAIL_TO_LIVE();
         vTaskDelete(NULL);
         return;
     }
@@ -87,6 +97,7 @@ static void ota_task(void *arg) {
         snprintf(msg, sizeof(msg), "ota_perform failed: %s", esp_err_to_name(err));
         net_relay_emit_cmd_result("firmware.update", req->cmd_id, false, msg, NULL);
         free(req);
+        OTA_BAIL_TO_LIVE();
         vTaskDelete(NULL);
         return;
     }
@@ -96,6 +107,7 @@ static void ota_task(void *arg) {
         net_relay_emit_cmd_result("firmware.update", req->cmd_id, false,
                                    "incomplete data received", NULL);
         free(req);
+        OTA_BAIL_TO_LIVE();
         vTaskDelete(NULL);
         return;
     }
@@ -106,6 +118,7 @@ static void ota_task(void *arg) {
         snprintf(msg, sizeof(msg), "ota_finish failed: %s", esp_err_to_name(err));
         net_relay_emit_cmd_result("firmware.update", req->cmd_id, false, msg, NULL);
         free(req);
+        OTA_BAIL_TO_LIVE();
         vTaskDelete(NULL);
         return;
     }

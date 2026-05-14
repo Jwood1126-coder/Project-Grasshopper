@@ -19,6 +19,7 @@
 #include "hal_lepton.h"
 #include "proto_gen.h"
 #include "sdkconfig.h"
+#include "system_phase.h"
 
 #ifndef GRASSHOPPER_FW_VERSION
 #define GRASSHOPPER_FW_VERSION "0.1.0-dev"
@@ -95,11 +96,34 @@ static void send_hello(void) {
     };
     char buf[512];
     size_t n = Hello_to_json(buf, sizeof(buf), &h);
-    if (n > 0 && n < sizeof(buf)) {
-        esp_websocket_client_send_text(s_client, buf, (int)n,
-                                        pdMS_TO_TICKS(1000));
-        ESP_LOGI(TAG, "hello sent (%u B)", (unsigned)n);
+    if (n == 0 || n >= sizeof(buf)) return;
+
+    // Splice the system phase block into hello so the dashboard knows
+    // the device's current phase the moment a connection comes up,
+    // without waiting up to 1.5 s for the first tick. Critical for
+    // wake-Wi-Fi windows: the WS connection is the ONLY message the
+    // dashboard sees during the first second of the window, before
+    // any tick task is even running. Hand-append the same way
+    // splice_extras does in app_main.c — trim the trailing `}` and
+    // re-close.
+    if (n > 0 && buf[n - 1] == '}') {
+        n -= 1;
+        int extra = snprintf(buf + n, sizeof(buf) - n,
+            ",\"system\":{\"phase\":\"%s\",\"phaseEnteredMs\":%lu}}",
+            system_phase_name(system_phase_get()),
+            (unsigned long)system_phase_entered_ms());
+        if (extra > 0 && (size_t)(n + extra) < sizeof(buf)) {
+            n += extra;
+        } else {
+            // Append failed — restore the trailing `}` so we still
+            // ship a valid JSON object.
+            buf[n++] = '}';
+        }
     }
+
+    esp_websocket_client_send_text(s_client, buf, (int)n,
+                                    pdMS_TO_TICKS(1000));
+    ESP_LOGI(TAG, "hello sent (%u B)", (unsigned)n);
 }
 
 // ---- Command result emit ----

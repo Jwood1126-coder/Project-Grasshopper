@@ -51,6 +51,14 @@ export interface EventEntry {
   id?: string
   cmd?: string
   ok?: boolean
+  // Optional fields populated for kind="phase" events. Wire-protocol
+  // phase names — see firmware components/system_phase. The dashboard
+  // builds a transition timeline from these, independent of the 1.5 s
+  // tick sampling rate.
+  from?: string
+  to?: string
+  prevDurMs?: number
+  uptimeMs?: number
   // Structured payload attached to a cmd.result by the firmware (e.g.
   // sessions.list returns {sessions:[...], total, listed, truncated};
   // session.read_file returns {filename, offset, len, totalSize, eof, b64}).

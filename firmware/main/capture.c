@@ -28,6 +28,7 @@
 #include "hal_lepton.h"
 #include "hal_storage.h"
 #include "session_store.h"
+#include "system_phase.h"
 
 static const char *TAG = "capture";
 
@@ -449,6 +450,10 @@ esp_err_t capture_now(char *session_id_out, size_t session_id_cap,
         snprintf(msg_out, msg_cap, "visible camera not ready");
         return ESP_ERR_INVALID_STATE;
     }
+    // Live-mode capture path: explicit, one-directional. Always exits
+    // back to LIVE — capture_now is only called from the cmd handler
+    // in live context, never nested inside DEEP_SLEEP_CAPTURE.
+    system_phase_enter(PHASE_CAPTURE);
 
     // Produce vis + therm artifacts in memory (engine is shared with
     // the live timelapse path and the deep-sleep wake handler).
@@ -457,10 +462,12 @@ esp_err_t capture_now(char *session_id_out, size_t session_id_cap,
                                                   /*want_thermal*/ true,
                                                   /*want_thermal_raw*/ true,
                                                   &art);
+    esp_err_t rc;
     if (cap_err != ESP_OK || !art.vis_jpg) {
         capture_artifacts_free(&art);
         snprintf(msg_out, msg_cap, "camera grab failed");
-        return ESP_FAIL;
+        rc = ESP_FAIL;
+        goto out;
     }
     bool therm_ok = (art.therm_jpg != NULL);
     size_t vis_bytes = art.vis_len;          // capture before free()
@@ -480,7 +487,8 @@ esp_err_t capture_now(char *session_id_out, size_t session_id_cap,
     if (!h) {
         capture_artifacts_free(&art);
         snprintf(msg_out, msg_cap, "%s: session_store_open failed", session_id);
-        return ESP_FAIL;
+        rc = ESP_FAIL;
+        goto out;
     }
     esp_err_t commit_err = session_store_commit(h, &art, /*meta*/ NULL);
     session_store_close(h);
@@ -494,10 +502,17 @@ esp_err_t capture_now(char *session_id_out, size_t session_id_cap,
                  "%s: vis %u B%s",
                  session_id, (unsigned)vis_bytes,
                  therm_ok ? " + therm OK" : " (no thermal frame yet)");
-        return ESP_OK;
+        rc = ESP_OK;
+        goto out;
     }
     snprintf(msg_out, msg_cap, "%s: commit failed", session_id);
-    return ESP_FAIL;
+    rc = ESP_FAIL;
+out:
+    // Single exit point so every error path returns CAPTURE → LIVE
+    // explicitly. NEVER use save/restore semantics — capture_now is
+    // only called from a LIVE context, period.
+    system_phase_enter(PHASE_LIVE);
+    return rc;
 }
 
 // ---- Timelapse ----
@@ -532,8 +547,14 @@ static void ensure_tl_mutex(void) {
 // One capture iteration: produce artifacts, hand them to session_store
 // for transactional commit. session_store owns the SD lock + journal +
 // session.json — this loop just chains the engine and the store.
+//
+// Phase: live timelapse only ever runs from LIVE. Each iteration enters
+// CAPTURE for the encode+commit window, then explicitly returns to LIVE.
+// No save/restore — the live TL task is the only caller and its outer
+// state is always LIVE.
 static void tl_capture_iteration(void) {
     if (!s_tl_handle) return;
+    system_phase_enter(PHASE_CAPTURE);
     capture_artifacts_t art = {0};
     esp_err_t cap_err = capture_engine_take_one(
         s_tl_capture_vis, s_tl_capture_therm,
@@ -542,6 +563,7 @@ static void tl_capture_iteration(void) {
     if (cap_err != ESP_OK) {
         ESP_LOGW(TAG, "tl: nothing produced (%s)", esp_err_to_name(cap_err));
         capture_artifacts_free(&art);
+        system_phase_enter(PHASE_LIVE);
         return;
     }
     // session_store_commit handles SD lock + atomic writes + journal
@@ -550,6 +572,7 @@ static void tl_capture_iteration(void) {
     // the whole commit to fail (and recovery sweeps any orphans).
     session_store_commit(s_tl_handle, &art, /*meta*/ NULL);
     capture_artifacts_free(&art);
+    system_phase_enter(PHASE_LIVE);
 }
 
 static void tl_task(void *arg) {

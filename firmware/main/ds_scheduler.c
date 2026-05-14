@@ -49,6 +49,7 @@
 #include "power_manager.h"
 #include "sdkconfig.h"
 #include "session_store.h"
+#include "system_phase.h"
 
 static const char *TAG = "ds_sched";
 
@@ -309,6 +310,12 @@ static bool run_wake_window(uint32_t window_sec) {
 
     s_stop_requested = false;
 
+    // WAKE_RADIO is a sub-phase of the broader DS cycle. Caller is in
+    // DEEP_SLEEP_CAPTURE; we explicitly transition both ways to make
+    // the radio-up window observable in telemetry. Never use save/
+    // restore — we know the outer phase here is DEEP_SLEEP_CAPTURE.
+    system_phase_enter(PHASE_WAKE_RADIO);
+
     int64_t t0 = esp_timer_get_time();
 
     // Bring up Wi-Fi. SSID/PASS from build config.
@@ -316,10 +323,12 @@ static bool run_wake_window(uint32_t window_sec) {
     const char *pass = CONFIG_GRASSHOPPER_WIFI_PASS;
     if (!ssid || !*ssid) {
         ESP_LOGW(TAG, "wake-window: no Wi-Fi SSID configured — skipping");
+        system_phase_enter(PHASE_DEEP_SLEEP_CAPTURE);
         return false;
     }
     if (net_wifi_init() != ESP_OK) {
         ESP_LOGW(TAG, "wake-window: net_wifi_init failed");
+        system_phase_enter(PHASE_DEEP_SLEEP_CAPTURE);
         return false;
     }
     esp_err_t werr = net_wifi_connect_blocking(ssid, pass);
@@ -327,6 +336,7 @@ static bool run_wake_window(uint32_t window_sec) {
         ESP_LOGW(TAG, "wake-window: Wi-Fi connect failed (%s) — sleeping again",
                  esp_err_to_name(werr));
         net_wifi_stop();
+        system_phase_enter(PHASE_DEEP_SLEEP_CAPTURE);
         return false;
     }
 
@@ -335,6 +345,7 @@ static bool run_wake_window(uint32_t window_sec) {
     if (net_relay_start() != ESP_OK) {
         ESP_LOGW(TAG, "wake-window: net_relay_start failed");
         net_wifi_stop();
+        system_phase_enter(PHASE_DEEP_SLEEP_CAPTURE);
         return false;
     }
 
@@ -354,6 +365,10 @@ static bool run_wake_window(uint32_t window_sec) {
     // before we drop the radio.
     net_relay_stop();
     net_wifi_stop();
+    // Back to the outer DS phase. Even if the caller is about to
+    // finalize and esp_restart, leave the phase telemetry truthful
+    // for any tick that lands in the gap.
+    system_phase_enter(PHASE_DEEP_SLEEP_CAPTURE);
     return stopped;
 }
 
@@ -431,6 +446,13 @@ void ds_scheduler_abort(void) {
 }
 
 esp_err_t ds_scheduler_run_one_cycle(void) {
+    // DEEP_SLEEP_CAPTURE covers the entire wake cycle (sensor bring-up,
+    // capture, commit, optional wake-window). On the natural-completion
+    // exit (last_capture or stop_received), the worker / app_main
+    // restarts — phase will reset to BOOT on the next cold boot.
+    // Per the design rule: top-level phase, never nested inside CAPTURE.
+    system_phase_enter(PHASE_DEEP_SLEEP_CAPTURE);
+
     if (!rtc_valid()) {
         // Try to repopulate from NVS (e.g. armed in previous boot,
         // RTC lost, but NVS active=1 → cold-boot resume).

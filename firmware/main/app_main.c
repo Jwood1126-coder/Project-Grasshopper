@@ -39,6 +39,7 @@
 #include "esp_random.h"
 #include "sessions.h"
 #include "ota.h"
+#include "system_phase.h"
 #include "cJSON.h"
 
 // Lepton frame geometry — 160x120 raw uint16.
@@ -250,6 +251,16 @@ static size_t splice_extras(char *buf, size_t n, size_t cap) {
             (unsigned long)ds_scheduler_max_captures());
         if (extra > 0 && (size_t)(n + extra) < cap) n += extra;
     }
+
+    // System phase block — always emitted. Dashboard uses `phase` to
+    // distinguish "intentionally sleeping" from "unexpectedly offline";
+    // `phaseEnteredMs` lets it compute "in this phase for X seconds"
+    // against tick.uptimeMs without an extra tick field.
+    extra = snprintf(buf + n, cap - n,
+        ",\"system\":{\"phase\":\"%s\",\"phaseEnteredMs\":%lu}",
+        system_phase_name(system_phase_get()),
+        (unsigned long)system_phase_entered_ms());
+    if (extra > 0 && (size_t)(n + extra) < cap) n += extra;
 
     if (n + 1 >= cap) return n;
     buf[n++] = '}';
@@ -789,8 +800,37 @@ static net_relay_cmd_status_t app_cmd_handler(const char *cmd, const char *id,
     return NET_RELAY_CMD_FAIL;
 }
 
+// Phase transition emitter. Registered with system_phase right after
+// system_phase_init so every transition after that point ships a small
+// JSON event to the relay. Best-effort: if the relay isn't connected
+// (BOOT phase, wake-window before connect, etc.) we just drop — the
+// log line is the durable record. Tick still carries the current
+// phase, so dashboards re-sync on next tick after reconnect.
+static void on_phase_transition(system_phase_t from, system_phase_t to,
+                                 uint32_t prev_dur_ms) {
+    if (!net_relay_is_connected()) return;
+    char buf[160];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"type\":\"event\",\"kind\":\"phase\","
+         "\"from\":\"%s\",\"to\":\"%s\","
+         "\"prevDurMs\":%lu,\"uptimeMs\":%llu}",
+        system_phase_name(from), system_phase_name(to),
+        (unsigned long)prev_dur_ms,
+        (unsigned long long)uptime_ms());
+    if (n > 0 && (size_t)n < sizeof(buf)) {
+        net_relay_send(buf, n);   // queue-full = drop, no retry
+    }
+}
+
 void app_main(void) {
     g_boot_ms = now_ms();
+
+    // Phase tracking goes up FIRST so every transition during boot is
+    // captured. Observer is registered immediately after init; its
+    // callback no-ops if the relay isn't up yet, so it's safe to
+    // arm before net_relay_start.
+    system_phase_init();
+    system_phase_register_observer(on_phase_transition);
 
     ESP_LOGI(TAG, "grasshopper " GRASSHOPPER_FW_VERSION " booting");
 
@@ -810,7 +850,9 @@ void app_main(void) {
     // finalized files (seq > journal max), deletes any *.tmp orphans.
     // Must run before any session_store_open call, while no other SD
     // writers are around. Cheap when there's nothing to do.
+    system_phase_enter(PHASE_RECOVERY);
     session_store_recover_all();
+    system_phase_enter(PHASE_BOOT);
 
     // Register the cmd handler BEFORE ds_scheduler_maybe_handle_wake.
     // The wake-window phase (PR-D, when wakeWifi:true) brings up the
@@ -928,6 +970,14 @@ void app_main(void) {
     extern void thermal_preview_task(void *);
     xTaskCreatePinnedToCore(preview_task,         "preview",  8192, NULL, 4, NULL, 0);
     xTaskCreatePinnedToCore(thermal_preview_task, "thermprv", 8192, NULL, 4, NULL, 0);
+
+    // All peripherals up + tick/preview tasks running. Mark LIVE so
+    // the dashboard can flip from "BOOT" chip to the green "LIVE" chip
+    // and consumers (preview, sessions worker — commit 2) know it's
+    // safe to do bulk work. CAPTURE / DEEP_SLEEP_CAPTURE / OTA will
+    // transition out of LIVE on demand from the cmd handler / DS
+    // worker / OTA task.
+    system_phase_enter(PHASE_LIVE);
 
     ESP_LOGI(TAG, "boot complete; free heap=%u psram=%u",
              (unsigned)esp_get_free_heap_size(),
