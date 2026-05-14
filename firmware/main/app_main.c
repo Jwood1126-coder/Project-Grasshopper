@@ -295,11 +295,56 @@ static void send_init(void) {
     }
 }
 
+// Per-phase upper-bound budgets for the stuck-phase detector. 0 means
+// "don't warn about this phase ever" — applied to non-blocking phases
+// where staying put indefinitely is the expected steady state.
+//
+// These ceilings should be GENEROUS — better to under-report stuck
+// states than to spam phase.stuck warnings on a healthy device that's
+// just running a slow capture or a long OTA. The intent is "something
+// is wrong; investigate," not "every long operation is suspicious."
+//
+// EVENT-ONLY: when a phase exceeds its ceiling we emit ONE phase.stuck
+// event for that phase entry, then stay quiet until the next transition.
+// We do NOT auto-recover; auto-recovery is where state machines turn
+// dangerous, and the user explicitly held the line on this.
+static const uint32_t PHASE_STUCK_MS[PHASE__COUNT] = {
+    [PHASE_UNKNOWN]            = 0,        // never warn — fail-open
+    [PHASE_BOOT]               = 0,        // boot sometimes lingers; not interesting
+    [PHASE_RECOVERY]           = 0,        // bounded by SD scan
+    [PHASE_LIVE]               = 0,        // intentional steady state
+    [PHASE_CAPTURE]            = 30000,    // 30s — live commits are sub-second
+    [PHASE_DEEP_SLEEP_CAPTURE] = 60000,    // 60s — one wake's worth + slack
+    [PHASE_WAKE_RADIO]         = 90000,    // 90s — max 60s window + WiFi setup
+    [PHASE_OTA]                = 300000,   // 5 min — large download budget
+};
+
+static void emit_phase_stuck(system_phase_t phase, uint32_t in_phase_ms) {
+    if (!net_relay_is_connected()) return;
+    char buf[160];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"type\":\"event\",\"kind\":\"phase.stuck\","
+         "\"phase\":\"%s\",\"inPhaseMs\":%lu,\"uptimeMs\":%llu}",
+        system_phase_name(phase),
+        (unsigned long)in_phase_ms,
+        (unsigned long long)uptime_ms());
+    if (n > 0 && (size_t)n < sizeof(buf)) {
+        net_relay_send(buf, n);
+    }
+}
+
 static void tick_task(void *arg) {
     Tick_t tick = { .type = "tick" };
 
     bool sent_init = false;
     int64_t last_fps_ms = now_ms();
+    // Stuck-phase tracker. We warn at most once per phase entry.
+    // Reset on every actual transition (detected via a phase change
+    // OR an entered_ms change — same-phase enter is a no-op so neither
+    // changes and we won't reset spuriously).
+    system_phase_t last_phase            = system_phase_get();
+    uint32_t       last_phase_entered_ms = system_phase_entered_ms();
+    bool           warned_this_entry     = false;
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1500));
@@ -367,6 +412,31 @@ static void tick_task(void *arg) {
         } else {
             ESP_LOGE(TAG, "tick buffer too small (n=%u)", (unsigned)n);
         }
+
+        // Stuck-phase detector. Run after the tick send so the
+        // dashboard always has the current phase block before the
+        // warning lands. Reset the warned-flag on any real transition;
+        // emit at most one event per phase entry.
+        system_phase_t cur_phase    = system_phase_get();
+        uint32_t       cur_entered  = system_phase_entered_ms();
+        if (cur_phase != last_phase || cur_entered != last_phase_entered_ms) {
+            last_phase            = cur_phase;
+            last_phase_entered_ms = cur_entered;
+            warned_this_entry     = false;
+        }
+        if (!warned_this_entry &&
+            cur_phase >= 0 && cur_phase < PHASE__COUNT &&
+            PHASE_STUCK_MS[cur_phase] > 0) {
+            uint32_t in_phase_ms = system_phase_in_phase_ms();
+            if (in_phase_ms > PHASE_STUCK_MS[cur_phase]) {
+                ESP_LOGW(TAG, "phase.stuck: %s for %ums (ceiling %ums)",
+                         system_phase_name(cur_phase),
+                         (unsigned)in_phase_ms,
+                         (unsigned)PHASE_STUCK_MS[cur_phase]);
+                emit_phase_stuck(cur_phase, in_phase_ms);
+                warned_this_entry = true;
+            }
+        }
     }
 }
 
@@ -420,6 +490,13 @@ void preview_task(void *arg) {
         vTaskDelay(pdMS_TO_TICKS(PREVIEW_INTERVAL_MS));
         if (!net_relay_is_connected())  continue;
         if (!hal_camera_ready())        continue;
+        // Phase-aware bulk throttle. Skips the camera grab + JPEG
+        // encode + WS send during CAPTURE / DEEP_SLEEP_CAPTURE / OTA.
+        // pauses_bulk() FAILS OPEN: any phase outside that explicit
+        // set returns false, so a corrupt phase value can't silence
+        // preview indefinitely. tick + cmd.result + log + sender queue
+        // all keep flowing — only this preview send is held.
+        if (system_phase_pauses_bulk())  continue;
 
         if (!s_preview_buf) {
             s_preview_buf = heap_caps_malloc(PREVIEW_MAX_BYTES, MALLOC_CAP_SPIRAM);
@@ -494,6 +571,9 @@ void thermal_preview_task(void *arg) {
         // is rebuilt as a single-task queue (see PR-C backlog).
         vTaskDelay(pdMS_TO_TICKS(1500));
         if (!net_relay_is_connected()) continue;
+        // Same fail-open phase throttle as preview_task. Holds the
+        // thermal encoder mutex out of the way during capture commits.
+        if (system_phase_pauses_bulk()) continue;
 
         if (!s_therm_preview_buf) {
             s_therm_preview_buf = heap_caps_malloc(PREVIEW_MAX_BYTES,

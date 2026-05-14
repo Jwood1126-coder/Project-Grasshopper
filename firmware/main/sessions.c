@@ -20,6 +20,7 @@
 #include "capture.h"
 #include "hal_storage.h"
 #include "net_relay.h"
+#include "system_phase.h"
 
 static const char *TAG = "sessions";
 
@@ -497,11 +498,39 @@ static void do_delete(const sess_req_t *req) {
 
 // ───────────── worker task ─────────────
 
+// Bounded in-place wait while a capture is in progress. We hold the
+// already-pulled request on our stack — DO NOT re-enqueue it. Repeated
+// re-enqueueing during a long capture would bounce the same request
+// to the back of the queue forever and starve out fresher requests
+// arriving behind it.
+//
+// 3 s ceiling. Live captures commit in ~hundreds of ms; DEEP_SLEEP_CAPTURE
+// can be ~10-15 s but the wake handler runs BEFORE sessions_init, so the
+// worker isn't even alive during a DS wake. OTA holds the radio for up
+// to a minute, but the dashboard isn't browsing the Library during an
+// OTA in any realistic flow.
+//
+// FAIL OPEN: pauses_bulk() returns false on UNKNOWN/garbage, so a
+// corrupt phase value can't starve the sessions worker forever.
+static void wait_for_quiet_phase(void) {
+    int waited_ms = 0;
+    while (system_phase_pauses_bulk() && waited_ms < 3000) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        waited_ms += 100;
+    }
+    if (waited_ms > 0) {
+        ESP_LOGI(TAG, "worker: waited %dms for non-bulk phase", waited_ms);
+    }
+}
+
 static void worker_task(void *arg) {
     (void)arg;
     sess_req_t req;
     for (;;) {
         if (xQueueReceive(s_queue, &req, portMAX_DELAY) != pdTRUE) continue;
+        // Defer bulk SD work briefly while a capture/OTA is in flight.
+        // Hold the request in our stack frame; never re-enqueue.
+        wait_for_quiet_phase();
         ESP_LOGI(TAG, "worker: cmd=%s id=%s", req_cmd_name(req.type), req.cmd_id);
         switch (req.type) {
             case SESS_REQ_LIST:      do_list(&req); break;

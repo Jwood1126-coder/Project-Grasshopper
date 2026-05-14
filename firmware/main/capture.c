@@ -440,6 +440,21 @@ static uint32_t new_session_id(void) {
     return 1000 + (r % 99000);   // 1000–99999
 }
 
+// MAINTAINER NOTE — read before adding any code path here:
+//
+// This function calls system_phase_enter(PHASE_CAPTURE) midway through.
+// Every exit MUST go through the `out:` label so phase returns to LIVE.
+// A bare `return` after the phase enter() leaves preview tasks paused
+// forever and the dashboard's chip stuck on "CAPTURE" until the next
+// phase transition (which may never come). This is exactly the kind of
+// silent-failure footgun the system_phase design was built to avoid.
+//
+// If you need an early return after the CAPTURE enter, use:
+//
+//     if (something_failed) { rc = ESP_FAIL; goto out; }
+//
+// The pre-enter validation block (SD present, camera ready) is the only
+// place bare returns are safe — phase has not been entered yet.
 esp_err_t capture_now(char *session_id_out, size_t session_id_cap,
                       char *msg_out, size_t msg_cap) {
     if (!hal_storage_sd_present()) {
@@ -544,6 +559,12 @@ static void ensure_tl_mutex(void) {
     if (!s_tl_mutex) s_tl_mutex = xSemaphoreCreateMutex();
 }
 
+// MAINTAINER NOTE: same single-exit discipline as capture_now. Every
+// path after system_phase_enter(PHASE_CAPTURE) must restore PHASE_LIVE
+// before returning. The two return statements below are mirror copies
+// of each other for that reason — do not collapse them by adding an
+// early return that skips the restore.
+//
 // One capture iteration: produce artifacts, hand them to session_store
 // for transactional commit. session_store owns the SD lock + journal +
 // session.json — this loop just chains the engine and the store.
