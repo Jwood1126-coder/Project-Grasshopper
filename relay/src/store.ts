@@ -25,6 +25,12 @@ export interface DeviceRecord {
   lastSeenMs: number
   init: unknown // last full Init message
   tick: unknown // last Tick (or merged snapshot)
+  // Latest {phase, phaseEnteredMs} block, sourced from whichever of
+  // hello / init / tick most recently carried one. Hello is critical:
+  // during a wake-Wi-Fi window the device sends hello + cmd.results
+  // but no init/tick, so without this field the dashboard would have
+  // no phase data to display until the next live boot.
+  system?: { phase: string; phaseEnteredMs: number; updatedMs: number }
   logs: LogEntry[]
   events: EventEntry[]
   previewVis?: PreviewFrame

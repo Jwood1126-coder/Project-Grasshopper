@@ -71,6 +71,10 @@ export const USER_UI_HTML = `<!doctype html>
   .chip.ok    { color: var(--ok);   border-color: #1f3a28; background: #0e1a13; }
   .chip.warn  { color: var(--warn); border-color: #3a2f1f; background: #1a160e; }
   .chip.err   { color: var(--err);  border-color: #3a1f23; background: #1a0e10; }
+  /* Info / sleeping-by-design — distinct from "live" green and the
+     amber "warn" so the user sees DEEP_SLEEP_CAPTURE / WAKE_RADIO at a
+     glance without misreading them as a fault. Cyan, calm. */
+  .chip.info  { color: #6cc7ff; border-color: #1e3a4a; background: #0e1a22; }
   .chip .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
   .chip.ok .dot { animation: pulse 2.4s ease-in-out infinite; }
   @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
@@ -1356,6 +1360,18 @@ export const USER_UI_HTML = `<!doctype html>
   // empty state only when sustained for many polls.
   let noDeviceTicks = 0;
 
+  // Last-known system phase block — updated whenever a poll() sees one
+  // in state.system / state.tick.system / state.init.system. Survives
+  // across polls so the offline branch can distinguish "DEEP_SLEEP_CAPTURE
+  // — sleeping by design" from "unknown — unexpectedly offline".
+  // Cleared only when the device truly goes silent for a long time
+  // (the noDeviceTicks >= 10 path).
+  // Shape: { phase: string, phaseEnteredMs: number, observedAt: number }
+  // observedAt is dashboard wall-clock at the time we cached it; lets
+  // the chip show approximate "in this phase for X" even when the
+  // device is offline.
+  let lastSeenSystem = null;
+
   // ───── Timelapse settings modal ─────
   // Live mode allows fast intervals (task-loop captures); deep-sleep
   // mode requires ≥60s because Lepton boot eats ~10–18s of awake time
@@ -1959,6 +1975,48 @@ export const USER_UI_HTML = `<!doctype html>
       el('div', { class: 'v ' + (kind || '') }, String(v)));
   }
 
+  // Map a wire-protocol phase name to a chip CSS class. Unknown values
+  // get the default (no extra class) gray look — downgrade-safe: an old
+  // firmware that never carries the system block doesn't break the UI.
+  function phaseChipClass(phase) {
+    switch (phase) {
+      case 'LIVE':                return 'chip ok';
+      case 'CAPTURE':
+      case 'DEEP_SLEEP_CAPTURE':
+      case 'WAKE_RADIO':          return 'chip info';
+      case 'OTA':
+      case 'BOOT':
+      case 'RECOVERY':            return 'chip warn';
+      case 'UNKNOWN':
+      default:                    return 'chip';
+    }
+  }
+
+  // Pull the canonical {phase, phaseEnteredMs} from a poll response.
+  // Prefers the relay's top-level state.system (commit 3 firmware/relay
+  // path); falls back to the splice_extras blocks inside tick / init for
+  // older relay deployments that haven't redeployed yet. Returns null if
+  // nothing is present.
+  function readSystemBlock(state) {
+    if (!state || typeof state !== 'object') return null;
+    const candidates = [state.system, state.tick?.system, state.init?.system];
+    for (const c of candidates) {
+      if (c && typeof c.phase === 'string' &&
+          typeof c.phaseEnteredMs === 'number') {
+        return { phase: c.phase, phaseEnteredMs: c.phaseEnteredMs };
+      }
+    }
+    return null;
+  }
+
+  function fmtPhaseDuration(ms) {
+    if (!isFinite(ms) || ms < 0) return '';
+    if (ms < 1000) return ms + ' ms';
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return s + 's';
+    return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+  }
+
   function updateChips(d, state) {
     const chips = document.getElementById('chips');
     chips.innerHTML = '';
@@ -1977,6 +2035,31 @@ export const USER_UI_HTML = `<!doctype html>
         class: acqOk ? 'chip ok' : (lastThermFrames > 0 ? 'chip warn' : 'chip err'),
         title: 'Acquisition: thermal frame counter increasing',
       }, acqOk ? 'Acquiring' : (lastThermFrames > 0 ? 'Stalled' : 'No frames')));
+    }
+
+    // Phase chip. Read from state if present; otherwise from the cached
+    // lastSeenSystem (covers the offline branch where we don't have a
+    // fresh state object). Compute "in phase for X" against tick.uptimeMs
+    // when available, else against dashboard wall-clock since we cached
+    // the block. Approximate is fine — the value is for human triage.
+    const sys = readSystemBlock(state) || lastSeenSystem;
+    if (sys) {
+      let inPhaseMs = 0;
+      const tickUp = state?.tick?.uptimeMs;
+      if (typeof tickUp === 'number' && tickUp >= sys.phaseEnteredMs) {
+        inPhaseMs = tickUp - sys.phaseEnteredMs;
+      } else if (lastSeenSystem && lastSeenSystem.observedAt) {
+        // Wall-clock fallback — represents the SUM of dashboard-time
+        // since we last saw the device + whatever device-time was
+        // already on the clock. Coarse but useful for "stuck > 30s".
+        inPhaseMs = Date.now() - lastSeenSystem.observedAt;
+      }
+      const isStale = (!d || !d.online) ? true : false;
+      chips.appendChild(el('div', {
+        class: phaseChipClass(sys.phase) + (isStale ? ' stale' : ''),
+        title: 'System phase' + (isStale ? ' (last known)' : '') +
+               (inPhaseMs > 0 ? ' · in this phase for ' + fmtPhaseDuration(inPhaseMs) : ''),
+      }, sys.phase));
     }
   }
 
@@ -2127,6 +2210,29 @@ export const USER_UI_HTML = `<!doctype html>
           setFwStatus((e.ok ? '' : '✗ ') + (e.msg || '') + pct,
                        e.ok ? '' : 'err');
         }
+        // Phase transitions — quietly cache the latest known phase from
+        // the event stream too. Tick-derived state.system updates
+        // are still the primary source; this just lets the chip flip
+        // ~1 s sooner during a transition burst (e.g. LIVE→CAPTURE→LIVE
+        // inside a single tick interval that the chip would otherwise
+        // miss entirely).
+        if (e.kind === 'phase' && typeof e.to === 'string' &&
+            typeof e.uptimeMs === 'number') {
+          // The transition event carries to + uptimeMs; phaseEnteredMs
+          // for the NEW phase is the uptime at transition.
+          lastSeenSystem = {
+            phase: e.to,
+            phaseEnteredMs: e.uptimeMs,
+            observedAt: Date.now(),
+          };
+        }
+        // Stuck-phase warnings — surface as a toast so the operator sees
+        // them in real time, not just buried in the events ring.
+        if (e.kind === 'phase.stuck' && typeof e.phase === 'string') {
+          const inMs = (typeof e.inPhaseMs === 'number') ? e.inPhaseMs : 0;
+          toast('⚠ phase ' + e.phase + ' stuck for ' + fmtPhaseDuration(inMs),
+                'err');
+        }
       }
     } catch {}
   }
@@ -2151,16 +2257,40 @@ export const USER_UI_HTML = `<!doctype html>
           currentDeviceId = null;
           lastThermFrames = 0;
           lastThermFramesTs = 0;
+          // Branch the empty state on last-known phase. If the device
+          // went silent while in DEEP_SLEEP_CAPTURE, this is a designed
+          // sleep — show the user the right story instead of "searching
+          // for your device" (which implies something's wrong). After
+          // ~10 minutes of cached state we drop the cache and fall back
+          // to the generic "looking for" message; sleeping that long
+          // without a wake-Wi-Fi window is genuinely unusual.
+          const sleepingByDesign =
+            lastSeenSystem &&
+            lastSeenSystem.phase === 'DEEP_SLEEP_CAPTURE' &&
+            (Date.now() - (lastSeenSystem.observedAt || 0)) < 10 * 60 * 1000;
           if (currentView === 'live' && !content.querySelector('.empty')) {
             content.innerHTML = '';
-            content.appendChild(el('div', { class: 'empty' },
-              el('div', { class: 'pulse' }),
-              el('h2', {}, 'Looking for your device…'),
-              el('p', {}, 'Power on a Grasshopper unit and connect it to Wi-Fi. It should appear here within a few seconds.')
-            ));
+            if (sleepingByDesign) {
+              content.appendChild(el('div', { class: 'empty' },
+                el('div', { class: 'pulse' }),
+                el('h2', {}, 'Sleeping by design'),
+                el('p', {},
+                  'Device entered DEEP_SLEEP_CAPTURE. Radio is off between captures; ' +
+                  'the dashboard will reconnect during the next wake-Wi-Fi window or when the session completes.')
+              ));
+            } else {
+              content.appendChild(el('div', { class: 'empty' },
+                el('div', { class: 'pulse' }),
+                el('h2', {}, 'Looking for your device…'),
+                el('p', {}, 'Power on a Grasshopper unit and connect it to Wi-Fi. It should appear here within a few seconds.')
+              ));
+            }
           }
         }
-        updateChips(null, null);
+        // Pass the cached system block through so the chip stays
+        // visible during the offline window even before noDeviceTicks
+        // reaches the empty-state threshold.
+        updateChips(null, lastSeenSystem ? { system: lastSeenSystem } : null);
         return;
       }
       noDeviceTicks = 0;
@@ -2179,6 +2309,10 @@ export const USER_UI_HTML = `<!doctype html>
           lastThermFrames = live.thermal.frames;
           lastThermFramesTs = Date.now();
         }
+        // Cache the latest known phase so the offline branch can show
+        // the right empty-state message + the chip stays correct.
+        const sys = readSystemBlock(state);
+        if (sys) lastSeenSystem = { ...sys, observedAt: Date.now() };
         updateActiveTl(live);
         updateChips(d, state);
         maybeRefreshLibrary();
@@ -2199,6 +2333,9 @@ export const USER_UI_HTML = `<!doctype html>
                               { cache: 'no-store' });
       const state = await sr.json();
       const live = state?.tick ?? state?.init;
+      // Cache phase for the offline branch.
+      const sys = readSystemBlock(state);
+      if (sys) lastSeenSystem = { ...sys, observedAt: Date.now() };
       updateActiveTl(live);
       updateLiveView(d, state);
       updateChips(d, state);

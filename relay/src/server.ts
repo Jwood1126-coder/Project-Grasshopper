@@ -37,6 +37,28 @@ function deviceOnline(d: { socket: { readyState: number } | null; lastSeenMs: nu
   return Date.now() - d.lastSeenMs < ONLINE_FRESHNESS_MS
 }
 
+// Pull {phase, phaseEnteredMs} from any incoming hello/init/tick that
+// carries a top-level `system` block (commit 1 firmware splice). Stored
+// once per device so the dashboard can show "sleeping by design" the
+// instant the device went silent, including during wake-Wi-Fi windows
+// where no init/tick will follow the hello.
+//
+// Defensive: if the message lacks a system block, OR phase isn't a
+// string, OR phaseEnteredMs isn't a number, we leave the existing
+// stored value alone. Downgrade safety: an old-firmware reconnect
+// won't wipe the last-known phase.
+function captureSystemBlock(deviceId: string, msg: any): void {
+  const sys = msg?.system
+  if (!sys || typeof sys !== 'object') return
+  const phase = sys.phase
+  const enteredMs = sys.phaseEnteredMs
+  if (typeof phase !== 'string') return
+  if (typeof enteredMs !== 'number') return
+  store.upsert(deviceId, {
+    system: { phase, phaseEnteredMs: enteredMs, updatedMs: Date.now() },
+  })
+}
+
 app.get('/api/devices', (c) =>
   c.json({
     devices: store.list().map((d) => ({
@@ -66,6 +88,12 @@ app.get('/api/devices/:id/state', (c) => {
     online: deviceOnline(d),
     init: d.init,
     tick: d.tick,
+    // Top-level last-known phase block (sourced from any of
+    // hello/init/tick that carried one). Dashboard reads this for
+    // the phase chip and the "sleeping by design" branch — the
+    // tick.system / init.system blocks are still there for backward
+    // compatibility but `system` is the canonical source.
+    system: d.system,
   })
 })
 
@@ -641,6 +669,9 @@ const server = Bun.serve<WsCtx>({
           ip: ws.data.remoteIp,
           lastSeenMs: Date.now(),
         })
+        // Phase block from hello — critical during wake-Wi-Fi windows
+        // when no init/tick will follow. See store.ts DeviceRecord.
+        captureSystemBlock(msg.deviceId, msg)
         store.setSocket(msg.deviceId, ws)
         console.log(`[ws] hello from ${msg.deviceId} fw=${msg.fwVersion ?? '?'}`)
         // Push wall-clock time so the device can set its system clock
@@ -668,6 +699,7 @@ const server = Bun.serve<WsCtx>({
             fwVersion: msg.fwVersion ?? '',
             gitSha: msg.gitSha ?? '',
           })
+          captureSystemBlock(deviceId, msg)
           break
         case 'tick': {
           const prev = store.get(deviceId)
@@ -676,6 +708,7 @@ const server = Bun.serve<WsCtx>({
             tick: merged,
             state: (msg as any).state ?? prev?.state ?? 'UNKNOWN',
           })
+          captureSystemBlock(deviceId, msg)
           break
         }
         case 'event':
