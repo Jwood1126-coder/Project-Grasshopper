@@ -626,6 +626,21 @@ export const USER_UI_HTML = `<!doctype html>
   .session-card .badge.tl { background: #1f3a28; color: var(--ok); }
   .session-card .badge.single { background: #2a2a3a; color: #88a; }
   .session-card .badge.incomplete { background: #3a1f23; color: var(--err); }
+  /* Recording: red accent border + pulsing dot in the badge. Replaces
+     the "incomplete" tag while the session is actively writing — same
+     state, but framed as live progress instead of a fault. */
+  .session-card.recording {
+    border-color: var(--err);
+    box-shadow: 0 0 0 1px var(--err) inset;
+  }
+  .session-card .badge.recording {
+    background: var(--err); color: #fff;
+    animation: rec-pulse 1.4s ease-in-out infinite;
+  }
+  @keyframes rec-pulse {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.55; }
+  }
 
   .empty-library {
     text-align: center; padding: 60px 20px; color: var(--muted);
@@ -2164,7 +2179,9 @@ export const USER_UI_HTML = `<!doctype html>
           lastThermFrames = live.thermal.frames;
           lastThermFramesTs = Date.now();
         }
+        updateActiveTl(live);
         updateChips(d, state);
+        maybeRefreshLibrary();
         return;
       }
 
@@ -2181,11 +2198,49 @@ export const USER_UI_HTML = `<!doctype html>
       const sr = await fetch('/api/devices/' + encodeURIComponent(d.deviceId) + '/state',
                               { cache: 'no-store' });
       const state = await sr.json();
+      const live = state?.tick ?? state?.init;
+      updateActiveTl(live);
       updateLiveView(d, state);
       updateChips(d, state);
     } catch (e) {
       console.warn('poll error', e);
     }
+  }
+
+  // Pull the in-progress timelapse session id (and capture count) from the
+  // latest tick/init. Side-effect: when the count moves, mark the library
+  // dirty so the next maybeRefreshLibrary tick re-fetches the list and the
+  // recording card's thumbnail/captures field stays current.
+  function updateActiveTl(live) {
+    const tl = live?.timelapse;
+    const sid = (tl && tl.active && tl.sessionId) ? tl.sessionId : null;
+    const count = (tl && typeof tl.captureCount === 'number') ? tl.captureCount : 0;
+    if (sid !== activeTlSessionId) {
+      activeTlSessionId = sid;
+      // Force a refresh on TL start/stop transitions so the recording
+      // card appears (or its incomplete badge clears) without delay.
+      lastLibraryReloadMs = 0;
+    } else if (sid && count !== activeTlCaptureCount) {
+      // New capture committed during this session — refresh the card.
+      lastLibraryReloadMs = 0;
+    }
+    activeTlCaptureCount = count;
+  }
+
+  // Library auto-refresh. Cheap when nothing changed: sessions.list is
+  // a single device cmd that returns inline JSON. Cadence:
+  //   - 8 s baseline while view='library' and a device is online
+  //   - immediate when activeTlSessionId/captureCount transitions
+  //     (lastLibraryReloadMs reset to 0 by updateActiveTl)
+  // Detail view doesn't need it — captures.jsonl is loaded on open and
+  // an in-progress session's later captures aren't visible anyway until
+  // the session is closed (the detail view caches the snapshot).
+  function maybeRefreshLibrary() {
+    if (currentView !== 'library' || !currentDeviceId) return;
+    const now = Date.now();
+    if (now - lastLibraryReloadMs < 8000) return;
+    lastLibraryReloadMs = now;
+    loadLibrary();
   }
 
   // ───── Library + detail views ─────
@@ -2419,6 +2474,17 @@ export const USER_UI_HTML = `<!doctype html>
   }
   let libPrefs = loadLibPrefs();
   let lastSessions = [];
+  // sessionId of an in-progress timelapse, surfaced on the matching
+  // library card with a "● recording" badge and dropping the redundant
+  // "incomplete" tag (incomplete=true is by definition the recording state).
+  // Updated from poll() each tick.
+  let activeTlSessionId = null;
+  // captureCount for the active TL on the previous tick — used to
+  // trigger a library re-fetch when a new capture commits, so the
+  // recording card shows the fresh count + thumbnail without waiting
+  // on the slower wall-clock interval.
+  let activeTlCaptureCount = 0;
+  let lastLibraryReloadMs = 0;
 
   function buildLibraryView() {
     const v = el('div', { class: 'library-view' });
@@ -2524,6 +2590,10 @@ export const USER_UI_HTML = `<!doctype html>
       meta.textContent = 'Waiting for device…';
       return;
     }
+    // Stamp here too — setView() calls loadLibrary directly without
+    // going through maybeRefreshLibrary, and we want the next 8 s
+    // throttle window to start now so we don't double-fetch.
+    lastLibraryReloadMs = Date.now();
     try {
       const r = await fetch(
         '/api/devices/' + encodeURIComponent(currentDeviceId) + '/sessions',
@@ -2560,6 +2630,7 @@ export const USER_UI_HTML = `<!doctype html>
       : '';
     const isTl = s.mode === 'timelapse';
     const incomplete = isTl && s.complete === false;
+    const isRecording = isTl && activeTlSessionId && activeTlSessionId === sid;
     const dur = (s.durationSec != null && s.durationSec > 0)
       ? fmtElapsed(s.durationSec * 1000) : '—';
     const ts = s.timestamp ? new Date(s.timestamp * 1000) : null;
@@ -2570,23 +2641,42 @@ export const USER_UI_HTML = `<!doctype html>
     const wantTherm = modality === 'therm' || modality === 'both';
 
     const card = el('div', {
-      class: 'session-card' + (modality === 'both' ? ' both' : ''),
+      class: 'session-card' + (modality === 'both' ? ' both' : '') +
+             (isRecording ? ' recording' : ''),
       onclick: () => setView('detail', sid),
     });
     const thumbWrap = el('div', { class: 'thumb-wrap' + (modality === 'both' ? ' both' : '') });
 
-    function makeThumb(name) {
+    // Try the primary thumbnail; on 404 walk the fallback list. This
+    // matters for thermal: seq=1 is often missing because the Lepton
+    // hadn't produced its first frame when the first capture committed
+    // (~10-15 s warmup post-CCI). For thermal we therefore fall back
+    // to the latest committed seq, where the sensor is always running.
+    function makeThumb(candidates) {
       const img = el('img', { class: 'thumb' });
-      loadAuthImg(img, fileUrl(name), () => {
-        // Fall back to a "no preview" placeholder for this slot.
-        const ph = el('div', { class: 'thumb-empty', style: 'flex:1;display:flex;align-items:center;justify-content:center' }, 'no preview');
-        img.replaceWith(ph);
-      });
+      let i = 0;
+      const tryNext = () => {
+        if (i >= candidates.length) {
+          const ph = el('div', { class: 'thumb-empty',
+            style: 'flex:1;display:flex;align-items:center;justify-content:center' },
+            'no preview');
+          if (img.parentElement) img.replaceWith(ph);
+          return;
+        }
+        const name = candidates[i++];
+        loadAuthImg(img, fileUrl(name), tryNext);
+      };
+      tryNext();
       return img;
     }
 
-    if (s.captureVis !== false && wantVis)   thumbWrap.appendChild(makeThumb('000001_vis.jpg'));
-    if (s.captureTherm !== false && wantTherm) thumbWrap.appendChild(makeThumb('000001_therm.jpg'));
+    const last = (typeof s.captureCount === 'number' && s.captureCount > 1)
+                 ? pad6(s.captureCount) : null;
+    const visCandidates   = ['000001_vis.jpg'].concat(last ? [last + '_vis.jpg'] : []);
+    const thermCandidates = ['000001_therm.jpg'].concat(last ? [last + '_therm.jpg'] : []);
+
+    if (s.captureVis !== false && wantVis)   thumbWrap.appendChild(makeThumb(visCandidates));
+    if (s.captureTherm !== false && wantTherm) thumbWrap.appendChild(makeThumb(thermCandidates));
     if (!thumbWrap.children.length) {
       thumbWrap.appendChild(el('div', { class: 'thumb-empty' }, 'no preview'));
     }
@@ -2596,13 +2686,15 @@ export const USER_UI_HTML = `<!doctype html>
         (isTl ? ('every ' + (s.intervalSec ?? '?') + 's · ' + dur) : 'single')),
       tsTxt && el('div', { class: 'row' }, tsTxt),
       el('div', { class: 'badges' },
+        isRecording && el('span', { class: 'badge recording' }, '● recording'),
         el('span', { class: 'badge ' + (isTl ? 'tl' : 'single') },
            isTl ? 'timelapse' : 'single'),
         s.captureVis && s.captureTherm
           ? el('span', { class: 'badge' }, 'vis+therm')
           : (s.captureVis ? el('span', { class: 'badge' }, 'vis')
                           : el('span', { class: 'badge' }, 'therm')),
-        incomplete && el('span', { class: 'badge incomplete' }, 'incomplete')));
+        incomplete && !isRecording &&
+          el('span', { class: 'badge incomplete' }, 'incomplete')));
     card.appendChild(thumbWrap);
     card.appendChild(info);
     return card;
@@ -2769,7 +2861,24 @@ export const USER_UI_HTML = `<!doctype html>
       grid.replaceChildren(...detailCaptureList.map((c, idx) => {
         const tile = el('div', { class: 'capture-tile',
           onclick: () => openLightbox(idx) });
-        if (c.visOk) {
+        // Detail tile honors libPrefs.modality so a therm-only or
+        // therm-preferred session doesn't render rows of "no vis"
+        // placeholders. modality='both' picks vis when present
+        // (vis is generally more recognizable as a thumbnail),
+        // therm otherwise.
+        const wantTherm = libPrefs.modality === 'therm';
+        const useTherm  = (wantTherm && c.thermOk) ||
+                          (libPrefs.modality === 'both' && !c.visOk && c.thermOk) ||
+                          (!c.visOk && c.thermOk);
+        const useVis    = !useTherm && c.visOk;
+        if (useTherm) {
+          const img = el('img', {});
+          tile.appendChild(img);
+          loadAuthImg(img,
+            '/api/devices/' + encodeURIComponent(currentDeviceId) +
+            '/sessions/' + encodeURIComponent(sid) +
+            '/file/' + c.thermFile);
+        } else if (useVis) {
           const img = el('img', {});
           tile.appendChild(img);
           loadAuthImg(img,
@@ -2779,7 +2888,7 @@ export const USER_UI_HTML = `<!doctype html>
         } else {
           tile.appendChild(el('div', { class: 'thumb-empty',
             style: 'display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted);font-size:11px' },
-            'no vis'));
+            wantTherm ? 'no therm' : 'no vis'));
         }
         tile.appendChild(el('div', { class: 'seq' }, '#' + c.seq));
         // Per-tile download button: opens menu with this capture's
