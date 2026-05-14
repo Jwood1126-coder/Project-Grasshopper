@@ -84,6 +84,28 @@ bool hal_lepton_get_frame(uint16_t *dst);
 
 uint32_t hal_lepton_frame_count(void);
 
+// True iff at least one frame has been committed AND it landed within
+// `max_age_ms` (judged against esp_timer_get_time/1000). Intended for
+// callers that need to know "the sensor is currently streaming" not
+// just "had a frame at some point" — frame_count > 0 is sticky once
+// set, freshness is what actually distinguishes a healthy stream from
+// one that stalled mid-session. Use ~1500–2000 ms (covers 2-3 frame
+// intervals at the Lepton's native ~5 fps after our discard ratio).
+bool hal_lepton_frame_fresh(uint32_t max_age_ms);
+
+// Cooperative state for callers that need to know whether hal_lepton_boot()
+// is currently running on another task. Set true on entry to
+// hal_lepton_boot(), cleared on exit. The deep-sleep cmd-handler-spawned
+// worker uses this to AVOID racing app_main's Lepton boot when the
+// dashboard fires timelapse.start in the ~10 s window between
+// net_relay_start (WS up) and hal_lepton_boot finishing.
+bool hal_lepton_boot_in_progress(void);
+
+// Block until hal_lepton_boot() either finishes or `timeout_ms` elapses.
+// Returns ESP_OK if boot is no longer in progress when this returns,
+// ESP_ERR_TIMEOUT otherwise. Polls every 100 ms.
+esp_err_t hal_lepton_wait_boot_complete(uint32_t timeout_ms);
+
 // ---------- CCI controls (thread-safe) ----------
 
 esp_err_t hal_lepton_run_ffc(void);

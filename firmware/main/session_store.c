@@ -516,6 +516,65 @@ esp_err_t session_store_commit(session_store_handle_t *h,
     return ESP_OK;
 }
 
+esp_err_t session_store_mark_aborted(const char *session_id,
+                                       const char *reason) {
+    if (!session_id || !*session_id) return ESP_ERR_INVALID_ARG;
+    if (!reason || !*reason) reason = "interrupted-cold-boot";
+
+    if (!hal_storage_sd_lock(5000)) {
+        ESP_LOGW(TAG, "mark_aborted: SD lock timeout");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    char dir[160];
+    snprintf(dir, sizeof(dir), "%s/%s", SESSIONS_BASE_DIR, session_id);
+    // Create dir in case the session was armed but never reached
+    // session_store_open (worker crashed, etc).
+    hal_storage_sd_mkdir_p(dir);
+
+    // Replay any existing journal so the aborted marker carries the
+    // capture count and aggregates the user already invested in. If
+    // there's no journal, agg stays zeroed and we write a 0-capture
+    // marker — still useful as a "this session existed but committed
+    // nothing" signal.
+    replay_agg_t agg; replay_init(&agg);
+    (void)replay_journal(dir, &agg);
+
+    char path[256];
+    snprintf(path, sizeof(path), "%s/session.json", dir);
+
+    char meta[768];
+    int n = snprintf(meta, sizeof(meta),
+        "{\"sessionId\":\"%s\","
+         "\"mode\":\"timelapse\","
+         "\"complete\":false,"
+         "\"aborted\":true,"
+         "\"abortedReason\":\"%s\","
+         "\"abortedAt\":%llu,"
+         "\"captureCount\":%lu,"
+         "\"timestamp\":%llu,"
+         "\"intervalSec\":0,"
+         "\"durationSec\":0,"
+         "\"captureVis\":true,"
+         "\"captureTherm\":true}",
+        session_id, reason,
+        (unsigned long long)time(NULL),
+        (unsigned long)agg.capture_count,
+        (unsigned long long)agg.earliest_epoch);
+
+    int w = (n > 0 && (size_t)n < sizeof(meta))
+            ? hal_storage_sd_atomic_write(path, meta, (size_t)n)
+            : -1;
+    hal_storage_sd_unlock();
+    if (w <= 0) {
+        ESP_LOGE(TAG, "mark_aborted: write %s failed", path);
+        return ESP_FAIL;
+    }
+    ESP_LOGW(TAG, "mark_aborted: %s reason=\"%s\" prior_captures=%lu",
+             session_id, reason, (unsigned long)agg.capture_count);
+    return ESP_OK;
+}
+
 uint32_t session_store_journal_max_seq(const char *session_id) {
     if (!session_id || !*session_id) return 0;
     char dir[160];

@@ -117,17 +117,38 @@ esp_err_t hal_lepton_run_initial_ffc(void) {
     return err;
 }
 
+// Cooperative flag. The deep-sleep worker checks this to avoid racing
+// app_main's hal_lepton_boot when a cmd arrives in the ~10 s window
+// between net_relay_start and hal_lepton_boot finishing.
+static volatile bool s_boot_in_progress = false;
+
+bool hal_lepton_boot_in_progress(void) {
+    return s_boot_in_progress;
+}
+
+esp_err_t hal_lepton_wait_boot_complete(uint32_t timeout_ms) {
+    uint32_t waited = 0;
+    while (s_boot_in_progress && waited < timeout_ms) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        waited += 100;
+    }
+    return s_boot_in_progress ? ESP_ERR_TIMEOUT : ESP_OK;
+}
+
 esp_err_t hal_lepton_boot(void) {
+    s_boot_in_progress = true;
+    esp_err_t rc = ESP_FAIL;
+
     // Fox uses 5s here. New Lepton 3.5 units sometimes need longer
     // before responding to I2C; bump to 8s for safety.
     esp_err_t err = hal_lepton_power_on(8000);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) { rc = err; goto out; }
 
     err = hal_lepton_cci_bus_init();
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) { rc = err; goto out; }
 
     err = hal_lepton_cci_apply_config();
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) { rc = err; goto out; }
 
     // NOTE: FFC at boot was an experiment that turned out to be
     // counterproductive. After FFC, the Lepton emits duplicate frames
@@ -136,13 +157,16 @@ esp_err_t hal_lepton_boot(void) {
     // Fox runs FFC AFTER the first frame, and that's what we do too.
 
     err = hal_lepton_vospi_bring_up();
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) { rc = err; goto out; }
 
     err = hal_lepton_wait_first_frame(30000);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) { rc = err; goto out; }
 
     hal_lepton_run_initial_ffc();   // non-fatal
-    return ESP_OK;
+    rc = ESP_OK;
+out:
+    s_boot_in_progress = false;
+    return rc;
 }
 
 bool hal_lepton_get_frame(uint16_t *dst) {
@@ -151,6 +175,15 @@ bool hal_lepton_get_frame(uint16_t *dst) {
 
 uint32_t hal_lepton_frame_count(void) {
     return lepton_vospi_frame_count();
+}
+
+bool hal_lepton_frame_fresh(uint32_t max_age_ms) {
+    if (lepton_vospi_frame_count() == 0) return false;
+    hal_lepton_stats_t st = {0};
+    lepton_vospi_get_stats(&st);
+    if (st.lastFrameMs == 0) return false;
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    return (now - st.lastFrameMs) <= max_age_ms;
 }
 
 esp_err_t hal_lepton_run_ffc(void) {

@@ -118,6 +118,17 @@ esp_err_t session_store_recover_all(void);
 // session is active — the SD journal is the source of truth.
 uint32_t session_store_journal_max_seq(const char *session_id);
 
+// Write an aborted-marker session.json into a session directory.
+// Used by the deep-sleep scheduler when a non-timer cold boot finds
+// an NVS-active session: rather than silently wiping the marker,
+// we leave a breadcrumb on disk so the dashboard can show the user
+// "session X was interrupted at boot, aborted" instead of the
+// session simply vanishing. Creates the dir if absent. Idempotent —
+// overwrites any existing session.json. `reason` is a short free-text
+// string; pass NULL for the default "interrupted-cold-boot".
+esp_err_t session_store_mark_aborted(const char *session_id,
+                                       const char *reason);
+
 #ifdef __cplusplus
 }
 #endif

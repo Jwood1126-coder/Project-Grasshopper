@@ -181,31 +181,51 @@ static void nvs_clear(void) {
 // phases let us measure each step (phase timing for the journal),
 // skip the every-wake FFC, and bound the first-frame wait.
 //
-// Two paths:
-//   - "Already running" (cmd-handler-context first cycle): app_main
-//     ran hal_lepton_boot before the worker fired, so the sensor is
-//     streaming and the VoSPI reader has frames. Skip the disruptive
-//     power cycle entirely — power_on() force-cycles the MOSFET
-//     (1s OFF + 8s ON) which kills a working sensor and resets
-//     internal state, the cci_apply_config does OEM_REBOOT which
-//     adds another ~5s, and even after all that the wait_first_frame
-//     can return immediately on a stale s_frame_counter. Net effect
-//     was that the cmd-handler-spawned first wake was producing NO
-//     thermal artifacts in the user's session_9583.
-//   - "Cold wake" (timer wake from deep sleep): MOSFET was driven
-//     low before sleep, so we genuinely need to power it back on.
+// Three paths:
 //
-// Detection: hal_lepton_frame_count() > 0 is true iff at least one
-// frame has been assembled since boot. After cold wake from deep
-// sleep, the program reloads from scratch and the counter is 0.
+//   1. "App_main is mid-boot of the Lepton right now" — cmd arrived
+//      in the ~10 s window between net_relay_start (WS up) and
+//      hal_lepton_boot finishing. Wait for it to complete (bounded
+//      by 35s — slightly more than the 30s first-frame budget) and
+//      then use the streaming sensor. Without this, we'd race the
+//      live boot and power-cycle a Lepton mid-CCI-configure.
+//
+//   2. "Already streaming, fresh" — frame_count > 0 AND the most
+//      recent frame is recent (<2s old). Skip the disruptive power
+//      cycle. frame_count alone is not enough: it's sticky once set
+//      so a sensor that produced one frame and then stalled would
+//      pass the old check but still be unhealthy at capture time.
+//
+//   3. "Cold wake from deep sleep" — MOSFET was driven low before
+//      sleep, program reloaded fresh on wake. Genuinely needs
+//      power_on + CCI configure + first-frame wait.
 static bool bring_up_lepton(uint32_t *out_boot_ms) {
     int64_t t0 = esp_timer_get_time();
-    if (hal_lepton_frame_count() > 0) {
-        ESP_LOGI(TAG, "bring_up_lepton: already streaming (%lu frames) — skipping power cycle",
+
+    // Path 1: app_main may be mid-boot of the Lepton in another task.
+    // 35s budget gives the standard 30s first-frame wait + slack.
+    if (hal_lepton_boot_in_progress()) {
+        ESP_LOGI(TAG, "bring_up_lepton: app_main boot in progress — waiting up to 35s");
+        if (hal_lepton_wait_boot_complete(35000) != ESP_OK) {
+            ESP_LOGE(TAG, "bring_up_lepton: app_main boot did not finish in 35s");
+            // Fall through to cold path; the sensor is in some indeterminate
+            // state, the safest play is to power-cycle it.
+        }
+    }
+
+    // Path 2: already streaming (and frames are recent enough that
+    // it's actually streaming, not just stuck on a single old frame).
+    // 2000 ms covers ~10 frames at 5 fps.
+    if (hal_lepton_frame_fresh(2000)) {
+        ESP_LOGI(TAG, "bring_up_lepton: already streaming fresh (%lu frames) — skip power cycle",
                  (unsigned long)hal_lepton_frame_count());
         if (out_boot_ms) *out_boot_ms = 0;
         return true;
     }
+
+    // Path 3: cold path. Includes the case where path-1's wait timed
+    // out — we take whatever the indeterminate sensor state is and
+    // forcibly reset it via the MOSFET power-cycle.
     if (hal_lepton_power_on(8000)       != ESP_OK) goto fail;
     if (hal_lepton_cci_bus_init()       != ESP_OK) goto fail;
     if (hal_lepton_cci_apply_config()   != ESP_OK) goto fail;
@@ -637,16 +657,22 @@ esp_err_t ds_scheduler_maybe_handle_wake(void) {
     bool timer_wake = (cause == ESP_SLEEP_WAKEUP_TIMER);
 
     // Cold-boot path with a stale NVS active=1 (interrupted prior
-    // session, e.g. brown-out before commit): in PR-C we clear the
-    // marker and continue normal boot. session_store_recover_all
+    // session, e.g. brown-out before commit, or user pressed reset
+    // mid-session): write an explicit aborted marker into the session
+    // dir so the dashboard can show "session interrupted at boot"
+    // rather than the session simply disappearing. Then clear the
+    // NVS marker and continue normal boot. session_store_recover_all
     // (called separately by app_main) handles any orphan files.
-    // Future: option to auto-resume.
     if (!timer_wake) {
         ds_arm_args_t args = {0};
         char sid[32] = {0};
         if (nvs_load(&args, sid, sizeof(sid), NULL)) {
-            ESP_LOGW(TAG, "cold boot found NVS-active session %s — clearing (no auto-resume in PR-C)",
-                     sid);
+            const char *reason = (cause == ESP_SLEEP_WAKEUP_UNDEFINED)
+                ? "interrupted-cold-boot"
+                : "interrupted-non-timer-wake";
+            ESP_LOGW(TAG, "cold boot found NVS-active session %s — marking aborted (%s)",
+                     sid, reason);
+            session_store_mark_aborted(sid, reason);
             nvs_clear();
             memset(&s_rtc, 0, sizeof(s_rtc));
         }

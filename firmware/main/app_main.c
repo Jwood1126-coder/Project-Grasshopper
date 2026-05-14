@@ -612,15 +612,20 @@ static net_relay_cmd_status_t app_cmd_handler(const char *cmd, const char *id,
                          esp_err_to_name(err));
                 return NET_RELAY_CMD_FAIL;
             }
-            // Emit the success cmd.result BEFORE returning, so the UI
-            // sees "armed" and clears its 8 s pending-cmd timeout. The
-            // worker (below) sleeps 1.5 s before bringing peripherals
-            // up, which gives this message time to actually flush over
-            // TLS — running the long sensor bring-up + capture in the
-            // WS task context (the old pattern) was blocking the WS
-            // event loop and starving the sender, so the cmd.result
-            // never made it onto the wire before deep_sleep killed
-            // the radio.
+            // Spawn the worker FIRST. If it fails, we can return
+            // CMD_FAIL cleanly without an earlier success message
+            // confusing the UI. Only after we know the worker is
+            // running do we emit "armed" — at that point we know
+            // the session will actually be attempted.
+            if (ds_scheduler_run_one_cycle_async() != ESP_OK) {
+                ds_scheduler_abort();
+                snprintf(msg_out, msg_cap, "ds worker spawn failed");
+                return NET_RELAY_CMD_FAIL;
+            }
+            // Worker is now running (vTaskDelay 1500 ms before doing
+            // anything destructive — gives this cmd.result time to
+            // flush over TLS before the worker starts disrupting the
+            // sensor stack).
             net_relay_emit_cmd_result("timelapse.start", id, true,
                                       "deep-sleep session armed", NULL);
             char m[256];
@@ -629,15 +634,7 @@ static net_relay_cmd_status_t app_cmd_handler(const char *cmd, const char *id,
                      session_id, (unsigned long)max_caps, (unsigned long)interval,
                      capture_vis ? "on" : "off", capture_therm ? "on" : "off");
             ESP_LOGI(TAG, "%s", m);
-            // Spawn worker; cmd handler returns DEFERRED so the
-            // dispatcher does NOT emit a second cmd.result.
-            if (ds_scheduler_run_one_cycle_async() != ESP_OK) {
-                // Worker failed to spawn — abort the arm so we don't
-                // leave NVS pointing at a session that'll never run.
-                ds_scheduler_abort();
-                snprintf(msg_out, msg_cap, "ds worker spawn failed");
-                return NET_RELAY_CMD_FAIL;
-            }
+            // DEFERRED so the dispatcher does NOT emit a second cmd.result.
             return NET_RELAY_CMD_DEFERRED;
         }
 
