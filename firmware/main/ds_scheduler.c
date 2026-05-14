@@ -180,16 +180,42 @@ static void nvs_clear(void) {
 // Returns true if Lepton came up OK. Lepton boot is staged: split
 // phases let us measure each step (phase timing for the journal),
 // skip the every-wake FFC, and bound the first-frame wait.
+//
+// Two paths:
+//   - "Already running" (cmd-handler-context first cycle): app_main
+//     ran hal_lepton_boot before the worker fired, so the sensor is
+//     streaming and the VoSPI reader has frames. Skip the disruptive
+//     power cycle entirely — power_on() force-cycles the MOSFET
+//     (1s OFF + 8s ON) which kills a working sensor and resets
+//     internal state, the cci_apply_config does OEM_REBOOT which
+//     adds another ~5s, and even after all that the wait_first_frame
+//     can return immediately on a stale s_frame_counter. Net effect
+//     was that the cmd-handler-spawned first wake was producing NO
+//     thermal artifacts in the user's session_9583.
+//   - "Cold wake" (timer wake from deep sleep): MOSFET was driven
+//     low before sleep, so we genuinely need to power it back on.
+//
+// Detection: hal_lepton_frame_count() > 0 is true iff at least one
+// frame has been assembled since boot. After cold wake from deep
+// sleep, the program reloads from scratch and the counter is 0.
 static bool bring_up_lepton(uint32_t *out_boot_ms) {
     int64_t t0 = esp_timer_get_time();
+    if (hal_lepton_frame_count() > 0) {
+        ESP_LOGI(TAG, "bring_up_lepton: already streaming (%lu frames) — skipping power cycle",
+                 (unsigned long)hal_lepton_frame_count());
+        if (out_boot_ms) *out_boot_ms = 0;
+        return true;
+    }
     if (hal_lepton_power_on(8000)       != ESP_OK) goto fail;
     if (hal_lepton_cci_bus_init()       != ESP_OK) goto fail;
     if (hal_lepton_cci_apply_config()   != ESP_OK) goto fail;
     if (hal_lepton_vospi_bring_up()     != ESP_OK) goto fail;
-    // 15 s is generous: under normal conditions the first frame lands
-    // ~500 ms after VoSPI start. Bigger budget covers cold-Lepton
-    // edge cases without making a hung sensor wedge the wake forever.
-    if (hal_lepton_wait_first_frame(15000) != ESP_OK) goto fail;
+    // 30 s matches hal_lepton_boot's budget — was 15 s, which fires
+    // on cold Lepton units that take 10-15 s post-CCI to deliver the
+    // first frame. Failure here = lepton_ok=false in run_one_cycle =
+    // capture_engine called with want_thermal=false = silently no
+    // therm.jpg in the session, which is exactly what hit user.
+    if (hal_lepton_wait_first_frame(30000) != ESP_OK) goto fail;
     // PR-C: skip per-wake FFC. Initial FFC fires only on the first
     // capture of the session (caller sets a flag).
     if (out_boot_ms) *out_boot_ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
