@@ -383,27 +383,35 @@ static void vospi_task(void *arg) {
                     }
                     vospi_force_resync();
 
-                    // Codex-improved recovery rule: track frames committed
-                    // since the last reset, not cumulative valid packets.
-                    // The old guard `s_valid_packets == 0` made recovery
-                    // impossible once we'd seen ONE valid packet ever —
-                    // exactly the half-alive state we got stuck in.
+                    // Recovery rule: every 600 sync attempts (~10 min at
+                    // ~1 s each), check if frames have advanced. If not,
+                    // power-cycle. If yes, just refresh the milestone and
+                    // continue.
                     //
-                    // New rule: if we've gone ≥600 sync attempts (~10 min
-                    // at ~1 s each) without committing a single frame
-                    // since the last reset attempt, the Lepton is
-                    // genuinely stuck and a reset is worth trying.
-                    static uint32_t s_frames_at_last_reset = 0;
-                    bool no_progress = (s_frame_counter == s_frames_at_last_reset);
-                    if (sync_fail_count >= 600 && no_progress) {
-                        ESP_LOGW(TAG, "persistent failure — resetting Lepton hardware");
-                        s_frames_at_last_reset = s_frame_counter;
-                        vospi_power_cycle_hardware(5000);
-                        vospi_force_resync();
-                        vospi_abort_frame(frame, &expect_seg, &expect_line,
-                                          &frame_start_ms, &last_segment_start_ms,
-                                          cur_seg_ids);
-                        sync_fail_count = 0;
+                    // The earlier version tracked "frames at last reset"
+                    // initialized to 0 — meaning once frame_counter went
+                    // non-zero from the very first commit, no_progress
+                    // could never become true again, and a Lepton that
+                    // assembled some frames and then got stuck would NEVER
+                    // auto-recover. Symptom in the field: frame_counter
+                    // freezes at e.g. 442 with discardPackets climbing
+                    // into the hundreds of thousands and hwResets stuck
+                    // at 0 forever. This is what hit the user just now.
+                    static uint32_t s_frames_at_milestone = 0;
+                    static int      s_milestone_count     = 0;
+                    if (sync_fail_count >= s_milestone_count + 600) {
+                        if (s_frame_counter == s_frames_at_milestone) {
+                            ESP_LOGW(TAG, "Lepton stuck (no frames in 600 sync attempts, counter=%lu) — power-cycling",
+                                     (unsigned long)s_frame_counter);
+                            vospi_power_cycle_hardware(5000);
+                            vospi_force_resync();
+                            vospi_abort_frame(frame, &expect_seg, &expect_line,
+                                              &frame_start_ms, &last_segment_start_ms,
+                                              cur_seg_ids);
+                            sync_fail_count = 0;
+                        }
+                        s_frames_at_milestone = s_frame_counter;
+                        s_milestone_count     = sync_fail_count;
                     }
                 }
                 break;
