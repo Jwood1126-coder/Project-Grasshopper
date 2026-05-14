@@ -530,6 +530,13 @@ esp_err_t session_store_close(session_store_handle_t *h) {
     return ESP_OK;
 }
 
+void session_store_release(session_store_handle_t *h) {
+    if (!h) return;
+    ESP_LOGI(TAG, "release %s (count=%lu, NOT marking complete)",
+             h->session_id, (unsigned long)h->capture_count);
+    free(h);
+}
+
 uint32_t    session_store_capture_count(const session_store_handle_t *h) {
     return h ? h->capture_count : 0;
 }

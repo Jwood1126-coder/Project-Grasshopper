@@ -34,6 +34,9 @@
 
 #include "capture.h"
 #include "session_store.h"
+#include "ds_scheduler.h"
+#include "power_manager.h"
+#include "esp_random.h"
 #include "sessions.h"
 #include "ota.h"
 #include "cJSON.h"
@@ -525,9 +528,16 @@ static net_relay_cmd_status_t app_cmd_handler(const char *cmd, const char *id,
     }
 
     if (strcmp(cmd, "timelapse.start") == 0) {
-        // Payload: { intervalSec, captureVis, captureTherm, maxDurationSec? }
-        uint32_t interval = 30, max_dur = 0;
+        // Payload: { intervalSec, captureVis, captureTherm, maxDurationSec?,
+        //            deepSleep?, maxCaptures? }
+        // deepSleep:true  → switch to ds_scheduler (PR-C). intervalSec must
+        //                   be ≥60. maxCaptures is required (≥1). After
+        //                   arming, fires capture #1 immediately, then the
+        //                   device enters deep sleep until the next due
+        //                   interval. Each wake captures one frame.
+        uint32_t interval = 30, max_dur = 0, max_caps = 0;
         bool capture_vis = true, capture_therm = true;
+        bool deep_sleep  = false;
         if (payload) {
             const cJSON *iv = cJSON_GetObjectItemCaseSensitive(payload, "intervalSec");
             if (cJSON_IsNumber(iv)) interval = (uint32_t)iv->valueint;
@@ -537,7 +547,62 @@ static net_relay_cmd_status_t app_cmd_handler(const char *cmd, const char *id,
             if (cJSON_IsBool(ct)) capture_therm = cJSON_IsTrue(ct);
             const cJSON *md = cJSON_GetObjectItemCaseSensitive(payload, "maxDurationSec");
             if (cJSON_IsNumber(md) && md->valueint > 0) max_dur = (uint32_t)md->valueint;
+            const cJSON *ds = cJSON_GetObjectItemCaseSensitive(payload, "deepSleep");
+            if (cJSON_IsBool(ds)) deep_sleep = cJSON_IsTrue(ds);
+            const cJSON *mc = cJSON_GetObjectItemCaseSensitive(payload, "maxCaptures");
+            if (cJSON_IsNumber(mc) && mc->valueint > 0) max_caps = (uint32_t)mc->valueint;
         }
+
+        if (deep_sleep) {
+            if (max_caps == 0) {
+                snprintf(msg_out, msg_cap, "deep-sleep mode requires maxCaptures ≥ 1");
+                return NET_RELAY_CMD_FAIL;
+            }
+            if (interval < 60) {
+                snprintf(msg_out, msg_cap, "deep-sleep mode requires intervalSec ≥ 60 (Lepton boot ~10s/wake)");
+                return NET_RELAY_CMD_FAIL;
+            }
+            char session_id[64];
+            uint32_t r = (uint32_t)esp_random();
+            snprintf(session_id, sizeof(session_id), "session_%lu",
+                     (unsigned long)(1000 + (r % 99000)));
+            ds_arm_args_t args = {
+                .max_captures  = max_caps,
+                .interval_sec  = interval,
+                .capture_vis   = capture_vis,
+                .capture_therm = capture_therm,
+            };
+            esp_err_t err = ds_scheduler_arm(session_id, &args);
+            if (err != ESP_OK) {
+                snprintf(msg_out, msg_cap, "ds_scheduler_arm failed: %s",
+                         esp_err_to_name(err));
+                return NET_RELAY_CMD_FAIL;
+            }
+            // Send the result back BEFORE we go heads-down. The result
+            // tells the dashboard "armed; first capture firing now;
+            // device will be offline until session completes". The
+            // run_one_cycle below will not return — it sleeps.
+            net_relay_emit_cmd_result("timelapse.start", id, true,
+                                      "deep-sleep session armed", NULL);
+            char m[256];
+            snprintf(m, sizeof(m),
+                     "%s armed: %lu captures x %lus, vis=%s therm=%s — first capture firing, then deep sleep",
+                     session_id, (unsigned long)max_caps, (unsigned long)interval,
+                     capture_vis ? "on" : "off", capture_therm ? "on" : "off");
+            ESP_LOGI(TAG, "%s", m);
+            // Tiny breath so the WS send actually flushes before we
+            // start tearing peripherals down.
+            vTaskDelay(pdMS_TO_TICKS(200));
+            // No-return on success-with-more-to-go; ESP_OK on completion.
+            ds_scheduler_run_one_cycle();
+            // If we get here, the session completed in ONE cycle (e.g.
+            // maxCaptures=1). Fall through to a normal cmd response —
+            // unreachable for PR-C tests at maxCaptures=3.
+            snprintf(msg_out, msg_cap, "%s: 1-shot deep-sleep session done", session_id);
+            return NET_RELAY_CMD_OK;
+        }
+
+        // Live (non-deep-sleep) timelapse path — unchanged.
         char session_id[64];
         esp_err_t err = timelapse_start(interval, capture_vis, capture_therm,
                                          max_dur,
@@ -698,6 +763,19 @@ void app_main(void) {
     // Must run before any session_store_open call, while no other SD
     // writers are around. Cheap when there's nothing to do.
     session_store_recover_all();
+
+    // Deep-sleep wake handler. Examines wakeup cause + NVS state and:
+    //   - timer wake + active session → run one capture cycle (returns
+    //     here only if the session completed; otherwise sleeps and
+    //     does not return)
+    //   - any other wake → ESP_ERR_INVALID_STATE; we fall through to
+    //     normal boot. This keeps the cold-boot path unchanged for
+    //     non-DS use, while making the DS wake path cheap (it skips
+    //     WiFi/relay/preview/OLED/tick init entirely).
+    ds_scheduler_init();
+    ds_scheduler_maybe_handle_wake();
+    // If we're here: either it wasn't a DS wake, or the session just
+    // completed its last capture — continue normal boot.
 
     if (strlen(CONFIG_GRASSHOPPER_WIFI_SSID) > 0) {
         ESP_ERROR_CHECK(net_wifi_init());

@@ -85,6 +85,15 @@ esp_err_t session_store_commit(session_store_handle_t *h,
 // safe to call from a self-stop or a clean shutdown.
 esp_err_t session_store_close(session_store_handle_t *h);
 
+// Free the handle WITHOUT marking complete=true. session.json on
+// disk keeps whatever state the most recent commit left it in
+// (complete=false). Used by the deep-sleep wake handler between
+// captures: each wake opens, commits, releases, then sleeps. Only
+// the wake that fires the LAST capture calls session_store_close.
+//
+// Equivalent to session_store_close minus the SD lock + json write.
+void session_store_release(session_store_handle_t *h);
+
 // Read accessors for the timelapse status reporter (UI live status).
 uint32_t session_store_capture_count(const session_store_handle_t *h);
 uint64_t session_store_started_ms(const session_store_handle_t *h);
