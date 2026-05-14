@@ -124,6 +124,24 @@ export const USER_UI_HTML = `<!doctype html>
   .tl-banner.ds .icon { background: #6b8acc; color: #001022; animation: none; }
   .tl-banner.ds .info .title { color: #aac6ff; }
   .tl-banner.ds .info .meta  { color: #88a4d8; }
+  /* Offline-echo: localStorage-derived, not from device telemetry. Dim
+     it further so the user reads "we're guessing based on what you
+     armed" rather than "we're observing what's happening." */
+  .tl-banner.ds.offline-echo {
+    background: linear-gradient(180deg, #14182a 0%, #0a0e18 100%);
+    border-color: #2a3458;
+    border-style: dashed;
+  }
+  .tl-banner.ds.offline-echo .icon { background: #4a5878; color: #14182a; }
+  .tl-banner.ds.offline-echo .info .title { color: #88a0c8; }
+  .tl-banner.ds.offline-echo .info .meta  { color: #6a7a9a; }
+  .tl-banner.ds.offline-echo .stop-btn {
+    background: #444;
+    color: #ccc;
+  }
+  .tl-banner.ds.offline-echo .stop-btn:hover:not(:disabled) {
+    background: #555;
+  }
 
   /* Modal hint: small explanatory text under a control. */
   .hint {
@@ -822,19 +840,25 @@ export const USER_UI_HTML = `<!doctype html>
       <div class="interval-grid" id="dur-grid"></div>
     </div>
     <div class="modal-row" id="row-ds-max" style="display:none">
-      <label>Captures</label>
+      <label>Captures <span style="color:#ff7a8c">*</span></label>
       <input type="number" id="ds-max-captures" min="1" max="999" value="12" style="width:80px;padding:6px;border-radius:6px;border:1px solid #444;background:#222;color:#eee" />
+      <div class="hint">Required. Hard cap on the session length — the only stop guarantee when wake-radio is off.</div>
     </div>
     <div class="modal-row" id="row-ds-wifi" style="display:none">
       <label>Wake radio</label>
       <div class="toggle-row">
         <div class="tog" id="ds-wakewifi">Bring up Wi-Fi between captures</div>
       </div>
-      <div class="hint">Lets the dashboard see in-progress sessions and accept Stop. Adds ~5–15 s awake per capture.</div>
+      <div class="hint">Lets the dashboard see in-progress sessions and accept Stop. Probably acceptable at 10-min+ intervals — verify with soak data before relying on it.</div>
     </div>
     <div class="modal-row" id="row-ds-window" style="display:none">
       <label>Window</label>
       <input type="number" id="ds-window-sec" min="5" max="60" value="15" style="width:80px;padding:6px;border-radius:6px;border:1px solid #444;background:#222;color:#eee" /> seconds
+    </div>
+    <div class="modal-row" id="row-ds-every" style="display:none">
+      <label>Every Nth wake</label>
+      <input type="number" id="ds-wifi-every" min="1" max="100" value="1" style="width:80px;padding:6px;border-radius:6px;border:1px solid #444;background:#222;color:#eee" />
+      <div class="hint">1 = every wake (radio cost every cycle). Higher = lower battery cost, longer stop latency. Currently the firmware honors 1 only — the field is captured + persisted now so the schema is stable when periodic wake lands.</div>
     </div>
     <div class="modal-actions">
       <button class="btn" onclick="closeTlModal()">Cancel</button>
@@ -1395,6 +1419,7 @@ export const USER_UI_HTML = `<!doctype html>
     document.getElementById('row-ds-wifi').style.display   = ds ? '' : 'none';
     const wakeWifi = document.getElementById('ds-wakewifi').classList.contains('on');
     document.getElementById('row-ds-window').style.display = (ds && wakeWifi) ? '' : 'none';
+    document.getElementById('row-ds-every').style.display  = (ds && wakeWifi) ? '' : 'none';
     document.getElementById('mode-hint').textContent = ds
       ? 'Device deep-sleeps between captures. Capture journal lands on SD; dashboard sees the session only during optional wake-Wi-Fi windows.'
       : 'Device stays on between captures.';
@@ -1414,9 +1439,10 @@ export const USER_UI_HTML = `<!doctype html>
     const wf = document.getElementById('ds-wakewifi');
     wf.onclick = () => {
       wf.classList.toggle('on');
-      // window row visibility tracks the wakeWifi toggle
-      document.getElementById('row-ds-window').style.display =
-        (tlMode === 'ds' && wf.classList.contains('on')) ? '' : 'none';
+      // window + every-Nth rows track the wakeWifi toggle
+      const show = (tlMode === 'ds' && wf.classList.contains('on')) ? '' : 'none';
+      document.getElementById('row-ds-window').style.display = show;
+      document.getElementById('row-ds-every').style.display  = show;
     };
   }
 
@@ -1436,20 +1462,40 @@ export const USER_UI_HTML = `<!doctype html>
       return;
     }
     if (tlMode === 'ds') {
-      const maxCaps = parseInt(document.getElementById('ds-max-captures').value, 10) || 0;
-      if (maxCaps < 1) {
-        toast('Captures must be ≥ 1', 'err');
+      const maxCapsRaw = document.getElementById('ds-max-captures').value;
+      const maxCaps = parseInt(maxCapsRaw, 10);
+      if (!isFinite(maxCaps) || maxCaps < 1) {
+        toast('Captures is required (≥ 1) — it is the only stop guarantee in low-power mode', 'err');
+        document.getElementById('ds-max-captures').focus();
         return;
       }
       const wakeWifi = document.getElementById('ds-wakewifi').classList.contains('on');
       const wakeWindowSec = wakeWifi
         ? (parseInt(document.getElementById('ds-window-sec').value, 10) || 15)
         : 0;
+      const wakeWifiEvery = wakeWifi
+        ? (parseInt(document.getElementById('ds-wifi-every').value, 10) || 1)
+        : 1;
       closeTlModal();
+      // Persist what we just armed so the dashboard can keep showing
+      // an "armed but device-dark" banner while the device sleeps. The
+      // device sets / clears its own DS state independently; we treat
+      // localStorage as a hint and clear it when the device comes back
+      // online reporting DS_INACTIVE (= session complete or aborted).
+      try {
+        localStorage.setItem('gh_ds_armed', JSON.stringify({
+          armedAt: Date.now(),
+          intervalSec: tlSelectedInterval,
+          maxCaptures: maxCaps,
+          captureVis: tlCaptureVis,
+          captureTherm: tlCaptureTherm,
+          wakeWifi, wakeWindowSec, wakeWifiEvery,
+        }));
+      } catch {}
       sendCmd('timelapse.start',
         { intervalSec: tlSelectedInterval, captureVis: tlCaptureVis, captureTherm: tlCaptureTherm,
           deepSleep: true, maxCaptures: maxCaps,
-          wakeWifi, wakeWindowSec },
+          wakeWifi, wakeWindowSec, wakeWifiEvery },
         null, 'Start Deep-Sleep Timelapse');
       return;
     }
@@ -1699,7 +1745,9 @@ export const USER_UI_HTML = `<!doctype html>
     // Active timelapse banner + Start/Stop button toggle. Deep-sleep
     // sessions take precedence (the dashboard only sees them during
     // wake-Wi-Fi windows, so when we DO see one, surface it loudly).
-    updateTlBanner(tl, live.deepSleep);
+    // Pass device.online too so the offline-echo branch can decide
+    // whether to clear stale localStorage hints.
+    updateTlBanner(tl, live.deepSleep, !!(d && d.online));
 
     // Diagnostics
     const validRatio = therm && therm.totalPackets > 0
@@ -1731,12 +1779,33 @@ export const USER_UI_HTML = `<!doctype html>
     );
   }
 
-  function updateTlBanner(tl, ds) {
+  // Read the dashboard-side echo of an armed deep-sleep session.
+  // Lives in localStorage; cleared when the device returns online
+  // reporting DS_INACTIVE (= session complete or aborted).
+  function loadDsArmed() {
+    try {
+      const raw = localStorage.getItem('gh_ds_armed');
+      return raw ? JSON.parse(raw) : null;
+    } catch { return null; }
+  }
+  function clearDsArmed() {
+    try { localStorage.removeItem('gh_ds_armed'); } catch {}
+  }
+
+  function updateTlBanner(tl, ds, deviceOnline) {
     const slot = fields.tlBannerSlot;
     if (!slot) return;
     const dsActive = !!(ds && ds.active);
     const tlActive = !!(tl && tl.active);
-    const anyActive = dsActive || tlActive;
+    const armed = loadDsArmed();
+    // If device is online AND not in DS_ACTIVE AND we have a stale
+    // local echo, the session must have completed (or never armed).
+    // Clear so we stop showing a phantom banner.
+    if (armed && deviceOnline && !dsActive) {
+      clearDsArmed();
+    }
+    const showOfflineEcho = !!(armed && !deviceOnline && !dsActive);
+    const anyActive = dsActive || tlActive || showOfflineEcho;
 
     // Toggle Start button label/visibility — both modes use the same button.
     if (fields.tlBtn) {
@@ -1746,7 +1815,9 @@ export const USER_UI_HTML = `<!doctype html>
           ? 'Deep-sleep timelapse running…'
           : tlActive
             ? 'Timelapse running…'
-            : 'Start Timelapse…';
+            : showOfflineEcho
+              ? 'Deep-sleep session armed (device dark)…'
+              : 'Start Timelapse…';
       }
       fields.tlBtn.disabled = anyActive;
       fields.tlBtn.style.opacity = anyActive ? '0.55' : '';
@@ -1778,6 +1849,59 @@ export const USER_UI_HTML = `<!doctype html>
             ' · device sleeps between captures · this view appears only during wake windows')
         ),
         stopBtn);
+      slot.replaceChildren(banner);
+      return;
+    }
+
+    // Offline echo: device is dark but we know it was armed for a
+    // deep-sleep session. Render a banner with computed-from-localStorage
+    // estimates so the user isn't staring at "no device" wondering if
+    // anything's happening. Cleared automatically when the device comes
+    // back online reporting DS_INACTIVE.
+    if (showOfflineEcho) {
+      const a = armed;
+      const intervalMs = (a.intervalSec || 0) * 1000;
+      const elapsedMs = Date.now() - (a.armedAt || Date.now());
+      // First capture fires immediately, subsequent captures land at
+      // armedAt + (k-1)*interval + ~18s wake. Estimate the most-recent
+      // committed capture by integer division.
+      const estDoneRaw = intervalMs > 0 ? Math.floor(elapsedMs / intervalMs) + 1 : 1;
+      const estDone = Math.max(0, Math.min(estDoneRaw, a.maxCaptures || 0));
+      const totalDurMs = (a.maxCaptures || 0) * intervalMs;
+      const finishAt = (a.armedAt || 0) + totalDurMs;
+      const finishStr = new Date(finishAt).toLocaleString();
+      const sessionDone = estDone >= (a.maxCaptures || 0);
+      const stopHint = a.wakeWifi
+        ? 'Stop will queue until next wake-radio window (~every '
+          + ((a.intervalSec || 0) * (a.wakeWifiEvery || 1)) + 's)'
+        : 'No remote stop — session will run until ' + (a.maxCaptures || '?') + ' captures complete';
+
+      const cancelBtn = el('button', {
+        class: 'stop-btn',
+        title: 'Forget this echo — does not affect the device',
+        onclick: () => {
+          if (confirm('Forget this offline echo?\\n\\nThis only clears the dashboard hint. The device will continue its session until completion.')) {
+            clearDsArmed();
+            updateTlBanner(tl, ds, deviceOnline);
+          }
+        },
+      }, '✕ Forget echo');
+
+      const banner = el('div', { class: 'tl-banner ds offline-echo' },
+        el('div', { class: 'icon' }, '◌'),
+        el('div', { class: 'info' },
+          el('div', { class: 'title' },
+            sessionDone
+              ? 'Deep-sleep session expected complete (device hasn\\'t reconnected yet)'
+              : 'Deep-sleep session armed · device dark'),
+          el('div', { class: 'meta' },
+            'estimated capture ' + estDone + ' / ' + (a.maxCaptures || '?') +
+            ' · interval ' + (a.intervalSec || '?') + 's' +
+            ' · armed ' + fmtElapsed(elapsedMs) + ' ago'),
+          el('div', { class: 'meta' },
+            'expected finish: ' + finishStr),
+          el('div', { class: 'meta' }, stopHint)),
+        cancelBtn);
       slot.replaceChildren(banner);
       return;
     }

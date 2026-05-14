@@ -558,6 +558,10 @@ static net_relay_cmd_status_t app_cmd_handler(const char *cmd, const char *id,
         bool deep_sleep  = false;
         bool wake_wifi   = false;
         uint32_t wake_window = 15;
+        uint32_t wake_wifi_every = 1;     // PR-G schema-stable; firmware
+                                           // honors 1 (= every wake) today,
+                                           // higher values stored but ignored
+                                           // until soak data informs default
         if (payload) {
             const cJSON *iv = cJSON_GetObjectItemCaseSensitive(payload, "intervalSec");
             if (cJSON_IsNumber(iv)) interval = (uint32_t)iv->valueint;
@@ -575,6 +579,8 @@ static net_relay_cmd_status_t app_cmd_handler(const char *cmd, const char *id,
             if (cJSON_IsBool(ww)) wake_wifi = cJSON_IsTrue(ww);
             const cJSON *ws = cJSON_GetObjectItemCaseSensitive(payload, "wakeWindowSec");
             if (cJSON_IsNumber(ws) && ws->valueint > 0) wake_window = (uint32_t)ws->valueint;
+            const cJSON *we = cJSON_GetObjectItemCaseSensitive(payload, "wakeWifiEvery");
+            if (cJSON_IsNumber(we) && we->valueint > 0) wake_wifi_every = (uint32_t)we->valueint;
         }
 
         if (deep_sleep) {
@@ -598,6 +604,7 @@ static net_relay_cmd_status_t app_cmd_handler(const char *cmd, const char *id,
                 .capture_therm   = capture_therm,
                 .wake_wifi       = wake_wifi,
                 .wake_window_sec = wake_window,
+                .wake_wifi_every = wake_wifi_every,
             };
             esp_err_t err = ds_scheduler_arm(session_id, &args);
             if (err != ESP_OK) {

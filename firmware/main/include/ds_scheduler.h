@@ -52,6 +52,15 @@ typedef struct {
     // so it costs battery — opt in only when visibility matters.
     bool     wake_wifi;
     uint32_t wake_window_sec;    // 5..60; ignored when wake_wifi=false
+
+    // PR-G schema-stable placeholder: open the wake-Wi-Fi window only
+    // every Nth wake (1 = every wake, 6 at a 10-min interval = once
+    // per hour). Stored across boots so a future firmware can honor
+    // it without changing the cmd schema. Currently parsed, validated,
+    // persisted — but NOT yet gated on in run_one_cycle. Run a no-
+    // radio + a wake-every-cycle soak first so we know what the per-
+    // wake radio cost actually IS before optimizing it away.
+    uint32_t wake_wifi_every;    // ≥1; default 1 = every wake
 } ds_arm_args_t;
 
 // Initialize an empty (DS_INACTIVE) state. Reads NVS — if a session

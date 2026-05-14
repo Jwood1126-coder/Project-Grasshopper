@@ -76,6 +76,7 @@ typedef struct {
     uint8_t  wake_wifi;
     uint8_t  reserved1;
     uint32_t wake_window_sec;
+    uint32_t wake_wifi_every;     // PR-G schema-stable; not yet gated on
 } ds_rtc_state_t;
 
 _Static_assert(sizeof(ds_rtc_state_t) <= 256,
@@ -121,6 +122,7 @@ static esp_err_t nvs_save(const ds_arm_args_t *args, const char *session_id,
     nvs_set_u64(h, "start",    start_epoch);
     nvs_set_u8 (h, "wfi",      args->wake_wifi ? 1 : 0);
     nvs_set_u32(h, "wwin",     args->wake_window_sec);
+    nvs_set_u32(h, "wevery",   args->wake_wifi_every);
     err = nvs_commit(h);
     nvs_close(h);
     return err;
@@ -140,7 +142,7 @@ static bool nvs_load(ds_arm_args_t *args, char *session_id, size_t cap,
         nvs_close(h);
         return false;
     }
-    uint32_t mx = 0, iv = 0, wwin = 0;
+    uint32_t mx = 0, iv = 0, wwin = 0, wevery = 0;
     uint8_t vis = 0, therm = 0, wfi = 0;
     uint64_t start = 0;
     nvs_get_u32(h, "max",      &mx);
@@ -150,6 +152,7 @@ static bool nvs_load(ds_arm_args_t *args, char *session_id, size_t cap,
     nvs_get_u64(h, "start",    &start);
     nvs_get_u8 (h, "wfi",      &wfi);     // missing key on old sessions → 0
     nvs_get_u32(h, "wwin",     &wwin);
+    nvs_get_u32(h, "wevery",   &wevery);  // missing → 0; arm() normalizes to 1
     nvs_close(h);
 
     args->max_captures    = mx;
@@ -158,6 +161,7 @@ static bool nvs_load(ds_arm_args_t *args, char *session_id, size_t cap,
     args->capture_therm   = (therm != 0);
     args->wake_wifi       = (wfi != 0);
     args->wake_window_sec = wwin;
+    args->wake_wifi_every = (wevery == 0) ? 1 : wevery;
     if (start_epoch) *start_epoch = start;
     return true;
 }
@@ -345,6 +349,14 @@ esp_err_t ds_scheduler_arm(const char *session_id,
     s_rtc.capture_therm       = args->capture_therm ? 1 : 0;
     s_rtc.wake_wifi           = args->wake_wifi ? 1 : 0;
     s_rtc.wake_window_sec     = args->wake_window_sec;
+    // PR-G schema-stable: clamp 1..100. Default 1 = every wake (current
+    // behavior). Stored across deep-sleep + persisted to NVS so a future
+    // firmware can honor higher values without changing the cmd schema.
+    {
+        uint32_t every = args->wake_wifi_every ? args->wake_wifi_every : 1;
+        if (every > 100) every = 100;
+        s_rtc.wake_wifi_every = every;
+    }
     rtc_seal();
 
     esp_err_t err = nvs_save(args, session_id, start_epoch);
@@ -353,12 +365,13 @@ esp_err_t ds_scheduler_arm(const char *session_id,
         memset(&s_rtc, 0, sizeof(s_rtc));
         return err;
     }
-    ESP_LOGI(TAG, "armed %s: %lu captures, %lus interval, vis=%d therm=%d, wakeWifi=%d window=%lus",
+    ESP_LOGI(TAG, "armed %s: %lu captures, %lus interval, vis=%d therm=%d, wakeWifi=%d window=%lus every=%lu",
              session_id,
              (unsigned long)args->max_captures,
              (unsigned long)args->interval_sec,
              (int)args->capture_vis, (int)args->capture_therm,
-             (int)args->wake_wifi, (unsigned long)args->wake_window_sec);
+             (int)args->wake_wifi, (unsigned long)args->wake_window_sec,
+             (unsigned long)s_rtc.wake_wifi_every);
     return ESP_OK;
 }
 
@@ -392,6 +405,7 @@ esp_err_t ds_scheduler_run_one_cycle(void) {
         s_rtc.capture_therm       = args.capture_therm ? 1 : 0;
         s_rtc.wake_wifi           = args.wake_wifi ? 1 : 0;
         s_rtc.wake_window_sec     = args.wake_window_sec;
+        s_rtc.wake_wifi_every     = args.wake_wifi_every ? args.wake_wifi_every : 1;
         rtc_seal();
         ESP_LOGW(TAG, "run_one_cycle: rebuilt RTC from NVS (cold-boot resume)");
     }
