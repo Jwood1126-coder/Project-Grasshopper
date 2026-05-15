@@ -630,6 +630,17 @@ export const USER_UI_HTML = `<!doctype html>
   .session-card .badge.tl { background: #1f3a28; color: var(--ok); }
   .session-card .badge.single { background: #2a2a3a; color: #88a; }
   .session-card .badge.incomplete { background: #3a1f23; color: var(--err); }
+  /* Abandoned: distinct from "incomplete" (which is a transient state)
+     and from "recording" (which is also incomplete=true but live). Muted
+     gray-blue so abandoned sessions look obviously inert. The card
+     itself dims so the eye skips past them at scan speed. */
+  .session-card .badge.abandoned {
+    background: #1f2530; color: #6b7a8a;
+    text-transform: none; letter-spacing: 0;  /* show the reason readably */
+    font-family: ui-monospace, monospace;
+  }
+  .session-card.abandoned { opacity: 0.6; }
+  .session-card.abandoned:hover { opacity: 1; }
   /* Recording: red accent border + pulsing dot in the badge. Replaces
      the "incomplete" tag while the session is actively writing — same
      state, but framed as live progress instead of a fault. */
@@ -2599,7 +2610,15 @@ export const USER_UI_HTML = `<!doctype html>
 
   // Library display preferences. Persisted in localStorage so the user's
   // last layout sticks across reloads.
-  const libDefaults = { modality: 'vis', layout: 'medium', sort: 'newest' };
+  const libDefaults = { modality: 'vis', layout: 'medium', sort: 'newest',
+                        // Hide abandoned sessions by default — the SD card
+                        // accumulates a long tail of recovery-touched orphans
+                        // (timestamp=0, aborted=true) over time, and they
+                        // crowd out real recordings. Toggle pill in the
+                        // toolbar lets users show them when they want to
+                        // clean up. Stored per-user in localStorage with the
+                        // rest of libPrefs.
+                        showAbandoned: false };
   function loadLibPrefs() {
     try {
       const s = JSON.parse(localStorage.getItem('gh_lib') || 'null');
@@ -2691,7 +2710,37 @@ export const USER_UI_HTML = `<!doctype html>
     sortGroup.appendChild(sel);
     tb.appendChild(sortGroup);
 
+    // Show-abandoned toggle. Default OFF — the typical user wants real
+    // recordings, not the legacy/recovery clutter. Click to flip; the
+    // pill text updates to make the current state obvious.
+    const showGroupAb = el('div', { class: 'group' },
+      el('span', { class: 'group-label' }, 'Abandoned'));
+    const abPill = el('div', {
+      class: 'pill' + (libPrefs.showAbandoned ? ' active' : ''),
+      onclick: () => {
+        libPrefs.showAbandoned = !libPrefs.showAbandoned;
+        saveLibPrefs();
+        // Re-fetch nothing — we have the full list cached in lastSessions.
+        // Just rerender with the new filter.
+        rerenderLibrary();
+      },
+      title: 'Show sessions marked aborted/interrupted (recovery orphans, ' +
+             'cold-boot-cleared DS sessions). Off by default — they accumulate ' +
+             'on the SD over time and crowd out real recordings.',
+    }, libPrefs.showAbandoned ? 'shown' : 'hidden');
+    showGroupAb.appendChild(abPill);
+    tb.appendChild(showGroupAb);
+
     return tb;
+  }
+
+  // Apply abandoned-filter before sort. Used by both initial load and
+  // the auto-refresh path — filtering inside the relay would be cleaner
+  // but we want the toolbar toggle to flip instantly without a network
+  // round trip. Counts are also reported in the meta line.
+  function visibleSessions(list) {
+    if (libPrefs.showAbandoned) return list;
+    return list.filter((s) => s && s.aborted !== true);
   }
 
   function rerenderLibrary() {
@@ -2699,8 +2748,16 @@ export const USER_UI_HTML = `<!doctype html>
     if (!grid) return;
     applyGridLayoutClass(grid);
     if (lastSessions.length === 0) return;
-    const sorted = sortSessions(lastSessions, libPrefs.sort);
+    const visible = visibleSessions(lastSessions);
+    const sorted = sortSessions(visible, libPrefs.sort);
     grid.replaceChildren(...sorted.map(renderSessionCard));
+    // Refresh meta line with the filtered count vs total.
+    const meta = document.getElementById('lib-meta');
+    if (meta) {
+      const hidden = lastSessions.length - visible.length;
+      meta.textContent = visible.length + ' sessions' +
+        (hidden > 0 ? ' (' + hidden + ' abandoned hidden)' : '');
+    }
   }
 
   function sortSessions(arr, key) {
@@ -2729,7 +2786,11 @@ export const USER_UI_HTML = `<!doctype html>
       s += (x.sessionId || '?') + ':' +
            (x.captureCount ?? '?') + ':' +
            (x.durationSec ?? '?') + ':' +
-           (x.complete === false ? 'i' : 'c') + ';';
+           (x.complete === false ? 'i' : 'c') +
+           // Include aborted so a recovery sweep that stamps the
+           // marker triggers a re-render (the abandoned-filter pill
+           // would otherwise read stale data).
+           (x.aborted === true ? 'A' : '_') + ';';
     }
     return s;
   }
@@ -2775,8 +2836,14 @@ export const USER_UI_HTML = `<!doctype html>
       const fp = sessionsFingerprint(list);
       if (fp === lastSessionsFp && grid.children.length > 0) return;
       lastSessionsFp = fp;
-      const sorted = sortSessions(list, libPrefs.sort);
+      const visible = visibleSessions(list);
+      const sorted = sortSessions(visible, libPrefs.sort);
       grid.replaceChildren(...sorted.map(renderSessionCard));
+      // Refresh meta with the filtered count.
+      const hidden = list.length - visible.length;
+      meta.textContent = visible.length + ' sessions' +
+        (hidden > 0 ? ' (' + hidden + ' abandoned hidden)' : '') +
+        (j.truncated ? ' · ' + j.total + ' total' : '');
     } catch (e) {
       meta.textContent = 'Network error';
     }
@@ -2802,7 +2869,8 @@ export const USER_UI_HTML = `<!doctype html>
 
     const card = el('div', {
       class: 'session-card' + (modality === 'both' ? ' both' : '') +
-             (isRecording ? ' recording' : ''),
+             (isRecording ? ' recording' : '') +
+             (s.aborted === true ? ' abandoned' : ''),
       onclick: () => setView('detail', sid),
     });
     const thumbWrap = el('div', { class: 'thumb-wrap' + (modality === 'both' ? ' both' : '') });
@@ -2840,6 +2908,16 @@ export const USER_UI_HTML = `<!doctype html>
     if (!thumbWrap.children.length) {
       thumbWrap.appendChild(el('div', { class: 'thumb-empty' }, 'no preview'));
     }
+    // Abandoned = explicitly marked aborted by either the cold-boot
+    // wipe path or the recovery sweep. Trumps "incomplete" — once
+    // a session is abandoned it isn't going to resume, and showing
+    // both badges would just confuse. Reasons are wire-protocol
+    // strings from the firmware (session_store.c). Kept as raw text
+    // so future reasons surface without a UI update.
+    const abandoned   = s.aborted === true;
+    const abortReason = abandoned && typeof s.abortedReason === 'string'
+                        ? s.abortedReason : null;
+
     const info = el('div', { class: 'info' },
       el('div', { class: 'title' }, sid),
       el('div', { class: 'row' }, (s.captureCount ?? '?') + ' captures · ' +
@@ -2853,8 +2931,13 @@ export const USER_UI_HTML = `<!doctype html>
           ? el('span', { class: 'badge' }, 'vis+therm')
           : (s.captureVis ? el('span', { class: 'badge' }, 'vis')
                           : el('span', { class: 'badge' }, 'therm')),
-        incomplete && !isRecording &&
-          el('span', { class: 'badge incomplete' }, 'incomplete')));
+        // Aborted/abandoned trumps "incomplete" (no point showing both).
+        abandoned
+          ? el('span', { class: 'badge abandoned',
+                         title: abortReason ? 'reason: ' + abortReason : 'aborted' },
+              abortReason || 'abandoned')
+          : (incomplete && !isRecording &&
+             el('span', { class: 'badge incomplete' }, 'incomplete'))));
     card.appendChild(thumbWrap);
     card.appendChild(info);
     return card;
