@@ -205,13 +205,25 @@ static void do_list(const sess_req_t *req) {
     hal_storage_sd_unlock();
 
     // Sort newest-first by timestamp using cJSON's array index swap.
+    //
     // ts=0 means "no NTP at session open AND first commit didn't write
-    // a real epoch either" — typically a deep-sleep session that fired
-    // its first wake with the clock unsynced. Treat those as MAX (sort
-    // first) so the user's just-armed session can't silently fall off
-    // the end of a truncated list. Bubble sort is fine — at our cap
-    // of 200 it's <40k compares of two doubles each; heap+JSON traversal
-    // dominates if anything.
+    // a real epoch either." A previous version of this sort treated
+    // ALL ts=0 sessions as +infinity to keep just-armed DS sessions
+    // visible. That misfired badly: ancient legacy sessions with ts=0
+    // (predating NTP push, or recovered orphans) ended up sorting
+    // ABOVE the user's actual successful 5/5 DS session, burying the
+    // real result under broken old data.
+    //
+    // Refined rule: ts=0 floats to the top ONLY for sessions that look
+    // genuinely in-progress — incomplete AND not aborted. A completed
+    // ts=0 session, or one explicitly marked aborted, sorts by its
+    // (real or zero) timestamp like everything else. So:
+    //   - DS session armed pre-NTP, mid-recording, complete=false  → top
+    //   - Old completed session with ts=0                          → bottom
+    //   - Recovered/interrupted session marked aborted=true        → bottom
+    //
+    // Bubble sort is fine — at our cap of 200 it's <40k compares of two
+    // doubles each; heap+JSON traversal dominates if anything.
     int n = cJSON_GetArraySize(arr);
     for (int i = 0; i < n - 1; i++) {
         for (int j = 0; j < n - 1 - i; j++) {
@@ -219,9 +231,16 @@ static void do_list(const sess_req_t *req) {
             cJSON *b = cJSON_GetArrayItem(arr, j + 1);
             double ats = json_num(a, "timestamp", 0);
             double bts = json_num(b, "timestamp", 0);
-            // ts=0 → infinity, so it sorts to the front
-            double aeff = (ats == 0) ? 1e18 : ats;
-            double beff = (bts == 0) ? 1e18 : bts;
+            const cJSON *ac = cJSON_GetObjectItemCaseSensitive(a, "complete");
+            const cJSON *bc = cJSON_GetObjectItemCaseSensitive(b, "complete");
+            const cJSON *ab = cJSON_GetObjectItemCaseSensitive(a, "aborted");
+            const cJSON *bb = cJSON_GetObjectItemCaseSensitive(b, "aborted");
+            // Only treat ts=0 as "in-progress hint" if the session
+            // actually looks in-progress.
+            bool a_inprog = !cJSON_IsTrue(ac) && !cJSON_IsTrue(ab);
+            bool b_inprog = !cJSON_IsTrue(bc) && !cJSON_IsTrue(bb);
+            double aeff = (ats == 0 && a_inprog) ? 1e18 : ats;
+            double beff = (bts == 0 && b_inprog) ? 1e18 : bts;
             if (aeff < beff) {
                 cJSON_DetachItemFromArray(arr, j + 1);
                 cJSON_InsertItemInArray(arr, j, b);

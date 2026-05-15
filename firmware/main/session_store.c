@@ -331,9 +331,19 @@ static esp_err_t write_session_json(const struct session_store_handle *h,
                            ? (now_ms - h->started_ms) / 1000 : 0;
     uint64_t now_epoch = (uint64_t)time(NULL);
     uint64_t start_epoch = h->started_epoch;
-    if (start_epoch == 0) {
-        // NTP wasn't synced at open time. If it's synced now, derive
-        // start_epoch as now - elapsed; otherwise leave at 0.
+    if (start_epoch == 0 && h->started_ms > 0) {
+        // NTP wasn't synced at open time. If it's synced now AND we
+        // have a real started_ms (i.e., the session was actually opened
+        // on this boot, not just reconstructed from disk), backfill
+        // start_epoch as now - elapsed.
+        //
+        // started_ms == 0 explicitly skips this branch — recover_one_session
+        // builds a transient handle with started_ms=0 to write the
+        // recovered session.json, and the old code stamped those with
+        // `now_epoch` (since elapsed=0 → start = now - 0 = now). That
+        // made every recovered legacy session appear as "newest" in
+        // the Library list, burying the user's actual successful
+        // session. Per Codex review: do not fabricate.
         if (now_epoch > elapsed_sec) start_epoch = now_epoch - elapsed_sec;
     }
 
@@ -709,28 +719,89 @@ static void recover_one_session(const char *session_id) {
     }
     closedir(d);
 
-    // Apply replay aggregates into a transient handle and rewrite
-    // session.json so the UI sees real numbers next time.
+    // Write a recovered-session marker so the UI can render it as
+    // "abandoned" rather than "in progress."
+    //
+    // Per Codex review: recovery used to call write_session_json with
+    // a transient handle whose started_ms=0. The fabrication branch
+    // inside write_session_json then stamped timestamp = now_epoch -
+    // 0 = NOW, making every recovered legacy session appear as the
+    // newest entry in the Library list and burying real successful
+    // sessions below the noise. Two fixes layer here:
+    //
+    //   1. write_session_json now skips the fabrication when
+    //      started_ms=0 (above), so timestamp stays 0 if the journal
+    //      had no epoch.
+    //   2. We don't call write_session_json at all from recovery —
+    //      we write an aborted marker directly. This lets us add
+    //      abortedReason / recoveredAt fields that the dashboard
+    //      can use to distinguish "this is an old leftover" from
+    //      "this is currently being recorded."
+    //
+    // ds_scheduler_maybe_handle_wake runs AFTER recover_all in
+    // app_main; if it finds an NVS-active session it'll call
+    // session_store_mark_aborted with a more specific reason
+    // ("interrupted-cold-boot"), overwriting our optimistic marker
+    // here. If it runs a timer-wake cycle, session_store_open writes
+    // a fresh session.json with complete=false and no aborted field,
+    // so resume works cleanly.
     if (agg.capture_count > 0) {
-        struct session_store_handle h = {0};
-        snprintf(h.session_id, sizeof(h.session_id), "%s", session_id);
-        snprintf(h.session_dir, sizeof(h.session_dir), "%s", dir);
-        snprintf(h.mode, sizeof(h.mode), "%s",
-                 agg.capture_count > 1 ? "timelapse" : "single");
-        h.interval_sec      = 0;     // unknown post-recovery
-        h.capture_vis       = true;  // best-effort
-        h.capture_therm     = true;
-        h.capture_count     = agg.capture_count;
-        h.valid_therm_count = agg.valid_therm_count;
-        h.min_raw_session   = agg.min_raw_session;
-        h.max_raw_session   = agg.max_raw_session;
-        h.sum_center_raw    = agg.sum_center_raw;
-        h.resolution        = agg.resolution;
-        if (agg.earliest_epoch > 0) h.started_epoch = agg.earliest_epoch;
-        // started_ms left at 0 → durationSec computes to 0; epoch
-        // span (earliest..latest) could be derived but the field
-        // isn't load-bearing on a recovered session.
-        write_session_json(&h, /*complete*/ false);
+        char path[256];
+        snprintf(path, sizeof(path), "%s/session.json", dir);
+        char meta[768];
+        uint64_t now_epoch = (uint64_t)time(NULL);
+
+        int n = snprintf(meta, sizeof(meta),
+            "{\"sessionId\":\"%s\","
+             "\"mode\":\"%s\","
+             "\"complete\":false,"
+             "\"aborted\":true,"
+             "\"abortedReason\":\"interrupted-recovery\","
+             "\"abortedAt\":%llu,"
+             "\"recoveredAt\":%llu,"
+             "\"intervalSec\":0,"
+             "\"captureCount\":%lu,"
+             "\"timestamp\":%llu,"
+             "\"captureVis\":true,"
+             "\"captureTherm\":true,"
+             "\"durationSec\":0",
+            session_id,
+            agg.capture_count > 1 ? "timelapse" : "single",
+            (unsigned long long)now_epoch,
+            (unsigned long long)now_epoch,
+            (unsigned long)agg.capture_count,
+            // Real epoch from journal; 0 if journal entries had ts=0
+            // (legacy / pre-NTP). Do NOT fabricate now_epoch here —
+            // that's the bug we're fixing.
+            (unsigned long long)agg.earliest_epoch);
+
+        if (agg.valid_therm_count > 0 && agg.max_raw_session > 0 &&
+            agg.min_raw_session != 0xFFFFFFFFu &&
+            n > 0 && n < (int)sizeof(meta)) {
+            int sx = tlinear_scale_x100(agg.resolution);
+            uint64_t avg_ctr = agg.sum_center_raw / agg.valid_therm_count;
+            int n2 = snprintf(meta + n, sizeof(meta) - n,
+                ",\"tempStats\":{"
+                  "\"minRaw\":%lu,\"maxRaw\":%lu,\"avgCenterRaw\":%llu,"
+                  "\"tlinearResolution\":%u,"
+                  "\"validThermCount\":%lu,"
+                  "\"minTempF\":%.2f,\"maxTempF\":%.2f,\"avgCenterTempF\":%.2f"
+                "}",
+                (unsigned long)agg.min_raw_session,
+                (unsigned long)agg.max_raw_session,
+                (unsigned long long)avg_ctr,
+                (unsigned)agg.resolution,
+                (unsigned long)agg.valid_therm_count,
+                raw_to_F_with_scale(agg.min_raw_session, sx),
+                raw_to_F_with_scale(agg.max_raw_session, sx),
+                raw_to_F_with_scale((uint32_t)avg_ctr,  sx));
+            if (n2 > 0 && n + n2 < (int)sizeof(meta)) n += n2;
+        }
+        if (n + 2 < (int)sizeof(meta)) {
+            meta[n++] = '}';
+            meta[n]   = '\0';
+        }
+        hal_storage_sd_atomic_write(path, meta, (size_t)n);
     }
     hal_storage_sd_unlock();
 
