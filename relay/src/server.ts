@@ -104,6 +104,18 @@ app.get('/api/devices/:id/logs', (c) => {
   return c.json({ logs: store.logsSince(d.deviceId, since) })
 })
 
+// Lifecycle + fault signals — never evicted by routine session.read_file
+// cmd.result traffic, so a Library scan can't bury the phase transitions
+// or disconnects you need when triaging "did the device crash mid-TL?"
+// Mirrors a subset of /events: kind ∈ {phase, phase.stuck, connected,
+// disconnected} plus any cmd.result with ok=false.
+app.get('/api/devices/:id/signals', (c) => {
+  const d = store.get(c.req.param('id'))
+  if (!d) return c.json({ error: 'unknown device' }, 404)
+  const since = Number(c.req.query('since') ?? '0')
+  return c.json({ signals: store.signalsSince(d.deviceId, since) })
+})
+
 app.get('/api/devices/:id/events', (c) => {
   const d = store.get(c.req.param('id'))
   if (!d) return c.json({ error: 'unknown device' }, 404)

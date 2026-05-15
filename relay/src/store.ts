@@ -33,6 +33,11 @@ export interface DeviceRecord {
   system?: { phase: string; phaseEnteredMs: number; updatedMs: number }
   logs: LogEntry[]
   events: EventEntry[]
+  // Parallel ring for lifecycle / fault signals — see SIGNAL_KINDS
+  // below. Populated by appendEvent at the same time as events but
+  // never evicted by routine cmd.result traffic, so a Library scan
+  // can't bury phase transitions / disconnects / failed commands.
+  signals: EventEntry[]
   previewVis?: PreviewFrame
   previewTherm?: PreviewFrame
   // Latest uploaded firmware blob — held in memory only so it survives
@@ -75,6 +80,21 @@ export interface EventEntry {
 
 const LOGS_PER_DEVICE = 1000
 const EVENTS_PER_DEVICE = 200
+// Separate ring for low-frequency lifecycle / fault signals so a burst
+// of session.read_file cmd.results from a Library scan can't push them
+// out within seconds. Keep modest — this is for triage, not history.
+const SIGNALS_PER_DEVICE = 200
+
+// Event kinds that always go into BOTH rings (events + signals). Plus
+// any cmd.result with ok=false. The intent: anything an operator or
+// diagnostic agent would care about during a debug session survives
+// even when the events ring is being hammered by routine traffic.
+const SIGNAL_KINDS = new Set([
+  'phase',
+  'phase.stuck',
+  'connected',
+  'disconnected',
+])
 
 class Store {
   private devices = new Map<string, DeviceRecord>()
@@ -93,6 +113,7 @@ class Store {
       tick: null,
       logs: [],
       events: [],
+      signals: [],
       ...existing,
       ...patch,
     }
@@ -129,12 +150,33 @@ class Store {
     if (d.events.length > EVENTS_PER_DEVICE) {
       d.events.splice(0, d.events.length - EVENTS_PER_DEVICE)
     }
+    // Mirror lifecycle / fault signals into the parallel ring so a
+    // Library-scan burst of session.read_file cmd.results can't push
+    // them out within seconds. Criteria: any event whose kind is in
+    // SIGNAL_KINDS, OR any cmd.result with ok=false (failed commands
+    // are always interesting).
+    if (SIGNAL_KINDS.has(entry.kind) ||
+        (entry.kind === 'cmd.result' && entry.ok === false)) {
+      d.signals.push(entry)
+      if (d.signals.length > SIGNALS_PER_DEVICE) {
+        d.signals.splice(0, d.signals.length - SIGNALS_PER_DEVICE)
+      }
+    }
   }
 
   logsSince(deviceId: string, since: number): LogEntry[] {
     const d = this.devices.get(deviceId)
     if (!d) return []
     return d.logs.filter((e) => e.ts > since)
+  }
+
+  // Lifecycle / fault signals — populated by appendEvent for kinds in
+  // SIGNAL_KINDS plus failed cmd.results. Use this when triaging "what
+  // just happened to the device" without the noise of routine cmd.results.
+  signalsSince(deviceId: string, since: number): EventEntry[] {
+    const d = this.devices.get(deviceId)
+    if (!d) return []
+    return d.signals.filter((e) => e.ts > since)
   }
 
   setPreview(deviceId: string, frame: PreviewFrame) {
