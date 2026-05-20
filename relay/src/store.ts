@@ -153,10 +153,25 @@ class Store {
     // Mirror lifecycle / fault signals into the parallel ring so a
     // Library-scan burst of session.read_file cmd.results can't push
     // them out within seconds. Criteria: any event whose kind is in
-    // SIGNAL_KINDS, OR any cmd.result with ok=false (failed commands
-    // are always interesting).
-    if (SIGNAL_KINDS.has(entry.kind) ||
-        (entry.kind === 'cmd.result' && entry.ok === false)) {
+    // SIGNAL_KINDS, OR any cmd.result with ok=false UNLESS that
+    // failure is an expected probe miss (session.read_file ENOENT
+    // for a thumbnail the UI knows might not exist — the fallback
+    // chain in renderSessionCard tries seq=1 then captureCount, and
+    // ENOENT on either is a normal data shape, not a fault).
+    //
+    // Without this filter, opening Library produces dozens of
+    // "open /sdcard/.../000001_therm.jpg: errno=2" entries in
+    // /signals — exactly the noise the separate ring was built to
+    // suppress.
+    let shouldMirror = SIGNAL_KINDS.has(entry.kind)
+    if (!shouldMirror && entry.kind === 'cmd.result' && entry.ok === false) {
+      const msg = entry.msg || ''
+      const isExpectedFileMiss =
+        entry.cmd === 'session.read_file' &&
+        (/errno=2\b/.test(msg) || /no such file/i.test(msg))
+      shouldMirror = !isExpectedFileMiss
+    }
+    if (shouldMirror) {
       d.signals.push(entry)
       if (d.signals.length > SIGNALS_PER_DEVICE) {
         d.signals.splice(0, d.signals.length - SIGNALS_PER_DEVICE)

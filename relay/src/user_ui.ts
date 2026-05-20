@@ -533,6 +533,19 @@ export const USER_UI_HTML = `<!doctype html>
     background: rgba(0,0,0,0.3); padding: 1px 6px; border-radius: 3px;
     font-size: 12px;
   }
+  /* Older-firmware compat banner. Calmer than the security banner —
+     amber/warn rather than red, since the device still works, just
+     with some metadata bugs the dashboard has already paved over. */
+  .compat-banner {
+    background: #2a2418; border: 1px solid var(--warn); border-radius: 8px;
+    padding: 10px 14px; margin-bottom: 16px; color: #f0d9a0;
+    font-size: 13px; line-height: 1.5;
+  }
+  .compat-banner strong { color: var(--warn); }
+  .compat-banner code {
+    background: rgba(0,0,0,0.3); padding: 1px 6px; border-radius: 3px;
+    font-size: 12px;
+  }
 
   /* Tab bar */
   .tabs { display: flex; gap: 4px; margin-left: auto; }
@@ -1383,6 +1396,17 @@ export const USER_UI_HTML = `<!doctype html>
   // device is offline.
   let lastSeenSystem = null;
 
+  // Sliding-window record of connect / disconnect signals. Each entry
+  // is the dashboard wall-clock ts when we observed the event in the
+  // event stream. updateChips reads the size of this buffer (filtered
+  // to the last CHURN_WINDOW_MS) and surfaces an "Unstable link" chip
+  // when the count exceeds CHURN_THRESHOLD. Bounded so the array
+  // can't grow unbounded over a long page lifetime.
+  const churnEvents = [];   // array of timestamps (ms)
+  const CHURN_WINDOW_MS = 5 * 60 * 1000;   // 5 minutes
+  const CHURN_THRESHOLD = 6;               // 6 connect+disconnect events in 5 min
+  const CHURN_MAX_TRACK = 50;              // prune ring at this size
+
   // ───── Timelapse settings modal ─────
   // Live mode allows fast intervals (task-loop captures); deep-sleep
   // mode requires ≥60s because Lepton boot eats ~10–18s of awake time
@@ -2088,6 +2112,29 @@ export const USER_UI_HTML = `<!doctype html>
       d ? (d.online ? 'Live' : 'Offline') : 'No device');
     chips.appendChild(tChip);
 
+    // Unstable-link chip. Render whenever churnEvents has more than
+    // CHURN_THRESHOLD entries within the last CHURN_WINDOW_MS. We
+    // count instead of filtering in-place so churnEvents stays small.
+    // Hover tooltip lists the exact count + window for context.
+    {
+      const now = Date.now();
+      const cutoff = now - CHURN_WINDOW_MS;
+      let recent = 0;
+      for (let i = churnEvents.length - 1; i >= 0; i--) {
+        if (churnEvents[i] >= cutoff) recent++;
+        else break;
+      }
+      if (recent >= CHURN_THRESHOLD) {
+        const mins = Math.round(CHURN_WINDOW_MS / 60000);
+        chips.appendChild(el('div', {
+          class: 'chip err',
+          title: recent + ' connect/disconnect events in the last ' + mins +
+                 ' min — link is flapping (iPhone hotspot drops, RSSI margin, ' +
+                 'WS-mutex contention on old firmware, etc).',
+        }, 'Unstable link'));
+      }
+    }
+
     if (d && d.online) {
       // Three states:
       //   "Acquiring"  — frame counter has advanced within the last 10s
@@ -2350,6 +2397,15 @@ export const USER_UI_HTML = `<!doctype html>
           toast('⚠ phase ' + e.phase + ' stuck for ' + fmtPhaseDuration(inMs),
                 'err');
         }
+        // Track connect / disconnect events for the churn detector.
+        // Each event is one transition; CHURN_THRESHOLD is set against
+        // the SUM of both directions over CHURN_WINDOW_MS.
+        if (e.kind === 'connected' || e.kind === 'disconnected') {
+          churnEvents.push(e.ts || Date.now());
+          if (churnEvents.length > CHURN_MAX_TRACK) {
+            churnEvents.splice(0, churnEvents.length - CHURN_MAX_TRACK);
+          }
+        }
       }
     } catch {}
   }
@@ -2466,6 +2522,7 @@ export const USER_UI_HTML = `<!doctype html>
       updateActiveTl(live);
       updateLiveView(d, state);
       updateChips(d, state);
+      maybeRenderCompatBanner(d);
     } catch (e) {
       console.warn('poll error', e);
     }
@@ -2680,15 +2737,36 @@ export const USER_UI_HTML = `<!doctype html>
   }
 
   // Load an image with Authorization header and assign the resulting
+  // Page-lifetime cache of (url → 404) so the fallback-thumbnail
+  // probe chain doesn't keep re-hitting the device's sessions worker
+  // for files we already know don't exist. Each Library re-render
+  // (e.g. auto-refresh, layout toggle) would otherwise re-probe
+  // every missing-thermal-seq-1 entry. Cleared only on page reload.
+  const missingUrls = new Set();
+
   // blob URL to <img>. Returns the blob URL (also tracked for cleanup).
   // Falls back to onerror handler if the fetch fails.
   async function loadAuthImg(img, url, onErr) {
+    // Skip the round-trip entirely if we already know this URL is
+    // a 404. The onErr handler still fires synchronously so the
+    // fallback chain advances exactly as it would on a fresh probe.
+    if (missingUrls.has(url)) {
+      if (onErr) onErr(404);
+      return null;
+    }
     try {
       const r = await fetch(url, {
         headers: { 'Authorization': 'Bearer ' + authToken },
         cache: 'no-store',
       });
-      if (!r.ok) { if (onErr) onErr(r.status); return null; }
+      if (!r.ok) {
+        // 404 = file genuinely missing on device. Cache so we don't
+        // re-probe. Other status codes (502/503/etc) might be
+        // transient — don't cache those, they'd suppress retries.
+        if (r.status === 404) missingUrls.add(url);
+        if (onErr) onErr(r.status);
+        return null;
+      }
       const blob = await r.blob();
       const u = URL.createObjectURL(blob);
       activeBlobUrls.push(u);
@@ -3385,6 +3463,64 @@ export const USER_UI_HTML = `<!doctype html>
   document.querySelectorAll('#tabs .tab').forEach((t) => {
     t.onclick = () => setView(t.dataset.view);
   });
+
+  // Minimum firmware version the deployed dashboard expects. Bump
+  // when a UI feature starts depending on metadata the firmware writes
+  // (e.g. aborted markers in session.json, deepSleep:{active:false}
+  // tick fields, etc). Devices below this version still work, but
+  // some UI affordances will be silently incomplete — Library cleanup,
+  // sleeping-by-design detection, abandoned filtering, etc.
+  //
+  // Format: "MAJOR.MINOR.PATCH" — ignores anything after a dash.
+  // Default-labeled firmware ("0.1.0-dev") is treated as below
+  // minimum on purpose: it's almost always an unflagged local build
+  // and the operator should know to set GRASSHOPPER_FW_VERSION.
+  const MIN_FW_VERSION = '0.4.2';
+
+  function parseFwVersion(v) {
+    if (typeof v !== 'string') return null;
+    const m = v.match(/^(\d+)\.(\d+)\.(\d+)/);
+    if (!m) return null;
+    return { major: +m[1], minor: +m[2], patch: +m[3] };
+  }
+  function fwBelowMin(deviceFw) {
+    const dv = parseFwVersion(deviceFw);
+    const mv = parseFwVersion(MIN_FW_VERSION);
+    if (!dv || !mv) return false;   // unparseable → don't nag
+    if (dv.major !== mv.major) return dv.major < mv.major;
+    if (dv.minor !== mv.minor) return dv.minor < mv.minor;
+    return dv.patch < mv.patch;
+  }
+
+  // Track so we only render once per page lifetime. Banner doesn't
+  // self-dismiss when the device upgrades mid-session because that
+  // would require monitoring fwVersion changes; the user can just
+  // reload after flashing.
+  let compatBannerRendered = false;
+
+  function maybeRenderCompatBanner(d) {
+    if (compatBannerRendered) return;
+    if (!d || typeof d.fwVersion !== 'string') return;
+    if (!fwBelowMin(d.fwVersion)) return;
+    const slot = document.getElementById('banner-slot');
+    if (!slot) return;
+    compatBannerRendered = true;
+    slot.appendChild(el('div', { class: 'compat-banner' },
+      el('strong', {}, '⚠ Device firmware below dashboard expectations. '),
+      'Device reports ',
+      el('code', {}, d.fwVersion),
+      '; dashboard expects ',
+      el('code', {}, '>= ' + MIN_FW_VERSION),
+      '. The device still works, but some metadata fields are missing: ',
+      'abandoned-session filtering, recovery markers, the ',
+      el('code', {}, 'deepSleep:{active:false}'),
+      ' tick block, and the canonical ',
+      'aborted-reason taxonomy may all be silently incomplete. ',
+      'Flash ',
+      el('code', {}, 'firmware/build/grasshopper.bin'),
+      ' (or OTA via Update Firmware below) to clear this banner.'
+    ));
+  }
 
   async function checkSecurityPosture() {
     try {
