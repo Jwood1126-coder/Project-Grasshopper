@@ -717,6 +717,45 @@ export const USER_UI_HTML = `<!doctype html>
     font: 11px/1 ui-monospace, monospace; padding: 2px 5px; border-radius: 3px;
   }
   .capture-tile:hover { border-color: var(--accent); }
+  /* Loading skeleton + missing marker for detail-view tiles. Without
+     these, a tile awaiting its blob is indistinguishable from a 404
+     tile — both render as a blank black box. Skeleton has a subtle
+     shimmer; missing marker shows the failing file name so the
+     operator can match it to the journal. */
+  .capture-tile .tile-skeleton {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 8px; color: #4a5566;
+    background: linear-gradient(90deg, #0a0a0a, #14181f, #0a0a0a);
+    background-size: 200% 100%;
+    animation: tile-shimmer 1.6s ease-in-out infinite;
+  }
+  @keyframes tile-shimmer {
+    0%   { background-position: 100% 0; }
+    100% { background-position: -100% 0; }
+  }
+  .capture-tile .tile-spinner {
+    width: 18px; height: 18px; border-radius: 50%;
+    border: 2px solid #2a3140; border-top-color: var(--accent);
+    animation: tile-spin 0.9s linear infinite;
+  }
+  @keyframes tile-spin { to { transform: rotate(360deg); } }
+  .capture-tile .tile-loading-label {
+    font: 10px/1 ui-monospace, monospace; letter-spacing: 0.05em;
+  }
+  .capture-tile .tile-missing {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 4px; padding: 8px; text-align: center;
+    color: var(--muted);
+  }
+  .capture-tile .tile-missing-label {
+    font: 600 11px/1.3 system-ui; color: var(--err);
+  }
+  .capture-tile .tile-missing-file {
+    font: 10px/1.3 ui-monospace, monospace; color: var(--muted);
+    word-break: break-all;
+  }
   .capture-tile .dl {
     position: absolute; top: 4px; right: 4px;
     background: rgba(10,14,20,0.78); backdrop-filter: blur(6px);
@@ -3324,20 +3363,41 @@ export const USER_UI_HTML = `<!doctype html>
                           (libPrefs.modality === 'both' && !c.visOk && c.thermOk) ||
                           (!c.visOk && c.thermOk);
         const useVis    = !useTherm && c.visOk;
-        if (useTherm) {
-          const img = el('img', {});
+        const fileName  = useTherm ? c.thermFile : (useVis ? c.visFile : null);
+        if (fileName) {
+          // Show a loading skeleton until the blob lands. Without
+          // this the tile is just a blank box, which the user can't
+          // distinguish from "404 / file missing." On 404, swap the
+          // skeleton for a clear "missing" marker. The fileName is
+          // shown so the operator can match it to the journal if
+          // they need to dig in.
+          const skeleton = el('div', { class: 'tile-skeleton' },
+            el('div', { class: 'tile-spinner' }),
+            el('div', { class: 'tile-loading-label' }, 'loading…'));
+          tile.appendChild(skeleton);
+          const img = el('img', { style: 'display:none' });
           tile.appendChild(img);
           loadAuthImg(img,
             '/api/devices/' + encodeURIComponent(currentDeviceId) +
             '/sessions/' + encodeURIComponent(sid) +
-            '/file/' + c.thermFile);
-        } else if (useVis) {
-          const img = el('img', {});
-          tile.appendChild(img);
-          loadAuthImg(img,
-            '/api/devices/' + encodeURIComponent(currentDeviceId) +
-            '/sessions/' + encodeURIComponent(sid) +
-            '/file/' + c.visFile);
+            '/file/' + fileName,
+            (status) => {
+              // 404 or other fetch failure — swap the skeleton for a
+              // missing-file marker. Includes the seq + filename so
+              // the operator knows exactly what didn't come back.
+              if (skeleton.parentElement) skeleton.remove();
+              if (img.parentElement) img.remove();
+              const what = useTherm ? 'thermal' : 'visible';
+              tile.appendChild(el('div', { class: 'thumb-empty tile-missing' },
+                el('div', { class: 'tile-missing-label' },
+                  status === 404 ? '✗ ' + what + ' missing' : '✗ ' + what + ' err ' + status),
+                el('div', { class: 'tile-missing-file' }, fileName)));
+            });
+          // Reveal the image once it loads (replace the skeleton).
+          img.onload = () => {
+            if (skeleton.parentElement) skeleton.remove();
+            img.style.display = '';
+          };
         } else {
           tile.appendChild(el('div', { class: 'thumb-empty',
             style: 'display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted);font-size:11px' },
