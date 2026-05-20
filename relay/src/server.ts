@@ -714,10 +714,23 @@ const server = Bun.serve<WsCtx>({
           captureSystemBlock(deviceId, msg)
           break
         case 'tick': {
+          // REPLACE, do not merge. Earlier code merged the new tick
+          // over the prev tick, which silently preserved CONDITIONAL
+          // blocks the firmware deliberately omits — most importantly
+          // `deepSleep`, which splice_extras only emits when a DS
+          // session is active. After a DS session completed + the
+          // device esp_restart()ed into LIVE, the new tick had no
+          // deepSleep block, but the merge kept the prior session's
+          // {active:true, sessionId, nextSeq, maxCaptures} alive in
+          // the cached tick. The dashboard then rendered the "DS
+          // active" banner from the dead session — clicking Stop hit
+          // the live cmd handler which correctly returned "no active
+          // timelapse", leaving the user staring at a phantom banner.
+          //
+          // Tick is a complete snapshot. Replace.
           const prev = store.get(deviceId)
-          const merged = { ...(prev?.tick as object), ...msg }
           store.upsert(deviceId, {
-            tick: merged,
+            tick: msg,
             state: (msg as any).state ?? prev?.state ?? 'UNKNOWN',
           })
           captureSystemBlock(deviceId, msg)

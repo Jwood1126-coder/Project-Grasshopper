@@ -2209,6 +2209,23 @@ export const USER_UI_HTML = `<!doctype html>
             (e.ok ? '✓ ' : '✗ ') + pending.type + ': ' + (e.msg || ''),
             e.ok ? 'ok' : 'err'
           );
+          // Self-heal phantom-banner state. If the user clicked Stop
+          // and the device says "no active timelapse" (or similar),
+          // our banner was wrong — clear the localStorage echo AND
+          // null the cached tick state so the next poll redraws from
+          // fresh state instead of the stale cache that produced the
+          // banner. Common cause: relay merged ticks (pre-eb8abc2)
+          // and a prior DS session's deepSleep:{active:true} block
+          // survived into the post-completion ticks.
+          if (pending.type === 'timelapse.stop' && e.ok === false &&
+              typeof e.msg === 'string' &&
+              /no active timelapse/i.test(e.msg)) {
+            clearDsArmed();
+            // Force the next poll to rebuild the banner from current
+            // state (it'll be empty/correct since the device truly
+            // has no active TL).
+            updateTlBanner(null, null, true);
+          }
         }
         // Surface OTA progress / completion in the firmware status
         // row regardless of pendingCmds — multiple cmd.result events

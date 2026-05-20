@@ -234,10 +234,14 @@ static size_t splice_extras(char *buf, size_t n, size_t cap) {
     extra = build_radiometric_json(buf + n, cap - n);
     if (extra > 0 && (size_t)(n + extra) < cap) n += extra;
 
-    // Deep-sleep block — only when a session is active. The dashboard
-    // reads this to render "session in progress, next wake at T+30s,
-    // 4/12 captures done" during wake-window phases (the only times
-    // the device is online during a DS session).
+    // Deep-sleep block — ALWAYS emit, with active:bool. Earlier code
+    // emitted the block conditionally (only when DS_ACTIVE), so when
+    // a session ended the next tick simply omitted the field. A relay
+    // that merged ticks (instead of replacing) would keep the
+    // {active:true, sessionId, nextSeq, maxCaptures} block alive
+    // forever, and the dashboard would render a phantom "DS active"
+    // banner after a completed session. Belt-and-suspenders fix:
+    // always emit, so even a merging relay sees the transition.
     if (ds_scheduler_state() == DS_ACTIVE) {
         extra = snprintf(buf + n, cap - n,
             ",\"deepSleep\":{"
@@ -249,6 +253,10 @@ static size_t splice_extras(char *buf, size_t n, size_t cap) {
             ds_scheduler_session_id(),
             (unsigned long)ds_scheduler_next_seq(),
             (unsigned long)ds_scheduler_max_captures());
+        if (extra > 0 && (size_t)(n + extra) < cap) n += extra;
+    } else {
+        extra = snprintf(buf + n, cap - n,
+            ",\"deepSleep\":{\"active\":false}");
         if (extra > 0 && (size_t)(n + extra) < cap) n += extra;
     }
 
