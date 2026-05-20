@@ -2783,6 +2783,14 @@ export const USER_UI_HTML = `<!doctype html>
   // every missing-thermal-seq-1 entry. Cleared only on page reload.
   const missingUrls = new Set();
 
+  // In-flight fetch dedup. Without this, 5 simultaneous tiles all
+  // wanting the same missing thermal would each fire their own
+  // fetch — observed in the relay event log as 13+ identical
+  // 404s within 1 second. With this, the first call starts the
+  // fetch and every subsequent call for the same URL awaits the
+  // same Promise. Cleared when the fetch resolves either way.
+  const inflightFetches = new Map();   // url -> Promise<Response | null>
+
   // blob URL to <img>. Returns the blob URL (also tracked for cleanup).
   // Falls back to onerror handler if the fetch fails.
   async function loadAuthImg(img, url, onErr) {
@@ -2794,10 +2802,20 @@ export const USER_UI_HTML = `<!doctype html>
       return null;
     }
     try {
-      const r = await fetch(url, {
-        headers: { 'Authorization': 'Bearer ' + authToken },
-        cache: 'no-store',
-      });
+      // Dedupe: if another tile is already fetching this URL, share
+      // its Response. Each consumer still parses + creates its own
+      // blob URL from the cloned response — Response bodies are
+      // single-use so we clone() per awaiter.
+      let pending = inflightFetches.get(url);
+      if (!pending) {
+        pending = fetch(url, {
+          headers: { 'Authorization': 'Bearer ' + authToken },
+          cache: 'no-store',
+        }).finally(() => inflightFetches.delete(url));
+        inflightFetches.set(url, pending);
+      }
+      const baseResponse = await pending;
+      const r = baseResponse.clone();
       if (!r.ok) {
         // 404 = file genuinely missing on device. Cache so we don't
         // re-probe. Other status codes (502/503/etc) might be
