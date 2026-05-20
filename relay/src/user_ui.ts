@@ -1518,6 +1518,25 @@ export const USER_UI_HTML = `<!doctype html>
       const wakeWifiEvery = wakeWifi
         ? (parseInt(document.getElementById('ds-wifi-every').value, 10) || 1)
         : 1;
+
+      // Hard confirm before arming DS with wake-Wi-Fi OFF. Device
+      // goes radio-dark for the FULL session and the dashboard can
+      // only see it again after the last capture completes (or by
+      // resetting the device manually). Multiple users have armed
+      // without realizing this is the contract — caused several
+      // "device went offline and didn't come back" panics.
+      if (!wakeWifi) {
+        const totalSec = tlSelectedInterval * maxCaps;
+        const totalMin = Math.ceil(totalSec / 60);
+        const msg = 'Arm deep-sleep timelapse with wake-Wi-Fi OFF?\\n\\n' +
+          maxCaps + ' captures × ' + tlSelectedInterval + 's interval ' +
+          '(~' + totalMin + ' min total)\\n\\n' +
+          '• Device radio is OFF between captures\\n' +
+          '• Dashboard will show "Sleeping by design" until session completes\\n' +
+          '• NO REMOTE STOP — only way to halt is to reset the device\\n' +
+          '• Captures land on SD; visible in Library when session ends';
+        if (!confirm(msg)) return;
+      }
       closeTlModal();
       // Persist what we just armed so the dashboard can keep showing
       // an "armed but device-dark" banner while the device sleeps. The
@@ -1791,6 +1810,36 @@ export const USER_UI_HTML = `<!doctype html>
     // whether to clear stale localStorage hints.
     updateTlBanner(tl, live.deepSleep, !!(d && d.online));
 
+    // Action-button gating. A button is "actionable" iff the device
+    // is online AND no current state makes the cmd unsafe / nonsense.
+    // We don't rely on the device's own preconditions because the
+    // user round-trip is slow + the toast lands several seconds
+    // after the click; better to grey out at the source.
+    //
+    // Rules (conservative — easy to relax later if needed):
+    //   Capture:  device online AND no active TL/DS AND phase ∈ {LIVE}
+    //   Start TL: device online AND no active TL/DS AND phase ∈ {LIVE}
+    //   FFC:      device online AND phase != OTA
+    //   Reboot:   device online (always — user override)
+    //
+    // The phase check uses tick.system.phase (canonical) with a
+    // fallback to top-level system.phase from the relay cache.
+    const online   = !!(d && d.online);
+    const phase    = live.system?.phase || lastSeenSystem?.phase || 'UNKNOWN';
+    const tlBusy   = !!(tl?.active) || !!(live.deepSleep?.active);
+    const phaseOk  = phase === 'LIVE';
+    const otaBusy  = phase === 'OTA';
+    setBtnEnabled(fields.captureBtn, online && !tlBusy && phaseOk,
+                   online ? (tlBusy ? 'Timelapse running' : (phaseOk ? '' : 'Device busy (' + phase + ')')) : 'Device offline');
+    setBtnEnabled(fields.tlBtn,      online && !tlBusy && phaseOk,
+                   online ? (tlBusy ? 'Timelapse already running' : (phaseOk ? '' : 'Device busy (' + phase + ')')) : 'Device offline');
+    setBtnEnabled(fields.ffcBtn,     online && !otaBusy,
+                   online ? (otaBusy ? 'Updating firmware' : '') : 'Device offline');
+    setBtnEnabled(fields.rebootBtn,  online,
+                   online ? '' : 'Device offline');
+    setBtnEnabled(fields.fwBtn,      online && !otaBusy,
+                   online ? (otaBusy ? 'OTA already in progress' : '') : 'Device offline');
+
     // Diagnostics
     const validRatio = therm && therm.totalPackets > 0
       ? therm.validPackets / therm.totalPackets : 0;
@@ -2040,12 +2089,33 @@ export const USER_UI_HTML = `<!doctype html>
     chips.appendChild(tChip);
 
     if (d && d.online) {
+      // Three states:
+      //   "Acquiring"  — frame counter has advanced within the last 10s
+      //   "Stalled"    — frame counter was once nonzero but hasn't moved
+      //                  in >10s (Lepton wedged mid-stream)
+      //   "Warming up" — frame counter still 0 (boot/CCI/first-frame
+      //                  pipeline, ~10-15s after a fresh boot — NOT
+      //                  the same failure mode as Stalled, even though
+      //                  the old chip showed them identically)
       const acqStale = lastThermFramesTs === 0 || (Date.now() - lastThermFramesTs) > 10000;
       const acqOk = lastThermFrames > 0 && !acqStale;
-      chips.appendChild(el('div', {
-        class: acqOk ? 'chip ok' : (lastThermFrames > 0 ? 'chip warn' : 'chip err'),
-        title: 'Acquisition: thermal frame counter increasing',
-      }, acqOk ? 'Acquiring' : (lastThermFrames > 0 ? 'Stalled' : 'No frames')));
+      let chipClass, chipText, chipTitle;
+      if (acqOk) {
+        chipClass = 'chip ok';
+        chipText  = 'Acquiring';
+        chipTitle = 'Acquisition: thermal frame counter increasing';
+      } else if (lastThermFrames > 0) {
+        chipClass = 'chip err';
+        chipText  = 'Stalled';
+        chipTitle = 'Lepton produced frames but counter hasn\\'t moved in >10s. ' +
+                    'Try reseating the breakout or wait for auto-recovery.';
+      } else {
+        chipClass = 'chip warn';
+        chipText  = 'Warming up';
+        chipTitle = 'Lepton hasn\\'t delivered its first frame yet (typical 10-15s ' +
+                    'after a fresh boot — CCI configure + first VoSPI sync).';
+      }
+      chips.appendChild(el('div', { class: chipClass, title: chipTitle }, chipText));
     }
 
     // Phase chip. Read from state if present; otherwise from the cached
@@ -2189,6 +2259,25 @@ export const USER_UI_HTML = `<!doctype html>
     }
   }
 
+  // Enable/disable + visually grey out a button based on whether the
+  // underlying action is currently safe. Takes a "whyDisabled" string
+  // that gets shown as the title attribute so the user can hover and
+  // see exactly why something's greyed out (e.g. "Timelapse already
+  // running", "Device offline"). Does NOT touch buttons currently in
+  // setBtnPending state — the spinner takes precedence over gating.
+  function setBtnEnabled(button, enabled, whyDisabled) {
+    if (!button) return;
+    if (button.classList.contains('pending')) return;   // mid-cmd; leave alone
+    button.disabled = !enabled;
+    button.style.opacity = enabled ? '' : '0.45';
+    button.style.cursor = enabled ? '' : 'not-allowed';
+    if (!enabled && whyDisabled) {
+      button.title = whyDisabled;
+    } else if (enabled) {
+      button.removeAttribute('title');
+    }
+  }
+
   async function pollEvents() {
     if (!currentDeviceId) return;
     try {
@@ -2319,6 +2408,16 @@ export const USER_UI_HTML = `<!doctype html>
         // visible during the offline window even before noDeviceTicks
         // reaches the empty-state threshold.
         updateChips(null, lastSeenSystem ? { system: lastSeenSystem } : null);
+        // Grey out any action buttons that are still in the DOM from
+        // the previous render — the user shouldn't be clicking Capture
+        // / Start TL while we wait for the empty-state threshold. The
+        // buttons get re-enabled the moment a device returns.
+        const why = 'Device offline';
+        setBtnEnabled(fields.captureBtn, false, why);
+        setBtnEnabled(fields.tlBtn,      false, why);
+        setBtnEnabled(fields.ffcBtn,     false, why);
+        setBtnEnabled(fields.rebootBtn,  false, why);
+        setBtnEnabled(fields.fwBtn,      false, why);
         return;
       }
       noDeviceTicks = 0;
@@ -2996,7 +3095,23 @@ export const USER_UI_HTML = `<!doctype html>
     if (file.size < 32 * 1024 || file.size > 4 * 1024 * 1024) {
       setFwStatus('Bad file size: ' + file.size + ' B', 'err'); return;
     }
-    setFwStatus('Uploading ' + (file.size / 1024 | 0) + ' KB to relay…');
+    // Hard confirm — OTA WILL reboot the device. Any active TL is
+    // interrupted, sensors re-init, ~30-60 s of downtime. The pending
+    // image starts in verify-pending state; if it crashes the
+    // bootloader rolls back, but the operator should still opt in
+    // explicitly. Show the size + name so they see what they're
+    // about to flash.
+    const sizeKb = (file.size / 1024 | 0);
+    const msg = 'Flash ' + file.name + ' (' + sizeKb + ' KB) to the device?\\n\\n' +
+      '• Device will reboot after download\\n' +
+      '• Any active timelapse / capture will be interrupted\\n' +
+      '• Live preview drops for ~30-60 s while the new image boots\\n' +
+      '• Bootloader auto-rolls-back if the new image crashes early';
+    if (!confirm(msg)) {
+      setFwStatus('Cancelled', '');
+      return;
+    }
+    setFwStatus('Uploading ' + sizeKb + ' KB to relay…');
     try {
       const upR = await fetch(
         '/api/devices/' + encodeURIComponent(currentDeviceId) + '/firmware',
